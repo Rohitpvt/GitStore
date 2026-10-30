@@ -1,0 +1,129 @@
+name: Product Submission
+description: Submit a software application, desktop installer, or developer utility to GitStore
+title: "[SUBMISSION]: <Product Name>"
+labels: ["submission:pending"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ### GitStore Product Submission
+        Welcome to the GitStore automated submission pipeline. Please fill in the details below.
+        Our automated GitHub Actions batch worker validates repository availability, release tags, and asset sizes.
+
+  - type: input
+    id: product_name
+    attributes:
+      label: Product Name
+      description: The public name of your application.
+      placeholder: "e.g., FastTerminal"
+    validations:
+      required: true
+
+  - type: input
+    id: repo_url
+    attributes:
+      label: GitHub Repository URL
+      description: The public GitHub repository hosting your software source and releases.
+      placeholder: "https://github.com/owner/repository"
+    validations:
+      required: true
+
+  - type: input
+    id: release_tag
+    attributes:
+      label: GitHub Release Tag
+      description: The specific tag of the release containing your distributable assets.
+      placeholder: "e.g., v1.2.0"
+    validations:
+      required: true
+
+  - type: input
+    id: asset_name
+    attributes:
+      label: Exact Release Asset Name
+      description: The exact filename of the binary/installer asset uploaded to the release.
+      placeholder: "e.g., FastTerminal-Setup.exe"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: Primary Category
+      description: Choose the primary category that best classifies your application.
+      options:
+        - "Developer Utilities"
+        - "Desktop Applications"
+        - "System Tools"
+        - "Web Applications"
+        - "Templates & Starters"
+        - "Media & Creative"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: platforms
+    attributes:
+      label: Supported Platforms
+      description: Select all operating systems supported by this release.
+      options:
+        - label: Windows
+        - label: macOS
+        - label: Linux
+        - label: Android
+        - label: Web
+
+  - type: textarea
+    id: short_description
+    attributes:
+      label: Short Description
+      description: A concise summary of your product (10 - 160 characters).
+      placeholder: "High-speed GPU-accelerated terminal emulator for Windows and Linux."
+    validations:
+      required: true
+
+  - type: textarea
+    id: full_description
+    attributes:
+      label: Detailed Markdown Description
+      description: Overview, key features, prerequisites, and documentation.
+      placeholder: "### Overview\n..."
+    validations:
+      required: true
+
+  - type: input
+    id: license
+    attributes:
+      label: Open Source License (SPDX)
+      description: The SPDX license identifier for your software.
+      placeholder: "e.g., MIT, Apache-2.0, GPL-3.0"
+    validations:
+      required: true
+
+  - type: input
+    id: icon_url
+    attributes:
+      label: Product Icon URL
+      description: HTTPS URL to a square application icon (hosted on GitHub or raw.githubusercontent.com).
+      placeholder: "https://raw.githubusercontent.com/owner/repo/main/assets/icon.png"
+    validations:
+      required: true
+
+  - type: input
+    id: live_demo_url
+    attributes:
+      label: Optional Live Demo URL
+      description: Public HTTPS link to a live web demo or project documentation.
+      placeholder: "https://demo.example.com"
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Verification & Compliance Confirmation
+      options:
+        - label: "I confirm this repository is publicly accessible and contains open-source software."
+          required: true
+        - label: "I understand GitStore distributes direct download links to my GitHub Release assets and does not re-upload binaries."
+          required: true
