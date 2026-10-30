@@ -1,8 +1,8 @@
 # GitStore — System Design Document (SDD)
 
-**Document Version:** 1.1.0  
-**Phase:** Phase 0.1 — Architecture Audit, Hardening & Final Validation  
-**Status:** Approved Technical Architecture (Hardened)  
+**Document Version:** 1.2.0  
+**Phase:** Phase 0.1.1 — Critical Architecture Corrections & Hardening  
+**Status:** Approved Technical Architecture (Corrected)  
 
 ---
 
@@ -12,7 +12,7 @@ GitStore is designed as a hybrid decoupled system utilizing **GitHub** as the st
 
 ```mermaid
 flowchart TD
-    subgraph ClientLayer["Client Layer (GitHub Pages CDN Fastly Backed)"]
+    subgraph ClientLayer["Client Layer (GitHub Pages Static Host)"]
         UserBrowser["Visitor / Consumer Browser"]
         DevBrowser["Developer Browser"]
         AdminBrowser["Admin Browser (Dashboard)"]
@@ -22,7 +22,7 @@ flowchart TD
     subgraph FirebaseLayer["Platform 2: Firebase Managed Services (Spark Plan)"]
         FirebaseAuth["Firebase Authentication\n(GitHub OAuth + Magic Link)"]
         Firestore["Cloud Firestore Operational Database\n(users, submissions, moderation_requests,\nproducts, categories, reports, admin_logs)"]
-        AppCheck["Firebase App Check\n(reCAPTCHA v3 Web Provider)"]
+        AppCheck["Firebase App Check\n(reCAPTCHA v3 - Lazy Loaded on Auth Pages)"]
         SecurityRules["Firestore Security Rules\n(Granular RBAC & Immutability)"]
     end
 
@@ -30,8 +30,8 @@ flowchart TD
         GHPages["GitHub Pages\n(Vanilla HTML5/CSS3/ES6 Storefront)"]
         GHIssues["GitHub Issue Forms\n(.github/ISSUE_TEMPLATE)"]
         GHReleases["Public GitHub Releases\n(External User Repositories)"]
-        GHREST["GitHub REST API v3\n(Repo, Tag, Asset & Collaborator Validation)"]
-        GHWorker["GitHub Actions Batch Worker\n(Scheduled every 10 min + Manual Dispatch)\n- Concurrency Group Lock\n- 15-Minute Leases\n- Two-Phase Compiler"]
+        GHREST["GitHub REST API v3\n(Canonical Repo Collaborator Check,\nUpstream Repo, Tag & Asset Validation)"]
+        GHWorker["GitHub Actions Batch Worker\n(Scheduled every 10 min + Manual Dispatch)\n- Concurrency Group Lock\n- 15-Minute Leases\n- Two-Phase Self-Healing Compiler"]
     end
 
     %% Client Interactions
@@ -47,15 +47,16 @@ flowchart TD
     GHIssues -->|Worker Poll & Verify Ownership| GHWorker
 
     %% Batch Worker Engine
-    GHWorker -->|1. Process Moderation Requests| Firestore
-    GHWorker -->|2. Authorize Admin via Collaborator Check| GHREST
-    GHWorker -->|3. Claim Leased Submissions Limit 3| Firestore
-    GHWorker -->|4. Verify Repos & Assets| GHREST
-    GHREST -->|Verify Source Existence & Commits| GHReleases
-    GHWorker -->|5. Update Submissions status: approved| Firestore
-    GHWorker -->|6. Compile Static JSON Catalogs| StaticCatalog
-    GHWorker -->|7. Git Rebase, Commit & Push| GHPages
-    GHWorker -->|8. Verify Deployment & Mark published| Firestore
+    GHWorker -->|1. Run Startup Reconciler loop| Firestore
+    GHWorker -->|2. Process Moderation Requests| Firestore
+    GHWorker -->|3. Authorize Admin on Canonical GitStore Repo| GHREST
+    GHWorker -->|4. Claim Leased Submissions Limit 3| Firestore
+    GHWorker -->|5. Verify Repos & Assets| GHREST
+    GHREST -->|Verify Source Existence| GHReleases
+    GHWorker -->|6. Update Submissions status: approved| Firestore
+    GHWorker -->|7. Compile Static JSON Catalogs| StaticCatalog
+    GHWorker -->|8. Git Pull --rebase & Push| GHPages
+    GHWorker -->|9. Verify Deployment & Mark published| Firestore
 ```
 
 ---
@@ -64,13 +65,13 @@ flowchart TD
 
 ### 2.1 Component 1: Static Web Frontend (`gh-pages`)
 - **Technology:** HTML5, CSS3, Vanilla JavaScript (ES6 Modules). Zero frameworks or build dependencies.
-- **Hosting:** GitHub Pages (Fastly edge network).
+- **Hosting:** GitHub Pages.
 - **Key Responsibilities:**
   - High-performance, zero-latency catalog browsing using `fetch()` against pre-compiled `data/catalog.json`.
   - Client-side search, multi-faceted filtering (category, platform, license), and routing via URL hash or clean query parameters.
   - Interactive Developer Dashboard for managing submissions, displaying real-time submission status, and submitting applications.
   - Decoupled Admin Dashboard: Displays `needs_review` submissions and enqueues commands into `/moderation_requests` with real-time `onSnapshot` status tracking.
-  - Integration with Firebase JavaScript SDK (v10+ Modular) for Auth, Firestore, and App Check.
+  - Lazy-loaded Firebase App Check (reCAPTCHA v3) on authenticated developer pages only.
 
 ### 2.2 Component 2: Cloud Firestore (Authoritative Data Store)
 - **Role:** The single source of truth for dynamic transactional state, user profiles, pending submissions, moderation requests, system configurations, and audit logs.
@@ -87,10 +88,10 @@ flowchart TD
 - **Runtime:** `ubuntu-latest` running a modular Node.js runner script (`scripts/processor/`).
 - **Core Operations:**
   1. **Concurrency Enforcement:** Configured with `concurrency: group: gitstore-worker, cancel-in-progress: false` to ensure atomic, non-overlapping processing runs.
-  2. **Moderation Queue Execution:** Processes `/moderation_requests`, verifies requester's repository collaborator permission via GitHub API, executes privileged mutations using Admin SDK, and logs to `admin_logs`.
-  3. **Issue Form Ingestion & Ownership Verification:** Ingests newly opened GitHub Issues tagged `submission:pending`, verifies ownership (owner/org/committer), assigns or provisions a Firebase UID, and registers the submission.
-  4. **Lease Allocation:** Claims up to 3 `queued` or stale `processing` submissions by assigning a lease holder ID (`GITHUB_RUN_ID`) and 15-minute lease expiration.
-  5. **GitHub REST API Verification:** Validates public repository status, release existence, asset name matching, size verification, and download URL fidelity.
+  2. **Startup Reconciliation Loop (`reconcilePublishedState`):** Checks deployed `data/catalog.json` and heals any unconfirmed Firestore documents.
+  3. **Canonical Collaborator Authorization:** Authorizes moderation requests by checking permissions on `Rohitpvt/GitStore`.
+  4. **Issue Form Ingestion:** Ingests newly opened GitHub Issues tagged `submission:pending`, verifies ownership (owner vs org/committer/community), assigns `claimStatus: 'unclaimed'`, and registers submission.
+  5. **Lease Allocation:** Claims up to 3 `queued` or stale `processing` submissions by assigning a lease holder ID (`GITHUB_RUN_ID`) and 15-minute lease expiration.
   6. **Two-Phase Publication Protocol:** Sets qualified submissions to `approved`, compiles static JSON catalogs, commits to Git, verifies `actions/deploy-pages` success, and then updates status to `published`.
 
 ---
@@ -102,7 +103,7 @@ flowchart TD
 sequenceDiagram
     autonumber
     actor Visitor as Visitor / Browser
-    participant CDN as GitHub Pages CDN
+    participant CDN as GitHub Pages Static Host
     participant StaticData as data/catalog.json
     participant GHRel as External GitHub Releases
 
@@ -115,7 +116,7 @@ sequenceDiagram
     GHRel-->>Visitor: Stream binary directly from creator's GitHub Release asset
 ```
 
-### 3.2 Submission to Publication Data Flow (Two-Phase Protocol)
+### 3.2 Submission to Publication Data Flow (Self-Healing Two-Phase Protocol)
 ```mermaid
 sequenceDiagram
     autonumber
@@ -127,21 +128,22 @@ sequenceDiagram
     participant GHAPI as GitHub REST API
     actor Admin as GitStore Admin
 
-    Dev->>Auth: Sign in via GitHub OAuth / Magic Link
+    Dev->>Auth: Sign in via GitHub OAuth
     Auth-->>Client: Return JWT & Firebase UID
     Dev->>Client: Fill Product Form & Submit
     Client->>DB: Create doc in submissions collection (status: 'queued')
     Note over Worker: Batch worker runs (cron or dispatch)
+    Worker->>DB: Run reconcilePublishedState() healing loop
     Worker->>DB: Atomic Transaction Claim (batch limit = 3)
     Worker->>GHAPI: Verify repository, release tag, asset extension & size
     GHAPI-->>Worker: 200 OK (Metadata confirmed)
-    alt Developer is UNVERIFIED or Community Nomination
+    alt Developer is UNVERIFIED or Org/Committer/Community
         Worker->>DB: Update status to 'needs_review'
         Admin->>DB: Enqueue APPROVE in moderation_requests
-        Worker->>GHAPI: Verify Admin repo collaborator permission
+        Worker->>GHAPI: Verify Admin on Canonical GitStore Repo
         GHAPI-->>Worker: 200 OK (permission: admin)
         Worker->>DB: Set submission status to 'approved'
-    else Developer IS Verified AND Proven Owner
+    else Developer IS Verified AND Direct Personal Owner
         Worker->>DB: Update status directly to 'approved'
     end
     Note over Worker: Phase 1: Compile & Deploy
@@ -151,13 +153,13 @@ sequenceDiagram
     alt Deploy Succeeded
         Note over Worker: Phase 2: Finalize Database State
         Worker->>DB: Update status to 'published'
-        Worker->>DB: Set /products/gh_{owner}_{repo} to 'active'
+        Worker->>DB: Set /products/prod_{owner}_{slug} to 'active'
     else Deploy Failed
         Worker->>DB: Leave status in 'approved' (retried on next run)
     end
 ```
 
-### 3.3 Privileged Administrator Workflow
+### 3.3 Privileged Administrator Workflow (Canonical GitStore Repository)
 ```mermaid
 sequenceDiagram
     autonumber
@@ -173,10 +175,12 @@ sequenceDiagram
     Dashboard->>FS: Write /moderation_requests (status: 'pending')
     Note over Dashboard: Dashboard listens via onSnapshot
     Actions->>FS: Fetch pending moderation requests
-    Actions->>GH: GET /repos/{owner}/{repo}/collaborators/{username}/permission
+    Actions->>Actions: Extract verified GitHub numeric ID from Firebase Auth
+    Actions->>GH: GET /user/{verifiedNumericId} -> get verifiedLogin
+    Actions->>GH: GET /repos/Rohitpvt/GitStore/collaborators/{verifiedLogin}/permission
     GH-->>Actions: Return permission: 'admin'
     Actions->>FS: Update /submissions/{id} to 'approved'
-    Actions->>FS: Create /products/gh_{owner}_{repo}
+    Actions->>FS: Create /products/prod_{owner}_{slug}
     Actions->>FS: Write immutable entry to /admin_logs
     Actions->>FS: Update /moderation_requests/{id} (status: 'completed')
     FS-->>Dashboard: onSnapshot fires with status: 'completed'
@@ -194,51 +198,33 @@ GitStore/
 │   │   ├── batch-processor.yml     # Cron batch worker (every 10m)
 │   │   └── pages-deploy.yml        # Pages deployment workflow
 │   └── ISSUE_TEMPLATE/
-│       └── product-submission.yml  # Structured issue form
+│       ├── product-submission.yml  # Structured issue form
+│       ├── bug_report.yml          # Bug report form
+│       └── feature_request.yml     # Feature request form
 ├── assets/
 │   ├── css/
 │   │   ├── variables.css           # Design tokens (obsidian, neons, tech-cuts)
 │   │   ├── base.css                # Reset, utility classes, blueprint grid
-│   │   ├── components/
-│   │   │   ├── buttons.css         # Chamfered buttons, hover states
-│   │   │   ├── cards.css           # Product showcase cards, corner crosshairs
-│   │   │   ├── navigation.css      # Fixed obsidian header, bracketed links
-│   │   │   ├── badges.css          # Monospace status badges
-│   │   │   └── forms.css           # Inputs, validation styling
-│   │   └── pages/
-│   │       ├── home.css            # Hero showcase, grid styling
-│   │       ├── explore.css         # Filter drawer, search bar
-│   │       ├── product-detail.css  # Detailed view, download action
-│   │       ├── dashboard.css       # Submissions table & stats
-│   │       └── admin.css           # Review queue & developer verification table
+│   │   ├── components/             # Reusable buttons, cards, badges
+│   │   └── pages/                  # Page-specific layout styles
 │   └── js/
 │       ├── config/
 │       │   └── firebase-config.js  # Public client keys & reCAPTCHA v3 init
-│       ├── api/
-│       │   ├── auth.js             # GitHub OAuth & Magic Link abstractions
-│       │   ├── firestore.js        # Submissions submission, moderation enqueuer
-│       │   └── catalog.js          # Fetching & caching static JSON catalogs
-│       ├── components/
-│       │   ├── navbar.js           # Responsive menu, user profile pill
-│       │   ├── product-card.js     # Card rendering template
-│       │   ├── filter-bar.js       # Category, platform, and license filters
-│       │   └── toast.js            # Non-blocking terminal-style notifications
-│       ├── utils/
-│       │   ├── sanitizers.js       # Strict HTML & URL sanitization (DOMPurify)
-│       │   ├── formatters.js       # Byte sizes, semver, dates
-│       │   └── router.js           # Client-side hash/query parameter management
-│       └── app.js                  # Global application bootstrapper
+│       ├── api/                    # Auth, Firestore, and Catalog fetch abstractions
+│       ├── components/             # Navbar, product cards, filter bars
+│       └── utils/                  # Sanitizers, formatters, semver helpers
 ├── data/
 │   ├── catalog.json                # Master searchable product index
 │   ├── categories.json             # Category taxonomy and counts
 │   └── products/                   # Granular product records
-│       └── gh_{owner}_{repo}.json
+│       └── prod_{owner}_{slug}.json
 ├── scripts/
 │   └── processor/
 │       ├── index.js                # Main Actions runner entrypoint
+│       ├── reconciler.js           # Self-healing publication reconciler
 │       ├── lease-manager.js        # Atomic transaction lease claimer
 │       ├── issue-parser.js         # Issue form ingest & ownership validator
-│       ├── moderation-handler.js   # Moderation request verifier & executor
+│       ├── moderation-handler.js   # Canonical repo collaborator verifier
 │       ├── github-verifier.js      # REST API repository & asset validator
 │       └── catalog-compiler.js     # Static JSON generator
 ├── docs/                           # Complete 13 Architectural Documents
@@ -250,29 +236,3 @@ GitStore/
 ├── admin.html                      # Administrator Moderation Portal
 └── login.html                      # Authentication Page (OAuth & Magic Link)
 ```
-
----
-
-## 5. Failure Recovery, Leases & Concurrency Protection
-
-### 5.1 Concurrency Lock
-GitHub Actions enforces concurrency at the workflow definition level:
-```yaml
-concurrency:
-  group: gitstore-batch-worker
-  cancel-in-progress: false
-```
-This guarantees that if an execution takes longer than 10 minutes, subsequent scheduled executions will queue rather than run concurrently, eliminating multi-runner race conditions.
-
-### 5.2 Atomic Processing Leases & Recovery
-- The batch processor queries for submissions where `status == 'queued' OR (status == 'processing' AND processingLease.leaseExpiresAt < NOW())`.
-- It claims each item inside a Firestore transaction:
-  ```javascript
-  transaction.update(doc.ref, {
-    status: 'processing',
-    'processingLease.leaseHolder': process.env.GITHUB_RUN_ID,
-    'processingLease.leaseExpiresAt': new Date(Date.now() + 15 * 60 * 1000)
-  });
-  ```
-- If the runner crashes mid-execution, the lease expires after 15 minutes, allowing the subsequent worker run to reclaim and recover the submission safely.
-- If deployment fails, submissions remain in `approved` and are re-compiled and re-deployed in the subsequent run.

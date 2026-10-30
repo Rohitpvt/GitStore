@@ -8,7 +8,7 @@ GitStore requires **zero binary hosting**, operates on **two platforms only** (G
 
 ---
 
-## 🚀 Key Architectural Pillars (Hardened in Phase 0.1)
+## 🚀 Key Architectural Pillars (Hardened in Phase 0.1.1)
 
 1. **Strict Two-Platform Confinement:**
    - **GitHub:** GitHub Pages (Static Storefront), GitHub Actions (Privileged Batch Processing Engine), GitHub Issues (Ingestion Queue), GitHub Releases (Direct Binary Distribution).
@@ -17,22 +17,25 @@ GitStore requires **zero binary hosting**, operates on **two platforms only** (G
 2. **Framework-Free Vanilla Frontend:**
    - Pure HTML5, CSS3, and ES6 JavaScript Modules.
    - Zero bundlers, zero framework lock-in, 100% portable static web assets.
-3. **Decoupled Privileged Administration:**
+3. **Decoupled Privileged Administration via Canonical Repository:**
    - Browser clients never receive Firebase Admin SDK credentials and cannot mint custom claims.
    - Privileged administrative commands write to an asynchronous `/moderation_requests` queue in Firestore.
-   - The GitHub Actions batch worker authoritatively validates administrator identity via the GitHub REST API (`GET /repos/{owner}/{repo}/collaborators/{username}/permission`) before applying mutations via `firebase-admin`.
-4. **Issue Ingestion & Ownership Verification:**
-   - Submissions through GitHub Issue Forms undergo strict repository ownership checks (direct owner, public org member, or committer).
-   - Submissions failing ownership proof are categorized as `community_nomination` and can never auto-publish.
-5. **Two-Phase Publication Protocol:**
-   - Guarantees database and static catalog consistency: Submissions transition to `approved`, static JSON catalogs are compiled and pushed, and only after GitHub Pages deployment confirms success does Firestore update status to `published`.
-6. **Static-First Read Architecture:**
-   - Storefront visitors load pre-compiled `data/catalog.json` snapshots served via GitHub Pages' global Fastly CDN.
+   - The GitHub Actions batch worker extracts the caller's verified GitHub numeric ID via Firebase Admin SDK and validates permissions against **GitStore's canonical repository** (`Rohitpvt/GitStore`) collaborator permissions (`admin` or `maintain`) before applying mutations via `firebase-admin`.
+4. **Issue Ingestion Without Fake Accounts & Strict Ownership:**
+   - Issue Form submissions do not create fake Firebase Auth accounts; they record `submitterGithubId` and are claimed upon subsequent OAuth login.
+   - Submissions undergo strict ownership checks: Only Direct Personal Repository Owners qualify for auto-publication. Org members, committers, and community nominators are strictly held in `needs_review`.
+5. **Multi-Product Repositories:**
+   - Multiple distinct applications can originate from a single GitHub repository without collision, using distinct product IDs (`prod_{repoOwner}_{productSlug}`).
+6. **Self-Healing Two-Phase Publication Protocol:**
+   - Guarantees database and static catalog consistency. Submissions transition to `approved`, static JSON catalogs are compiled and pushed, and only after GitHub Pages deployment confirms success does Firestore update status to `published`.
+   - The startup `reconcilePublishedState()` loop heals unconfirmed database documents if deployment succeeds but worker crashes before database update.
+7. **Static-First Read Architecture:**
+   - Storefront visitors load pre-compiled `data/catalog.json` snapshots served directly by GitHub Pages.
    - Anonymous browsing generates **0 Firestore reads**, keeping database usage under 3% of the free Firebase Spark quota.
-7. **Binary Non-Execution & Provenance:**
+8. **Binary Non-Execution & Provenance:**
    - GitStore never executes or sandboxes third-party binaries.
    - Download links point directly to cryptographic assets in authors' public GitHub Releases.
-8. **GitHub Pages Policy Pre-Launch Gate:**
+9. **GitHub Pages Policy Pre-Launch Gate:**
    - Strictly respects GitHub’s prohibition against sending passwords on Pages by omitting traditional password forms.
    - Pre-launch written confirmation from GitHub Support is established as a formal launch gate.
 
@@ -47,7 +50,9 @@ GitStore/
 │   │   ├── batch-processor.yml     # Cron batch worker (every 10m)
 │   │   └── pages-deploy.yml        # GitHub Pages deployment workflow
 │   └── ISSUE_TEMPLATE/
-│       └── product-submission.yml  # Git-native submission template
+│       ├── product-submission.yml  # Git-native submission template
+│       ├── bug_report.yml          # Bug report form
+│       └── feature_request.yml     # Feature request form
 ├── assets/
 │   ├── css/
 │   │   ├── variables.css           # Obsidian cyberpunk design tokens
@@ -63,8 +68,8 @@ GitStore/
 │   ├── catalog.json                # Pre-compiled static product index
 │   ├── categories.json             # Taxonomy metadata and active counts
 │   └── products/                   # Granular product detail JSON files
-│       └── gh_{owner}_{repo}.json
-├── docs/                           # Complete 13 Architectural Documents
+│       └── prod_{owner}_{slug}.json
+├── docs/                           # Complete 13 Hardened Architectural Documents
 ├── scripts/
 │   └── processor/                  # Modular batch processing engine
 ├── index.html                      # Storefront Homepage
@@ -78,31 +83,31 @@ GitStore/
 
 ---
 
-## 📚 Architectural Documentation Index (Phase 0.1 Hardened Baseline)
+## 📚 Architectural Documentation Index (Phase 0.1.1 Corrected Baseline)
 
 All 13 foundational architecture documents are synchronized and available in `docs/`:
 
-| Document | Title | Purpose & Hardened Scope |
+| Document | Title | Purpose & Corrected Scope |
 |---|---|---|
-| [**PRD.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/PRD.md) | Product Requirements Document | User personas, product formats, ownership framework, and pre-launch gates. |
-| [**SDD.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/SDD.md) | System Design Document | System components, sequence diagrams, two-phase publication protocol. |
-| [**ARCHITECTURE.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/ARCHITECTURE.md) | Architecture Specification | System invariants, interface contracts, and Architectural Decision Records (ADRs 01–10). |
-| [**DATABASE_SCHEMA.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/DATABASE_SCHEMA.md) | Cloud Firestore Schema | `moderation_requests`, deterministic IDs (`gh_{owner}_{repo}`), lease pseudocode, security rules. |
-| [**AUTHENTICATION.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/AUTHENTICATION.md) | Authentication & Identity | GitHub OAuth, Magic Links, reCAPTCHA v3, Pages policy analysis, account linking. |
-| [**SUBMISSION_PIPELINE.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/SUBMISSION_PIPELINE.md) | Submission Pipeline | FSM states, batch worker engine, issue ownership verification, two-phase deploy. |
-| [**SECURITY.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/SECURITY.md) | Security & Threat Model | Actor privilege matrix, decoupled admin security workflow, threat mitigations. |
+| [**PRD.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/PRD.md) | Product Requirements Document | User personas, multi-product formats, ownership framework, pre-launch gates. |
+| [**SDD.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/SDD.md) | System Design Document | System components, sequence diagrams, self-healing two-phase publish protocol. |
+| [**ARCHITECTURE.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/ARCHITECTURE.md) | Architecture Specification | System invariants, interface contracts, ADRs 01–10 (ADR-05 to 10 corrected). |
+| [**DATABASE_SCHEMA.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/DATABASE_SCHEMA.md) | Cloud Firestore Schema | `moderation_requests`, multi-product keys (`prod_{owner}_{slug}`), reconciler pseudocode. |
+| [**AUTHENTICATION.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/AUTHENTICATION.md) | Authentication & Identity | GitHub OAuth, Magic Links, reCAPTCHA v3 lazy-loading, account linking. |
+| [**SUBMISSION_PIPELINE.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/SUBMISSION_PIPELINE.md) | Submission Pipeline | FSM states, batch worker engine, 4-tier ownership verification, self-healing compiler. |
+| [**SECURITY.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/SECURITY.md) | Security & Threat Model | Actor privilege matrix, canonical repo admin flow, threat mitigations. |
 | [**UI_DESIGN_SYSTEM.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/UI_DESIGN_SYSTEM.md) | UI Design System | Obsidian cyberpunk tokens, chamfered buttons, crosshairs, disclaimer panel. |
-| [**ROADMAP.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/ROADMAP.md) | Implementation Roadmap | Phased execution milestones (Phase 0 to Phase 4) and exit criteria. |
-| [**DEPLOYMENT_GUIDE.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/DEPLOYMENT_GUIDE.md) | Operations Manual | Step-by-step setup for GitHub Pages, Actions secrets, and Firebase Console. |
-| [**TESTING_STRATEGY.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/TESTING_STRATEGY.md) | Testing Strategy | Local Firebase emulator rules testing, worker mocks, lease concurrency tests. |
-| [**COST_AND_LIMITS.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/COST_AND_LIMITS.md) | Cost & Quota Analysis | Quota exhaustion behaviors (`RESOURCE_EXHAUSTED`), realistic free-tier math. |
-| [**README.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/README.md) | Repository Readme | Project overview, navigation guide, and hardened architectural summary. |
+| [**ROADMAP.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/ROADMAP.md) | Implementation Roadmap | Phased execution milestones (Phase 0 to Phase 8) and exit criteria. |
+| [**DEPLOYMENT_GUIDE.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/DEPLOYMENT_GUIDE.md) | Operations Manual | Setup for Pages, Actions secrets, canonical collaborators, and Firebase. |
+| [**TESTING_STRATEGY.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/TESTING_STRATEGY.md) | Testing Strategy | Security rules tests, reconciler tests, multi-product collision tests. |
+| [**COST_AND_LIMITS.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/COST_AND_LIMITS.md) | Cost & Quota Analysis | Quota failure behaviors (`RESOURCE_EXHAUSTED`), reCAPTCHA v3 10k allowance. |
+| [**README.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/README.md) | Repository Readme | Project overview, navigation guide, and corrected architectural summary. |
 
 ---
 
-## 🚦 Project Status: Phase 0.1 Audit Complete
+## 🚦 Project Status: Phase 0.1 In Review
 
-- **Phase 0 (Architecture Baseline & Documentation):** COMPLETE ✅
-- **Phase 0.1 (Architecture Hardening & Validation):** COMPLETE ✅
-- **Phase 1 (Frontend Core Foundation):** PENDING APPROVAL ⏳
-- *Implementation Restriction:* In accordance with Phase 0/0.1 directives, **no application code or production dependencies have been initialized**. Implementation begins upon Phase 1 authorization.
+- **Phase 0 (Architecture Baseline & Documentation):** COMPLETE & APPROVED ✅
+- **Phase 0.1 (Architecture Hardening & Critical Corrections):** `IN_REVIEW` ⏳
+- **Phase 1 (Frontend Core Foundation):** `NOT_STARTED` 🛑
+- *Implementation Restriction:* In accordance with governance rules, **no application code has been implemented**. We await user approval of Phase 0.1 before proceeding to Phase 1.

@@ -1,8 +1,8 @@
 # GitStore — Comprehensive Deployment & Operations Guide
 
-**Document Version:** 1.1.0  
-**Phase:** Phase 0.1 — Architecture Audit, Hardening & Final Validation  
-**Status:** Approved Operations Manual (Hardened)  
+**Document Version:** 1.2.0  
+**Phase:** Phase 0.1.1 — Critical Architecture Corrections & Hardening  
+**Status:** Approved Operations Manual (Corrected)  
 **Target Environments:** GitHub (Pages & Actions) and Firebase (Auth, Firestore, App Check)
 
 ---
@@ -54,11 +54,11 @@ Before initiating deployment, ensure you possess:
 
 ### 2.4 Configure Firebase App Check (reCAPTCHA v3)
 1. Go to **Build -> App Check**.
-2. Register your Web App using **reCAPTCHA v3** (provides 1,000,000 monthly verifications free, unlike Enterprise which bills after 10k).
+2. Register your Web App using **reCAPTCHA v3** (provides 10,000 monthly assessments free under Google Cloud terms).
 3. Add your authorized domains:
    - `localhost` (for local development with debug token)
    - `<your-username>.github.io` (production GitHub Pages domain)
-4. Enforce App Check on **Cloud Firestore**.
+4. Enforce App Check in **monitoring mode initially**, moving to strict enforcement in Phase 6.
 
 ### 2.5 Generate Service Account for GitHub Actions
 1. In Firebase Console, open **Project Settings -> Service accounts**.
@@ -70,10 +70,10 @@ Before initiating deployment, ensure you possess:
 ## 3. Step 2: GitHub Repository & Secrets Configuration
 
 ### 3.1 Repository Setup
-1. Create a new public repository: `https://github.com/<your-username>/GitStore`.
+1. Create a new public repository: `https://github.com/Rohitpvt/GitStore`.
 2. Clone repository to your local machine:
    ```bash
-   git clone https://github.com/<your-username>/GitStore.git
+   git clone https://github.com/Rohitpvt/GitStore.git
    cd GitStore
    ```
 
@@ -83,10 +83,10 @@ Before initiating deployment, ensure you possess:
    - **`FIREBASE_SERVICE_ACCOUNT_JSON`**: Paste the entire raw JSON content of the Firebase service account private key generated in Step 2.5.
    - **`FIREBASE_CLIENT_CONFIG`**: Paste the JSON containing your public web app keys (apiKey, authDomain, projectId, appId).
 
-### 3.3 Configure Administrative Collaborators
-1. In your GitHub repository, navigate to **Settings -> Collaborators**.
+### 3.3 Configure Canonical GitStore Collaborators
+1. In your GitHub repository (`Rohitpvt/GitStore`), navigate to **Settings -> Collaborators**.
 2. Add designated platform administrators as collaborators with role **Admin** or **Maintain**.
-3. The GitHub Actions batch worker uses the GitHub REST API to verify collaborator permissions before executing privileged moderation requests from the dashboard.
+3. The GitHub Actions batch worker uses the GitHub REST API (`GET /repos/Rohitpvt/GitStore/collaborators/{username}/permission`) to verify collaborator permissions before executing privileged moderation requests from `/moderation_requests`.
 
 ---
 
@@ -101,7 +101,7 @@ Before initiating deployment, ensure you possess:
 
 ## 5. Step 4: Deploying Security Rules & Database Indexes
 
-Install the Firebase CLI locally (used for deploying rules and schema definitions):
+Install the Firebase CLI locally:
 ```bash
 npm install -g firebase-tools
 firebase login
@@ -128,7 +128,7 @@ name: GitStore Batch Processor
 
 on:
   schedule:
-    # Executes approximately every 10 minutes (subject to Actions queue load)
+    # Executes approximately every 10 minutes (subject to Actions platform queue load)
     - cron: '*/10 * * * *'
   workflow_dispatch: # Allows manual trigger from Actions tab
 
@@ -150,10 +150,11 @@ jobs:
         with:
           node-version: 20
 
-      - name: Run Batch Verification & Static Compilation
+      - name: Run Self-Healing Reconciliation & Batch Verification
         env:
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CANONICAL_REPOSITORY: ${{ github.repository }}
         run: |
           node scripts/processor/index.js
 
@@ -175,9 +176,9 @@ jobs:
 ## 7. Step 6: Post-Deployment Verification Checklist
 
 Execute these checks after initial deployment:
-1. **Storefront Availability:** Visit `https://<your-username>.github.io/GitStore/` and verify that the obsidian dark UI loads without console errors.
-2. **Static Catalog Access:** Confirm that `https://<your-username>.github.io/GitStore/data/catalog.json` returns HTTP `200 OK`.
+1. **Storefront Availability:** Visit `https://rohitpvt.github.io/GitStore/` and verify that the obsidian dark UI loads without console errors.
+2. **Static Catalog Access:** Confirm that `https://rohitpvt.github.io/GitStore/data/catalog.json` returns HTTP `200 OK`.
 3. **Authentication Verification:** Click **[ CONNECT GITHUB ]** and verify that the GitHub OAuth consent screen opens and returns an authenticated user state.
 4. **Submission Ingestion Test:** Submit a test open-source repository and verify that a document appears in Firestore `/submissions` with `status: 'queued'`.
 5. **Batch Worker Execution:** Manually trigger `GitStore Batch Processor` under the GitHub Actions tab and confirm the submission transitions to `needs_review` or `approved`.
-6. **Moderation Queue Execution:** Enqueue an approval from `admin.html` and verify the worker confirms collaborator rights, updates Firestore, and deploys static files.
+6. **Moderation Queue Execution:** Enqueue an approval from `admin.html` and verify the worker confirms collaborator rights on `Rohitpvt/GitStore`, updates Firestore, and deploys static files.

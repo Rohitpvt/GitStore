@@ -1,8 +1,8 @@
 # GitStore — Authentication Architecture & Identity Specification
 
-**Document Version:** 1.1.0  
-**Phase:** Phase 0.1 — Architecture Audit, Hardening & Final Validation  
-**Status:** Approved Authentication Specification (Hardened)  
+**Document Version:** 1.2.0  
+**Phase:** Phase 0.1.1 — Critical Architecture Corrections & Hardening  
+**Status:** Approved Authentication Specification (Corrected)  
 **Provider:** Firebase Authentication (v10 Modular SDK)  
 **Host Environment:** GitHub Pages (`https://<org>.github.io/<repo>/`)
 
@@ -21,19 +21,9 @@ GitHub’s official published documentation regarding GitHub Pages establishes e
    > *"GitHub Pages is not intended for or allowed to be used as a free web-hosting service to run your online business, e-commerce site, or any other website that is primarily directed at either facilitating commercial transactions or providing commercial software as a service (SaaS)."*  
    > — Source: [GitHub Terms: Additional Products and Features](https://docs.github.com/en/site-policy/github-terms/github-terms-of-service)
 
-### 1.2 Policy Analysis: Prohibitions vs. Ambiguities
-
-| Dimension | Explicitly Prohibited by GitHub | GitStore Design Approach | Status & Risk Assessment |
-|---|---|---|---|
-| **Password Transmission** | Sending passwords on GitHub Pages | **Strictly excluded.** No `<input type="password">` or password endpoints exist. | **Resolved.** 100% compliant. |
-| **Credit Card / Payments** | Credit card numbers & commercial transactions | **Strictly excluded.** GitStore has no carts, fees, or payment processing. | **Resolved.** 100% compliant. |
-| **Commercial SaaS** | Running a commercial SaaS web application | GitStore is a static directory for open software, not a paid SaaS. | **Resolved.** |
-| **Third-Party Directory Submissions** | Not explicitly addressed in GitHub documentation | GitStore accepts crowdsourced metadata for open-source repositories. | **Ambiguity Remains:** Could automated platform scanners flag "marketplace" or submission activity? |
-| **Monetization & Crowdfunding** | Explicitly permitted (donation & crowdfunding links allowed) | GitStore allows developer repository donation links (GitHub Sponsors). | **Permitted.** |
-
-### 1.3 Mandatory Pre-Launch Policy Gate
+### 1.2 Mandatory Pre-Launch Policy Gate
 > [!IMPORTANT]
-> **Policy Compliance Launch Gate:** While eliminating password fields resolves the sensitive transaction rule, the architectural classification of a "software marketplace/directory" hosted on Pages remains subject to interpretation. GitStore **will not mark policy compliance as conclusively resolved** without formal written clarification. Obtaining written confirmation from GitHub Support is established as a formal **Phase 4 Pre-Launch Gate**.
+> **Pre-Launch Policy Gate:** While eliminating password fields resolves the sensitive transaction rule, the architectural classification of an open software directory hosted on Pages remains subject to interpretation. GitStore **will not mark policy compliance as conclusively resolved** without formal written clarification. Obtaining written confirmation from GitHub Support is established as a formal **Phase 4 Pre-Launch Gate**.
 
 ---
 
@@ -45,8 +35,9 @@ GitHub OAuth is the primary authentication vehicle for GitStore creators:
 2. The browser invokes `signInWithPopup(auth, new GithubAuthProvider())`.
 3. Firebase opens a popup to `https://<project-id>.firebaseapp.com/__/auth/handler`, which redirects to GitHub’s official OAuth challenge:
    `https://github.com/login/oauth/authorize?client_id=...&scope=read:user,user:email`
-4. The user completes authentication and 2FA directly on `github.com`. **No credentials touch GitHub Pages.**
-5. GitHub issues an authorization code to the Firebase handler, which mints the Firebase session JWT and returns it to the client via cross-window messaging (`postMessage`).
+4. The user completes authentication directly on `github.com`. **No credentials touch GitHub Pages.**
+5. GitHub issues an authorization code to the Firebase handler, which mints the Firebase session JWT containing the verified, immutable numeric GitHub user ID in `user.providerData[0].uid`.
+6. Client extracts this verified ID. Browser-submitted text is **never** used as identity proof.
 
 ### 2.2 Secondary Identity: Passwordless Email Magic Link
 For developers without immediate GitHub access:
@@ -60,98 +51,72 @@ For developers without immediate GitHub access:
 
 ---
 
-## 3. Detailed Environment & Domain Configuration
+## 3. Account Linking & Claiming Issue Form Submissions
 
-### 3.1 Firebase Authorized Domains
-To prevent unauthorized domains from invoking Firebase Auth, configure in Firebase Console (`Authentication -> Settings -> Authorized domains`):
-- `localhost` (Local development)
-- `127.0.0.1` (Local development fallback)
-- `<project-id>.firebaseapp.com` (Default OAuth handler)
-- `<project-id>.web.app` (Firebase project alias)
-- `<username>.github.io` (Production GitHub Pages domain)
+### 3.1 No Placeholder Firebase Accounts
+- Submissions created via GitHub Issue Forms do **not** generate placeholder Firebase Auth accounts.
+- Submissions are stored with `submitterGithubId: issue.user.id` and `claimStatus: 'unclaimed'`.
 
-### 3.2 GitHub OAuth App Settings (on GitHub)
+### 3.2 Claiming Submissions upon OAuth Login
+When a developer signs into GitStore via GitHub OAuth:
+1. Firebase Auth returns their authenticated Firebase UID (`user.uid`) and verified numeric GitHub user ID (`user.providerData[0].uid`).
+2. The client or Actions worker queries `/submissions` where:
+   `submitterGithubId == user.providerData[0].uid && claimStatus == 'unclaimed'`
+3. For each match, updates:
+   ```typescript
+   developerUid: user.uid,
+   claimStatus: 'claimed'
+   ```
+4. This securely claims the submission without creating fake accounts or risking account takeover.
+
+### 3.3 Multi-Provider Account Linking
+If a developer first signs in via Email Magic Link (`dev@example.com`) and later clicks "Sign in with GitHub" with an account verified under the same email:
+1. Firebase Auth throws error: `auth/account-exists-with-different-credential`.
+2. The UI prompts the user to sign in with their existing Email Link.
+3. Once authenticated with Email Link, the client calls:
+   ```javascript
+   await linkWithCredential(auth.currentUser, pendingGithubCredential);
+   ```
+4. Both providers link to the same primary Firebase UID.
+
+---
+
+## 4. Detailed Environment & Domain Configuration
+
+### 4.1 Firebase Authorized Domains
+In Firebase Console (`Authentication -> Settings -> Authorized domains`), configure:
+- `localhost`
+- `127.0.0.1`
+- `<project-id>.firebaseapp.com`
+- `<project-id>.web.app`
+- `<username>.github.io`
+
+### 4.2 GitHub OAuth App Settings (on GitHub)
 In GitHub (`Settings -> Developer settings -> OAuth Apps -> GitStore`):
 - **Application Name:** `GitStore`
 - **Homepage URL:** `https://<username>.github.io/GitStore/`
 - **Authorization Callback URL:** `https://<project-id>.firebaseapp.com/__/auth/handler`
 
-### 3.3 Email Continuation ActionCodeSettings
-```javascript
-export const getActionCodeSettings = () => {
-  const isLocal = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
-  const baseUrl = isLocal 
-    ? `${window.location.origin}/login.html`
-    : `https://${window.location.hostname}/GitStore/login.html`;
-
-  return {
-    url: `${baseUrl}?finishSignUp=true`,
-    handleCodeInApp: true,
-  };
-};
-```
-
 ---
 
-## 4. Multi-Provider Account Linking & Recovery
+## 5. Firebase App Check: Quota Reality & Lazy-Loading Strategy
 
-If a developer first signs in via Email Magic Link (`dev@example.com`) and later clicks "Sign in with GitHub" with an account verified under the same email:
-1. Firebase Auth throws error: `auth/account-exists-with-different-credential`.
-2. The UI intercepts the error, extracts `error.credential`, and prompts the user to sign in with their existing Email Link.
-3. Once authenticated with Email Link, the client calls:
-   ```javascript
-   await linkWithCredential(auth.currentUser, pendingGithubCredential);
-   ```
-4. Both providers are now linked to the same primary Firebase UID, preserving the developer’s submission history.
-
----
-
-## 5. Session Management & Persistence
-
-- **Persistence Mode:** Local persistence (`browserLocalPersistence`) using sandboxed browser `IndexedDB`.
-- **Logout:** Explicitly invokes `signOut(auth)`.
-- **Auth Observer Pattern:**
-  ```javascript
-  import { onAuthStateChanged, setPersistence, browserLocalPersistence } from "firebase/auth";
-
-  await setPersistence(auth, browserLocalPersistence);
-
-  onAuthStateChanged(auth, async (user) => {
-    if (user) {
-      // Sync or fetch profile from Firestore /users/{uid}
-      window.dispatchEvent(new CustomEvent('gitstore:auth_changed', { detail: { user } }));
-    } else {
-      window.dispatchEvent(new CustomEvent('gitstore:auth_changed', { detail: { user: null } }));
-    }
-  });
-  ```
-
----
-
-## 6. Firebase App Check Architecture & Realistic Limits
-
-### 6.1 Provider Selection: reCAPTCHA v3
+### 5.1 Provider Selection & Quota Reality
 - **Selected Provider:** **reCAPTCHA v3** (Web).
-- **Justification over reCAPTCHA Enterprise:** reCAPTCHA Enterprise charges $1.00 per 1,000 assessments after the first 10,000/month. On the Firebase Spark free plan without a billing account, exceeding 10,000 calls causes requests to fail. Standard reCAPTCHA v3 includes up to **1,000,000 calls per month at $0 cost**, ensuring strict adherence to zero-cost constraints.
+- **Official Google Cloud / Firebase Quota:** **10,000 assessments per month free**.
+- **Assessment Consumption:** Each App Check token generation or auto-refresh triggers a backend assessment. With a default 1-hour TTL (auto-refreshed at 30 minutes), each active session consumes ~2 assessments per hour.
 
-### 6.2 Client Initialization & Local Debug Provider
-```javascript
-import { initializeAppCheck, ReCaptchaV3Provider, CustomProvider } from "firebase/app-check";
+### 5.2 The Lazy-Loading Architecture
+If App Check was initialized on public storefront browsing pages (`index.html`, `explore.html`), thousands of anonymous visitors would exhaust the 10,000 assessment free tier within days, causing App Check token generation to fail and blocking legitimate users.
 
-if (location.hostname === "localhost" || location.hostname === "127.0.0.1") {
-  // Use debug token in local development
-  self.FIREBASE_APPCHECK_DEBUG_TOKEN = true;
-} else {
-  initializeAppCheck(app, {
-    provider: new ReCaptchaV3Provider('RECAPTCHA_V3_SITE_KEY'),
-    isTokenAutoRefreshEnabled: true
-  });
-}
-```
+**GitStore isolates App Check strictly to authenticated developer pages:**
+- **Storefront Visitors:** Browse static catalogs (`data/catalog.json`) served directly by GitHub Pages. They make **0 Firestore requests** and **do NOT initialize App Check**.
+- **Authenticated Developers:** App Check is lazy-loaded **only on pages that interact with Cloud Firestore**:
+  - `submit.html` (Submissions wizard)
+  - `dashboard.html` (Developer dashboard)
+  - `admin.html` (Admin dashboard)
+- **Math:** 50 active developers/day spending 30 minutes = ~50–100 assessments/day = ~1,500–3,000 assessments/month, safely below the 10,000 monthly free tier.
 
-### 6.3 Crucial Architectural Limitations of App Check
-> [!WARNING]
-> **App Check is NOT Complete Security:**
-> 1. **No Protection Against Authenticated Abusers:** App Check attests that requests come from a legitimate browser loading the GitStore web page. It does **not** restrict what an authenticated developer can do if they open DevTools and call the Firestore SDK directly.
-> 2. **Does Not Replace Security Rules:** Security Rules remain the primary authorization boundary.
-> 3. **Cannot Run on Actions Worker:** The GitHub Actions batch processor runs outside browser contexts and authenticates via `firebase-admin` with a private service account key, bypassing App Check completely.
+### 5.3 Phased Enforcement Strategy
+- **Phase 2 (Integration):** App Check initialized in **metrics/monitoring mode** (tokens validated, but unverified requests are not dropped).
+- **Phase 6 (Pre-Launch QA):** App Check switched to **strict enforcement** only after verifying zero false-positive dropouts.

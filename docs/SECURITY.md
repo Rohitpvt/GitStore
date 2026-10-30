@@ -1,8 +1,8 @@
 # GitStore — Security Architecture & Threat Model
 
-**Document Version:** 1.1.0  
-**Phase:** Phase 0.1 — Architecture Audit, Hardening & Final Validation  
-**Status:** Approved Security Specification (Hardened)  
+**Document Version:** 1.2.0  
+**Phase:** Phase 0.1.1 — Critical Architecture Corrections & Hardening  
+**Status:** Approved Security Specification (Corrected)  
 
 ---
 
@@ -16,13 +16,11 @@ All authorization gates, role escalations, state transitions, and file verificat
 
 ## 2. Separation of Operational Actors & Privilege Matrix
 
-To guarantee strict least-privilege separation without introducing third-party servers:
-
 | Operation | Public Visitors | Authenticated Developers | Administrators | GitHub Actions Worker (`firebase-admin`) |
 |---|---|---|---|---|
 | **Browse Static Storefront** | Read `data/catalog.json` | Read `data/catalog.json` | Read `data/catalog.json` | Generates & deploys static files |
 | **Read Active Products** | Public read (Firestore) | Public read (Firestore) | Public read (Firestore) | Superuser Read/Write |
-| **Submit New Application** | ❌ Forbidden | ✅ Create `/submissions` (`status: queued`) | ✅ Create `/submissions` | Superuser Ingestion from Issues |
+| **Submit New Application** | ❌ Forbidden | ✅ Create `/submissions` (`status: queued`) | ✅ Create `/submissions` | Ingests from GitHub Issues |
 | **Edit Existing Submission** | ❌ Forbidden | ✅ Own submissions only (if `queued`/`rejected`) | ❌ Enqueues via `moderation_requests` | Superuser Read/Write |
 | **Claim Processing Lease** | ❌ Forbidden | ❌ Forbidden | ❌ Forbidden | ✅ Transactional superuser claim |
 | **Verify Repository & Asset**| ❌ Forbidden | ❌ Client assertion only | ❌ Client assertion only | ✅ Authoritative GitHub REST API checks |
@@ -33,90 +31,67 @@ To guarantee strict least-privilege separation without introducing third-party s
 
 ---
 
-## 3. Audited Administrator Security Workflow
+## 3. Audited Administrator Security Workflow (Trust Boundary Corrected)
 
-Without Cloud Functions or custom backend servers, browser clients must **never** receive Firebase Admin SDK credentials, and frontend JavaScript must **never** assign custom claims or directly update privileged fields.
+### 3.1 The Canonical GitStore Repository Boundary
+The critical trust boundary flaw in baseline specifications was checking collaborator status against the *submitted* application's repository. In GitStore v1.2.0:
+- Administrator permissions are verified **strictly against GitStore's own canonical repository** (`Rohitpvt/GitStore`), injected via `process.env.GITHUB_REPOSITORY`.
 
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Admin as Repository Maintainer
-    participant Client as Admin Dashboard (admin.html)
-    participant FS as Cloud Firestore
-    participant Worker as GitHub Actions Worker
-    participant GHAPI as GitHub REST API v3
+### 3.2 Cryptographic Identity Extraction (Zero Browser Trust)
+Browser-submitted usernames are never trusted:
+1. The admin authenticates in the browser via GitHub OAuth and writes to `/moderation_requests/{requestId}` with `requestedByUid: auth.uid`.
+2. The GitHub Actions worker queries the Firebase Admin SDK:
+   ```javascript
+   const userRecord = await admin.auth().getUser(request.requestedByUid);
+   const ghProvider = userRecord.providerData.find(p => p.providerId === 'github.com');
+   if (!ghProvider) throw new Error("Caller has no verified GitHub identity");
+   const verifiedNumericId = ghProvider.uid;
+   ```
+3. The worker calls GitHub API `GET /user/{verifiedNumericId}` to resolve the immutable GitHub login.
+4. The worker checks collaborator rights on GitStore's repository:
+   `GET /repos/{CANONICAL_OWNER}/{CANONICAL_REPO}/collaborators/{verifiedLogin}/permission`
+   Must return `permission: "admin"` or `"maintain"`.
+5. If the user was removed as a collaborator on GitHub, the API immediately returns 404 or `read`, and the request is rejected with an audit log. Stale Firestore claims are impossible.
 
-    Admin->>Client: Log in via GitHub OAuth
-    Admin->>Client: Click "Approve Submission" or "Verify Dev"
-    Client->>FS: Create doc in /moderation_requests (status: 'pending')
-    Note over Client,FS: Security Rules allow create ONLY with status 'pending'<br/>and requestedByUid == auth.uid. Updates/deletes blocked.
-    
-    Note over Worker: Triggered via cron (10m) or Admin workflow_dispatch
-    Worker->>FS: Query /moderation_requests (status == 'pending')
-    Worker->>GHAPI: GET /repos/{owner}/{repo}/collaborators/{adminUsername}/permission
-    GHAPI-->>Worker: Return permission: 'admin' or 'maintain'
-    
-    alt Caller is NOT Authorized Collaborator
-        Worker->>FS: Update moderation_requests (status: 'rejected', reason: 'UNAUTHORIZED')
-        Worker->>FS: Append security alert to /admin_logs
-    else Caller IS Authorized Maintainer
-        Worker->>FS: Update /submissions/{id} to status: 'approved'
-        Worker->>FS: Create/update /products/gh_{owner}_{repo}
-        Worker->>FS: Append audit entry to /admin_logs
-        Worker->>FS: Update moderation_requests (status: 'completed')
-        Worker->>Worker: Recompile data/catalog.json & commit/deploy
-    end
-    
-    FS-->>Client: onSnapshot listener detects status: 'completed'
-    Client-->>Admin: Display "Approved & Published Live"
-```
-
-### Steps in the Privileged Flow:
-1. **Initiation:** The admin initiates an action in the Admin Dashboard (`admin.html`).
-2. **Authentication & Ingestion:** The client writes to `/moderation_requests/{requestId}` with `requestedByUid: auth.uid`, `requestedByGithubUsername: profile.githubUsername`, and `status: 'pending'`.
-3. **Receipt in Actions:** The GitHub Actions worker queries `/moderation_requests` for pending actions.
-4. **Authoritative Authorization Check:** The worker uses `GITHUB_TOKEN` to call GitHub REST API:
-   `GET /repos/{owner}/{repo}/collaborators/{requestedByGithubUsername}/permission`
-   The caller must have `admin` or `maintain` repository permission.
-5. **Privileged Mutation:** Using `firebase-admin`, the worker updates the target document (`submissions`, `users`, or `products`).
-6. **Immutable Audit Logging:** The worker writes an immutable record to `/admin_logs` capturing the admin’s GitHub username, UID, action, target ID, and timestamp.
-7. **Client Feedback:** The dashboard listens via `onSnapshot` and updates in real-time when the request transitions to `completed`.
+### 3.3 Initial Administrator Bootstrap
+- The repository owner (`Rohitpvt`, derived from `process.env.GITHUB_REPOSITORY_OWNER`) is automatically the root administrator.
+- New maintainers are established simply by adding them as repository collaborators on GitHub. Zero client-side role elevation exists.
 
 ---
 
-## 4. Threat Modeling & Hardened Defenses
+## 4. Repository Ownership Verification & Anti-Hijacking
 
-### 4.1 Privilege Escalation (Self-Admin / Self-Verification)
-- **Threat:** An authenticated developer uses browser DevTools to patch their user document: `{ isVerifiedDeveloper: true, isAdmin: true }`.
-- **Hardened Defense:**
-  - Client-side Firestore Security Rules strictly forbid modifying these fields on `update` and enforce `false` on `create`.
-  - The worker only assigns verification status after verifying administrator permission via GitHub's API.
+### 4.1 Elimination of Placeholder Accounts
+- Issue Form submissions do **not** create fake Firebase Auth accounts.
+- Submissions are stored with `submitterGithubId` and `claimStatus: 'unclaimed'`.
+- When the developer logs into GitStore via GitHub OAuth, their authentic Firebase Auth account claims the submission seamlessly.
 
-### 4.2 Repository Hijacking via Issue Forms
-- **Threat:** An attacker opens a GitHub issue claiming ownership of a popular repository (`https://github.com/facebook/react`) to deploy modified malicious download links.
-- **Hardened Defense:**
-  - The worker cross-references the issue author (`issue.user.login`) against the target repository:
-    1. Direct repository owner match.
-    2. Public organization membership check via `GET /orgs/{org}/public_members/{user}`.
-    3. Merged commit history check via `GET /repos/{owner}/{repo}/commits?author={user}`.
-  - If all three checks fail, the submission is categorized as `community_nomination` and **cannot auto-publish under any circumstances**. It is permanently held for manual admin review.
+### 4.2 Multi-Tier Ownership Verification Matrix
 
-### 4.3 Malicious Binary Distribution & Legal Non-Execution
-- **Threat:** An attacker uploads malware to their own GitHub repository and lists it on GitStore.
-- **Hardened Defense:**
-  - **Non-Execution:** GitStore never executes or runs sandboxed binaries. Automated validation checks HTTP headers, file extensions, and sizes only.
-  - **Mandatory Review Gate:** Unverified developers cannot auto-publish. An administrator must inspect their public repository and release notes.
-  - **Legal Disclaimer:** Every download card and detail page displays an explicit disclaimer:
-    > "GitStore provides discovery and metadata verification only. GitStore does NOT execute, sandbox, or certify compiled binaries. Downloads are served directly from the author's public GitHub repository. Verify software source and run appropriate local anti-malware tools prior to running executables."
+| Tier | Submitter Status | Evidence Checked via GitHub API | What it Proves | Eligible for Auto-Publish? | Action Taken |
+|---|---|---|---|---|---|
+| **Tier 1: Direct Personal Owner** | Personal repo owner | `repo.owner.id == submitter.githubId` | Complete administrative control of repository | **YES** (if developer is verified) | Auto-publishes on valid asset checks |
+| **Tier 2: Organization Member** | Org repo submitter | `GET /orgs/{org}/public_members/{login}` (204) | Public affiliation with org | **NO** (does not prove repo release authority) | Gated to `needs_review` |
+| **Tier 3: Committer** | Contributor to repo | `GET /repos/{owner}/{repo}/commits?author={login}` | Has authored merged commits | **NO** (does not prove release authorization) | Gated to `needs_review` |
+| **Tier 4: Community Nomination**| Fan / Third-party | No ownership or commit proof found | Public open-source suggestion only | **NO** (unverified submitter) | Gated to `needs_review` |
 
 ---
 
-## 5. Firebase App Check Reality & Limitations
+## 5. Firebase App Check Architecture & Assessment Quotas
 
-GitStore configures **Firebase App Check** with **reCAPTCHA v3** to enforce origin validation on web traffic:
-
-1. **Attestation:** The web client acquires a reCAPTCHA v3 token and passes it to Cloud Firestore via the `X-Firebase-AppCheck` header.
-2. **Quota Advantage:** Standard reCAPTCHA v3 provides up to **1,000,000 verifications/month for free**, avoiding the billing overages of reCAPTCHA Enterprise on the Spark plan.
-3. **Realistic Security Boundaries:**
+1. **Provider:** **reCAPTCHA v3** (Web).
+2. **Quota Reality:** Under Google Cloud / Firebase terms, the no-cost allowance is **10,000 assessments per month**.
+3. **Lazy-Loading Mitigation:**
+   - Storefront visitors browsing `index.html`, `explore.html`, and `product.html` read static JSON directly from GitHub Pages and **do not initialize App Check**.
+   - App Check is initialized **only on authenticated developer pages** (`submit.html`, `dashboard.html`, `admin.html`).
+   - 50 active developers/day spending 30 minutes generate ~1,500–3,000 assessments/month, staying safely within the 10,000 free assessment ceiling.
+4. **App Check Limitations:**
    > [!WARNING]
-   > App Check verifies the origin of browser requests; it does **not** authenticate user intent. A malicious user who has authenticated with GitHub can open browser DevTools and execute arbitrary permitted Firestore queries. Therefore, **Firestore Security Rules remain the primary security enforcement boundary.**
+   > App Check validates browser origin, not user intent. Firestore Security Rules remain the primary line of defense.
+
+---
+
+## 6. Software Safety Disclaimer & Legal Non-Execution
+
+GitStore operates under an absolute non-execution invariant:
+> "GitStore provides discovery and metadata verification only. GitStore does NOT execute, sandbox, or certify compiled binaries. Downloads are served directly from the author's public GitHub repository. Verify software source and run appropriate local anti-malware scanners prior to running executables."
