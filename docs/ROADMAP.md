@@ -1,7 +1,7 @@
 # GitStore — Strategic Implementation Roadmap
 
-**Document Version:** 1.2.0  
-**Phase:** Phase 0.1 — Architecture Audit, Hardening & Master Phase Control  
+**Document Version:** 1.3.0  
+**Phase:** Phase 0.1.2 — Final Security & Architecture Corrections  
 **Status:** Approved Master Roadmap (Synchronized with `PHASE_PLAN.md`)  
 **Single Source of Execution Truth:** [`PHASE_PLAN.md`](./PHASE_PLAN.md)
 
@@ -18,6 +18,7 @@ gantt
     section Phase 0 & 0.1
     Phase 0: Architecture & Baseline Docs   :done, p0, 2026-10-30, 1d
     Phase 0.1: Architecture Hardening & Plan:done, p0_1, 2026-10-30, 1d
+    Phase 0.1.2: Final Security Corrections :done, p0_1_2, 2026-10-30, 1d
     section Phase 1 & 2
     Phase 1: Frontend Core Foundation (Mock):active, p1, 2026-11-01, 7d
     Phase 2: Firebase Foundation & Auth     :p2, after p1, 6d
@@ -39,12 +40,13 @@ gantt
 | Phase | Title | Focus & Core Deliverables | Status |
 |---|---|---|---|
 | **Phase 0** | Architecture and Documentation | Core product requirements, dual-platform architecture, 13 baseline docs. | `APPROVED` ✅ |
-| **Phase 0.1** | Architecture Hardening & Validation | Audited admin workflow, issue ownership framework, security rules, `PHASE_PLAN.md`. | `COMPLETED` ⏳ (Awaiting Gate) |
+| **Phase 0.1** | Architecture Hardening & Validation | Audited admin workflow, issue ownership framework, security rules, `PHASE_PLAN.md`. | `IN_REVIEW` ⏳ |
+| **Phase 0.1.2**| Final Security & Architecture Corrections | Collaborator mapping, async claiming queue, unique numeric IDs, two-tier publishing. | `IN_REVIEW` ⏳ (Awaiting Gate) |
 | **Phase 1** | Frontend Core Foundation | Responsive Vanilla HTML5/CSS3/ES6 static storefront using mock catalogs. | `NOT_STARTED` 🛑 |
-| **Phase 2** | Firebase Foundation and Auth | GitHub OAuth, Passwordless Magic Links, App Check (reCAPTCHA v3), Firestore security rules. | `NOT_STARTED` 🛑 |
+| **Phase 2** | Firebase Foundation and Auth | GitHub OAuth, Passwordless Magic Links, App Check (reCAPTCHA Enterprise), security rules. | `NOT_STARTED` 🛑 |
 | **Phase 3** | Developer Dashboard & Submissions | Submission form wizard, developer management portal, rate limiting. | `NOT_STARTED` 🛑 |
 | **Phase 4** | GitHub Integration & Batch Engine | Automated REST API verification, issue ingestion, concurrency locks, 15m leases. | `NOT_STARTED` 🛑 |
-| **Phase 5** | Admin Moderation & Publishing | Decoupled `/moderation_requests` queue, collaborator RBAC, Two-Phase catalog compiler. | `NOT_STARTED` 🛑 |
+| **Phase 5** | Admin Moderation & Publishing | Decoupled `/moderation_requests` queue, collaborator RBAC, Two-Tier catalog compiler. | `NOT_STARTED` 🛑 |
 | **Phase 6** | Security, Integration & QA | End-to-end tests, reliability testing, mandatory GitHub Pages pre-launch policy gate. | `NOT_STARTED` 🛑 |
 | **Phase 7** | Controlled Beta Launch | Production configuration, developer onboarding cohort, live telemetry. | `NOT_STARTED` 🛑 |
 | **Phase 8** | Post-Launch Improvements | Trending algorithms, reviews, release webhooks, category sharding. | `NOT_STARTED` 🛑 |

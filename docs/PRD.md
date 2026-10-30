@@ -1,8 +1,8 @@
 # GitStore — Product Requirements Document (PRD)
 
-**Document Version:** 1.2.0  
-**Phase:** Phase 0.1.1 — Critical Architecture Corrections & Hardening  
-**Status:** Approved Product Requirements (Corrected)  
+**Document Version:** 1.3.0  
+**Phase:** Phase 0.1.2 — Final Security & Architecture Corrections  
+**Status:** Approved Product Requirements (Hardened)  
 **Target Systems:** GitHub (Pages, Actions, Issues, Releases) & Firebase (Auth, Cloud Firestore, Security Rules, App Check)
 
 ---
@@ -39,28 +39,30 @@ GitStore is a specialized, open, high-performance software discovery and distrib
 
 ## 3. Product Features & Functional Requirements
 
-### 3.1 Supported Product Formats & Multi-Product Repositories
+### 3.1 Supported Product Formats & Globally Unique Multi-Product Repositories
 - **Supported Formats:** Desktop Executables (`.exe`, `.msi`), macOS (`.dmg`), Linux (`.zip`, `.tar.gz`), Android (`.apk`), Web Apps, and Templates.
-- **Multi-Product Repositories:** A single GitHub repository (monorepos, tool suites) can distribute multiple independent software applications under distinct product IDs (`prod_{repoOwner}_{productSlug}`).
+- **Multi-Product Repositories:** A single GitHub repository (monorepos, tool suites) can distribute multiple independent software applications under globally unique deterministic product IDs (`prod_{repoNumericId}_{productSlug}`) tied to the repository's immutable numeric GitHub ID (`gh_repo_{repoNumericId}`).
+- **Cross-Repository Collision Prevention:** Repositories under the same owner with identical product slugs (e.g. `microsoft/toolkit-a -> viewer` vs `microsoft/toolkit-b -> viewer`) generate distinct non-colliding product IDs (`prod_892341901_viewer` vs `prod_945112002_viewer`).
 
 ### 3.2 Submission Channels & Account Reconciliation
 - **Developer Web Dashboard:** Authenticated developers submit products with real-time status tracking.
-- **GitHub Issue Forms:** Alternative issue-based submission route. Issue submitters do **not** receive fake placeholder accounts; submissions are recorded as `unclaimed` with their immutable GitHub ID and claimed when the developer authenticates via GitHub OAuth.
+- **GitHub Issue Forms:** Alternative issue-based submission route. Issue submitters do **not** receive fake placeholder accounts; submissions are recorded as `unclaimed` with their immutable numeric GitHub ID (`sub_issue_{repoNumericId}_{issueNumber}`).
+- **Secure Asynchronous Claiming Queue:** Developers claim issue-submitted applications through `/claim_requests`, validated authoritatively against their linked GitHub account in Firebase Auth by the batch worker.
 
-### 3.3 Hybrid Publication Workflow & Trust Tiers
-1. **Tier 1 (Direct Personal Owner):** If developer is verified and is the direct owner of the personal repository, submissions auto-publish upon passing asset checks.
-2. **Tier 2 (Org Member) & Tier 3 (Committer):** Public org members or contributors do not have proven release authority. **Forced to `needs_review`.**
-3. **Tier 4 (Community Nomination):** Third-party open-source nominations **never auto-publish** and are held for manual review.
-4. **Suspicious / Malformed Submissions:** Failed checks (private repo, missing asset, mismatched hash) are automatically rejected.
+### 3.3 Strict Ownership, Release Authority & Verified Developer Distinction
+1. **Repository Ownership:** Proves control over the repository configuration (`repo.owner.id === submitterGithubId`).
+2. **Release Authority:** Direct personal repository owners possess inherent release authority to auto-publish upon passing automated asset checks. Organization members, committers, and third-party nominators lack proven release authority and are **forced to `needs_review`**.
+3. **Verified Developer Identity:** A distinct platform trust badge granted by administrators based on verified track record or identity. Owning a personal repo does **not** automatically award the Verified Developer badge.
+4. **Suspicious / Malformed Submissions:** Failed checks (private repo, missing asset, deleted release tag) are automatically rejected.
 
 ### 3.4 Decoupled Administrator Moderation Workflow
 - Administrative operations write commands to `/moderation_requests`.
-- The Actions worker validates permissions against **GitStore's canonical repository** (`Rohitpvt/GitStore`) collaborator permissions (`admin` or `maintain`) before applying mutations via `firebase-admin`.
+- The Actions worker validates permissions against **GitStore's canonical repository** (`Rohitpvt/GitStore`) collaborator permissions (`role_name === 'admin'` or `'maintain'`) before applying mutations via `firebase-admin`.
 
 ### 3.5 Public Storefront Capabilities
 - **Homepage:** Hero showcase, featured applications, category shelves, recent releases.
 - **Explore / Search Page:** Fast client-side filtering by category, platform, license, and instant search over static catalog snapshots.
-- **Product Detail Page:** Deep product information, platform pills, verified developer badge, release notes preview, direct download CTA with file size, license identifier, and external repository links.
+- **Product Detail Page:** Deep product information, platform pills, verified developer badge (if awarded), release notes preview, direct download CTA with file size, license identifier, and external repository links.
 - **Category Browsing:** Curated categories with live product count badges.
 
 ---
@@ -74,7 +76,7 @@ GitStore is a specialized, open, high-performance software discovery and distrib
 | **Source & Binary Distribution** | GitHub Releases & Public Repos | Direct file uploads to GitStore servers, S3 binary buckets |
 | **Authentication Service** | Firebase Authentication | Supabase Auth, Auth0, Custom Node.js auth servers |
 | **Operational Database** | Cloud Firestore | Supabase (PostgreSQL), MongoDB, DynamoDB, PlanetScale |
-| **Security & Abuse Mitigation** | Firebase App Check & Security Rules | Third-party WAFs, Cloudflare Turnstile, custom proxies |
+| **Security & Abuse Mitigation** | Firebase App Check (reCAPTCHA Enterprise) & Security Rules | Third-party WAFs, Cloudflare Turnstile, custom proxies |
 
 ---
 
@@ -87,10 +89,10 @@ GitStore is a specialized, open, high-performance software discovery and distrib
 ### 5.2 Security & Integrity
 - **Non-Execution Invariant:** GitStore never executes submitted files or binaries. All validation is structural, cryptographic, and metadata-focused via the GitHub REST API.
 - **Zero-Trust Client Security:** Firestore Security Rules prohibit client privilege self-escalation. Admin operations execute strictly inside GitHub Actions.
-- **Self-Healing Two-Phase Publication:** Submissions transition to `published` in Firestore only after GitHub Pages deployment confirms success, backed by an automated reconciliation loop.
+- **Recoverable Two-Tier Publication State Machine:** Submissions transition to `published` in Firestore only after GitHub Pages deployment confirms success via both the GitHub Deployments API and public HTTP manifest verification, backed by an automated reconciliation loop.
 
 ### 5.3 Mandatory GitHub Pages Pre-Launch Gate
-- **Pre-Launch Policy Clarification:** While password forms are eliminated to satisfy the sensitive transaction policy, formal written clarification regarding the classification of GitStore as a non-commercial open directory must be obtained from GitHub Support as a formal **Phase 4 Launch Gate**.
+- **Pre-Launch Policy Clarification:** While password forms are eliminated to satisfy the sensitive transaction policy, formal written clarification regarding the classification of GitStore as a non-commercial open directory must be obtained from GitHub Support as a formal **Phase 4 Launch Gate**. *Classified as Unresolved / Pending External Confirmation.*
 
 ---
 

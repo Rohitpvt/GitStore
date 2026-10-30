@@ -1,8 +1,8 @@
 # GitStore — Comprehensive Deployment & Operations Guide
 
-**Document Version:** 1.2.0  
-**Phase:** Phase 0.1.1 — Critical Architecture Corrections & Hardening  
-**Status:** Approved Operations Manual (Corrected)  
+**Document Version:** 1.3.0  
+**Phase:** Phase 0.1.2 — Final Security & Architecture Corrections  
+**Status:** Approved Operations Manual (Hardened)  
 **Target Environments:** GitHub (Pages & Actions) and Firebase (Auth, Firestore, App Check)
 
 ---
@@ -52,9 +52,9 @@ Before initiating deployment, ensure you possess:
      - `127.0.0.1`
      - `<your-username>.github.io`
 
-### 2.4 Configure Firebase App Check (reCAPTCHA v3)
+### 2.4 Configure Firebase App Check (reCAPTCHA Enterprise)
 1. Go to **Build -> App Check**.
-2. Register your Web App using **reCAPTCHA v3** (provides 10,000 monthly assessments free under Google Cloud terms).
+2. Register your Web App using **reCAPTCHA Enterprise** (`ReCaptchaEnterpriseProvider`), which provides 10,000 monthly assessments free under Google Cloud Fraud Defense.
 3. Add your authorized domains:
    - `localhost` (for local development with debug token)
    - `<your-username>.github.io` (production GitHub Pages domain)
@@ -82,20 +82,26 @@ Before initiating deployment, ensure you possess:
 2. Click **New repository secret** and add:
    - **`FIREBASE_SERVICE_ACCOUNT_JSON`**: Paste the entire raw JSON content of the Firebase service account private key generated in Step 2.5.
    - **`FIREBASE_CLIENT_CONFIG`**: Paste the JSON containing your public web app keys (apiKey, authDomain, projectId, appId).
+   - **`ADMIN_VERIFY_TOKEN`**: A Fine-Grained Personal Access Token (or GitHub App Installation Token) with `Metadata: read` permission on `Rohitpvt/GitStore`. (Used as a fallback if the default `GITHUB_TOKEN` is denied access to collaborator permission endpoints with HTTP 403).
 
 ### 3.3 Configure Canonical GitStore Collaborators
 1. In your GitHub repository (`Rohitpvt/GitStore`), navigate to **Settings -> Collaborators**.
 2. Add designated platform administrators as collaborators with role **Admin** or **Maintain**.
 3. The GitHub Actions batch worker uses the GitHub REST API (`GET /repos/Rohitpvt/GitStore/collaborators/{username}/permission`) to verify collaborator permissions before executing privileged moderation requests from `/moderation_requests`.
+4. Note that GitHub maps the `maintain` role to `write` in its legacy `permission` field; the worker checks `role_name === 'admin' || role_name === 'maintain'`.
 
 ---
 
-## 4. Step 3: GitHub Pages Configuration
+## 4. Step 3: GitHub Pages Configuration & Publication Verification
 
 1. In your GitHub repository, navigate to **Settings -> Pages**.
 2. Under **Build and deployment**:
    - **Source:** Select **GitHub Actions**.
 3. Ensure HTTPS is enforced by checking **Enforce HTTPS**.
+4. Publication Verification Architecture:
+   - Modern deployments use `actions/deploy-pages@v4` targeting the `github-pages` environment.
+   - The batch worker generates `data/deployment-manifest.json` containing `{ generationId, commitSha, deployedAt, productCount }`.
+   - The worker verifies publication by querying `GET /repos/Rohitpvt/GitStore/deployments?environment=github-pages` and performing a public HTTP check on `https://rohitpvt.github.io/GitStore/data/deployment-manifest.json` before finalizing database status to `published`.
 
 ---
 

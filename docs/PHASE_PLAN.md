@@ -1,8 +1,8 @@
 # GitStore — Master Phase Plan & Development Control System
 
-**Document Version:** 1.1.0  
+**Document Version:** 1.2.0  
 **Last Updated:** 2026-10-30  
-**Current Project State:** Phase 0.1 (Architecture Hardening & Critical Corrections) — `IN_REVIEW` ⏳ | Awaiting User `APPROVED` Gate for Phase 1  
+**Current Project State:** Phase 0.1.2 (Final Security & Architecture Corrections) — `IN_REVIEW` ⏳ | Awaiting User `APPROVED` Gate for Phase 1  
 **Project Lead:** Technical Project Manager, Software Architect, & QA Lead  
 **Governing Standard:** Strict Dual-Platform Confinement (**GitHub** & **Firebase** ONLY)
 
@@ -29,7 +29,8 @@ To ensure strict quality control and eliminate premature execution:
 | Phase | Title | Status | Subphases Completed | Gate Authority |
 |---|---|---|---|---|
 | **Phase 0** | Architecture and Documentation | `APPROVED` ✅ | 100% (Baseline docs created) | User Approved |
-| **Phase 0.1** | Architecture Hardening & Final Validation | `IN_REVIEW` ⏳ | 100% (All 7 critical audits closed) | User Review Pending |
+| **Phase 0.1** | Architecture Hardening & Final Validation | `IN_REVIEW` ⏳ | 100% (Audited & Hardened) | User Review Pending |
+| **Phase 0.1.2**| Final Security & Architecture Corrections | `IN_REVIEW` ⏳ | 100% (All 5 corrections closed) | User Review Pending |
 | **Phase 1** | Frontend Core Foundation (Mock Storefront) | `NOT_STARTED` 🛑 | 0 / 5 Subphases | Requires Phase 0.1 Approval |
 | **Phase 2** | Firebase Foundation and Authentication | `NOT_STARTED` 🛑 | 0 / 4 Subphases | Requires Phase 1 Approval |
 | **Phase 3** | Developer Dashboard and Submission System | `NOT_STARTED` 🛑 | 0 / 4 Subphases | Requires Phase 2 Approval |
@@ -54,20 +55,22 @@ To ensure strict quality control and eliminate premature execution:
 ---
 
 ### Phase 0.1: Architecture Hardening & Final Validation
-- **Status:** `IN_REVIEW` ⏳ (Audited & Corrected in Phase 0.1.1; Awaiting User `APPROVED` Status)
+- **Status:** `IN_REVIEW` ⏳ (Audited, Hardened, and Validated)
 - **Objective:** Audit Phase 0 architecture for structural, security, and operational gaps; correct trust boundaries; establish canonical repository collaborator checks; eliminate placeholder accounts; implement multi-product repository hierarchy; design self-healing publication loop; remove unapproved platform assumptions (Fastly); correct reCAPTCHA quotas.
-- **Subphases:**
-  1. *0.1.1 — Administrator Authorization Audit (Corrected):* Verify admin permissions strictly against GitStore's canonical repository (`Rohitpvt/GitStore`). Extract immutable numeric GitHub IDs via Firebase Admin SDK. Bootstrap via repository ownership.
-  2. *0.1.2 — Issue Form Identity & Ownership Audit (Corrected):* Eliminate fake placeholder accounts. Store `submitterGithubId` with `claimStatus: 'unclaimed'`. Restrict auto-publication strictly to Direct Personal Repository Owners. Gate Org Members, Committers, and Community Nominators to `needs_review`.
-  3. *0.1.3 — Security Rules & Lease Hardening:* Prevent client role manipulation (`isAdmin`, `isVerifiedDeveloper`) and client lease claiming; establish atomic transaction pseudocode.
-  4. *0.1.4 — GitHub Pages Policy Reassessment:* Categorize policy compliance accurately; establish Phase 4 Pre-Launch Gate for written confirmation from GitHub Support.
-  5. *0.1.5 — App Check & Spark Quotas Revalidation (Corrected):* Re-evaluate Google Cloud reCAPTCHA v3 quota (10,000 assessments/month); lazy-load App Check strictly on authenticated developer pages; remove all references to Fastly.
-  6. *0.1.6 — Batch Processing Reliability & Self-Healing (Corrected):* Multi-product decoupling (`prod_{owner}_{slug}`); Two-Phase commit protocol paired with startup `reconcilePublishedState()` self-healing loop for reverse failure recovery.
-  7. *0.1.7 — Master Phase Tracking Plan:* Author `PHASE_PLAN.md` and synchronize with `ROADMAP.md`.
-- **Files Created / Modified:**
-  - Created: `PHASE_PLAN.md`, `LICENSE`, `.gitignore`, `.gitattributes`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `.github/` templates.
-  - Modified (Updated to v1.2.0): All 13 documents in `docs/` and root.
-- **Definition of Done (DoD):** All 7 audit domains resolved, 13 documentation files updated, `PHASE_PLAN.md` created, Phase 0.1 completion report delivered, zero application code written.
+
+---
+
+### Phase 0.1.2: Final Security and Architecture Corrections
+- **Status:** `IN_REVIEW` ⏳ (Corrections Authored & Synchronized; Awaiting Gate)
+- **Objective:** Execute independent corrections on 5 critical architecture domains:
+  1. *Correction A — Collaborator Permission Mapping:* Fix `permission` vs `role_name` check against `GET /repos/Rohitpvt/GitStore/collaborators/{username}/permission`. Fail-closed policy for `admin` and `maintain`. Token access classified as pending integration verification.
+  2. *Correction B — Provider Identity Lookup & Secure Claiming:* Use `.find(p => p.providerId === 'github.com')?.uid`. Implement asynchronous `/claim_requests` queue with Firebase Admin SDK validation and rules protection.
+  3. *Correction C — Globally Unique Entity Identities:* Base repository and product keys on GitHub's immutable numeric repository ID (`gh_repo_{repoId}`, `prod_{repoId}_{productSlug}`). Eliminate cross-repo collisions.
+  4. *Correction D — Two-Tier Publication State Machine:* Implement recoverable state machine (`approved` -> `catalog_committed` -> `deploying` -> `deployment_verified` -> `published`). Verify deployment via Deployments API and public HTTP `deployment-manifest.json`. Detail 10 failure recovery scenarios.
+  5. *Correction E — App Check reCAPTCHA Enterprise:* Clarify that the 10,000 free monthly assessment allowance applies to reCAPTCHA Enterprise. Detail 1-hour token TTL caching and decouple assessments from Firestore operations.
+  6. *Additional Safeguards & Ownership Distinction:* Enforce `process.env.GITHUB_REPOSITORY === 'Rohitpvt/GitStore'`, distinguish repo ownership vs release authority vs verified developer badge, and retain GitHub Pages policy gate as unresolved.
+- **Files Modified:** All 13 architecture and specification documents under `docs/` and root `README.md`.
+- **Definition of Done (DoD):** All 5 corrections and safeguards documented, test fixtures specified, zero application code written, synchronized with `ROADMAP.md`.
 
 ---
 

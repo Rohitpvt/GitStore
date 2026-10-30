@@ -1,8 +1,8 @@
 # GitStore — System Design Document (SDD)
 
-**Document Version:** 1.2.0  
-**Phase:** Phase 0.1.1 — Critical Architecture Corrections & Hardening  
-**Status:** Approved Technical Architecture (Corrected)  
+**Document Version:** 1.3.0  
+**Phase:** Phase 0.1.2 — Final Security & Architecture Corrections  
+**Status:** Approved Technical Architecture (Hardened)  
 
 ---
 
@@ -21,8 +21,8 @@ flowchart TD
 
     subgraph FirebaseLayer["Platform 2: Firebase Managed Services (Spark Plan)"]
         FirebaseAuth["Firebase Authentication\n(GitHub OAuth + Magic Link)"]
-        Firestore["Cloud Firestore Operational Database\n(users, submissions, moderation_requests,\nproducts, categories, reports, admin_logs)"]
-        AppCheck["Firebase App Check\n(reCAPTCHA v3 - Lazy Loaded on Auth Pages)"]
+        Firestore["Cloud Firestore Operational Database\n(users, submissions, claim_requests,\nmoderation_requests, products, categories)"]
+        AppCheck["Firebase App Check\n(reCAPTCHA Enterprise - Lazy Loaded on Auth Pages)"]
         SecurityRules["Firestore Security Rules\n(Granular RBAC & Immutability)"]
     end
 
@@ -31,13 +31,29 @@ flowchart TD
         GHIssues["GitHub Issue Forms\n(.github/ISSUE_TEMPLATE)"]
         GHReleases["Public GitHub Releases\n(External User Repositories)"]
         GHREST["GitHub REST API v3\n(Canonical Repo Collaborator Check,\nUpstream Repo, Tag & Asset Validation)"]
-        GHWorker["GitHub Actions Batch Worker\n(Scheduled every 10 min + Manual Dispatch)\n- Concurrency Group Lock\n- 15-Minute Leases\n- Two-Phase Self-Healing Compiler"]
+        GHWorker["GitHub Actions Batch Worker\n(Scheduled every 10 min + Manual Dispatch)\n- Concurrency Group Lock\n- 15-Minute Leases\n- Two-Tier Publication & Reconciler"]
     end
 
     %% Client Interactions
     UserBrowser -->|Read Static Catalog| StaticCatalog
     DevBrowser -->|Authenticate| FirebaseAuth
     DevBrowser -->|Write Submission status: queued| Firestore
+    DevBrowser -.->|Submit via Issue Form| GHIssues
+    DevBrowser -->|Submit Claim Request| Firestore
+    AdminBrowser -->|Enqueue Moderation Request| Firestore
+
+    %% Batch Worker Engine
+    GHWorker -->|1. Run Startup Reconciler loop| Firestore
+    GHWorker -->|2. Process Claim & Moderation Requests| Firestore
+    GHWorker -->|3. Query Ingested Issues| GHIssues
+    GHWorker -->|4. Claim Queued Submissions Limit 3| Firestore
+    GHWorker -->|5. Verify Upstream Metadata| GHREST
+    GHWorker -->|6. Verify Collaborator Rights| GHREST
+    GHWorker -->|7. Push Compiled JSON & Manifest| StaticCatalog
+    GHWorker -->|8. Dispatch Pages Deployment| GHPages
+    GHWorker -->|9. Verify Deployments API & HTTP Manifest| GHREST
+    GHWorker -->|10. Finalize Submissions to published| Firestore
+```
     AdminBrowser -->|Enqueue Moderation Request| Firestore
     Firestore --- SecurityRules
     Firestore --- AppCheck
@@ -116,7 +132,7 @@ sequenceDiagram
     GHRel-->>Visitor: Stream binary directly from creator's GitHub Release asset
 ```
 
-### 3.2 Submission to Publication Data Flow (Self-Healing Two-Phase Protocol)
+### 3.2 Submission to Publication Data Flow (Recoverable Two-Tier Protocol)
 ```mermaid
 sequenceDiagram
     autonumber
@@ -137,29 +153,56 @@ sequenceDiagram
     Worker->>DB: Atomic Transaction Claim (batch limit = 3)
     Worker->>GHAPI: Verify repository, release tag, asset extension & size
     GHAPI-->>Worker: 200 OK (Metadata confirmed)
-    alt Developer is UNVERIFIED or Org/Committer/Community
+    alt Submitter is Org/Committer/Community (Lacks Inherent Release Authority)
         Worker->>DB: Update status to 'needs_review'
         Admin->>DB: Enqueue APPROVE in moderation_requests
         Worker->>GHAPI: Verify Admin on Canonical GitStore Repo
-        GHAPI-->>Worker: 200 OK (permission: admin)
+        GHAPI-->>Worker: 200 OK (role_name: 'admin' or 'maintain')
         Worker->>DB: Set submission status to 'approved'
-    else Developer IS Verified AND Direct Personal Owner
+    else Submitter IS Direct Personal Owner (Valid Release Authority)
         Worker->>DB: Update status directly to 'approved'
     end
-    Note over Worker: Phase 1: Compile & Deploy
-    Worker->>Worker: Compile data/catalog.json & data/products/*.json
+    Note over Worker: Static Compilation & Deployment
+    Worker->>DB: Set status to 'catalog_generating'
+    Worker->>Worker: Compile data/catalog.json & deployment-manifest.json
     Worker->>Worker: Git pull --rebase & push origin main
+    Worker->>DB: Set status to 'catalog_committed'
     Worker->>Worker: Dispatch actions/deploy-pages
-    alt Deploy Succeeded
-        Note over Worker: Phase 2: Finalize Database State
+    alt Deploy Succeeded & Manifest Verified via HTTP
         Worker->>DB: Update status to 'published'
-        Worker->>DB: Set /products/prod_{owner}_{slug} to 'active'
-    else Deploy Failed
-        Worker->>DB: Leave status in 'approved' (retried on next run)
+        Worker->>DB: Set /products/prod_{repoNumericId}_{slug} to 'active'
+    else Deploy Failed or Timed Out
+        Worker->>DB: Set status to 'deployment_failed' -> reset to 'approved'
     end
 ```
 
-### 3.3 Privileged Administrator Workflow (Canonical GitStore Repository)
+### 3.3 Secure Issue Form Submission Claiming Flow
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Dev as Developer
+    participant GH as GitHub Issues
+    participant Worker as Actions Batch Worker
+    participant DB as Cloud Firestore
+    participant Client as Web Dashboard
+    participant Auth as Firebase Auth
+
+    Dev->>GH: Open Issue Form (.github/ISSUE_TEMPLATE)
+    Worker->>GH: Ingest issue (user.id: "583231", issue: #42)
+    Worker->>DB: Create /submissions/sub_issue_892341901_42 (submitterGithubId: "583231", claimStatus: "unclaimed")
+    Dev->>Client: Log in via GitHub OAuth
+    Client->>Auth: Authenticate
+    Client->>DB: Create /claim_requests (requesterUid: auth.uid, targetSubmissionId: "sub_issue_892341901_42")
+    Note over Worker: Worker executes batch run
+    Worker->>DB: Fetch pending claim requests
+    Worker->>Auth: admin.auth().getUser(requesterUid)
+    Worker->>Worker: Find provider 'github.com' -> verifiedGithubId: "583231"
+    Worker->>DB: Verify targetSubmission.submitterGithubId === "583231"
+    Worker->>DB: Transaction: Set developerUid = requesterUid, claimStatus = 'claimed'
+    Worker->>DB: Set /claim_requests status to 'completed'
+```
+
+### 3.4 Privileged Administrator Workflow (Canonical GitStore Repository)
 ```mermaid
 sequenceDiagram
     autonumber
@@ -178,13 +221,12 @@ sequenceDiagram
     Actions->>Actions: Extract verified GitHub numeric ID from Firebase Auth
     Actions->>GH: GET /user/{verifiedNumericId} -> get verifiedLogin
     Actions->>GH: GET /repos/Rohitpvt/GitStore/collaborators/{verifiedLogin}/permission
-    GH-->>Actions: Return permission: 'admin'
+    GH-->>Actions: Return role_name: 'admin' (or 'maintain')
     Actions->>FS: Update /submissions/{id} to 'approved'
-    Actions->>FS: Create /products/prod_{owner}_{slug}
     Actions->>FS: Write immutable entry to /admin_logs
     Actions->>FS: Update /moderation_requests/{id} (status: 'completed')
     FS-->>Dashboard: onSnapshot fires with status: 'completed'
-    Dashboard-->>Admin: Show green "Published Live" confirmation
+    Dashboard-->>Admin: Show green "Approved & Queued for Publish" confirmation
 ```
 
 ---
@@ -209,15 +251,16 @@ GitStore/
 │   │   └── pages/                  # Page-specific layout styles
 │   └── js/
 │       ├── config/
-│       │   └── firebase-config.js  # Public client keys & reCAPTCHA v3 init
+│       │   └── firebase-config.js  # Public client keys & reCAPTCHA Enterprise init
 │       ├── api/                    # Auth, Firestore, and Catalog fetch abstractions
 │       ├── components/             # Navbar, product cards, filter bars
 │       └── utils/                  # Sanitizers, formatters, semver helpers
 ├── data/
+│   ├── deployment-manifest.json    # Deployed generationId & commitSha manifest
 │   ├── catalog.json                # Master searchable product index
 │   ├── categories.json             # Category taxonomy and counts
 │   └── products/                   # Granular product records
-│       └── prod_{owner}_{slug}.json
+│       └── prod_{repoId}_{slug}.json
 ├── scripts/
 │   └── processor/
 │       ├── index.js                # Main Actions runner entrypoint
