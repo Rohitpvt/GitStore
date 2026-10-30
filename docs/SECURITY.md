@@ -1,8 +1,8 @@
 # GitStore — Security Architecture & Threat Model
 
-**Document Version:** 1.4.0  
-**Phase:** Phase 0.1.3 — Deployment Integrity, Administrator Bootstrap & Workflow Security  
-**Status:** Approved Security Specification (Hardened)  
+**Document Version:** 1.5.0  
+**Phase:** Phase 0.1.4 — Evidence Alignment, Deployment Recovery & Governance Consistency  
+**Status:** Approved Security Specification (Hardened & Reconciled)  
 
 ---
 
@@ -10,7 +10,10 @@
 
 GitStore operates under a zero-trust model regarding client browsers. Because the application frontend is hosted statically on GitHub Pages and runs entirely on the client side, **the client runtime is treated as potentially adversarial.**
 
-All authorization gates, role escalations, state transitions, and file verifications are enforced either cryptographically at the database layer (Cloud Firestore Security Rules) or within an authenticated, isolated server environment (GitHub Actions Runners).
+All authorization gates, role escalations, state transitions, and file verifications are governed either at the database layer (Cloud Firestore Security Rules) or within an authenticated, isolated server environment (GitHub Actions Runners).
+
+> [!IMPORTANT]
+> **Evidence Classification Standard:** To preserve rigorous engineering integrity, security controls are classified strictly by their verified evidence state (`DESIGNED`, `DOCUMENTATION_VERIFIED`, `CONFIGURATION_VERIFIED`, `IMPLEMENTED`, `INTEGRATION_TESTED`, or `PENDING_INTEGRATION_TEST`). Controls are never described as "enforced" at runtime until live deployed verification has occurred.
 
 ---
 
@@ -54,19 +57,38 @@ Browser-submitted usernames, claims, and client-asserted UIDs are completely ign
    const decodedToken = await admin.auth().verifyIdToken(idToken, true);
    const verifiedUid = decodedToken.uid;
    ```
-3. The worker queries the Firebase Admin SDK for user record metadata:
+   *(Evidence: DOCUMENTATION_VERIFIED via Firebase Admin SDK official documentation; live Actions verification is PENDING_INTEGRATION_TEST).*
+3. The worker queries the Firebase Admin SDK for user record metadata and validates the linked GitHub provider:
    ```javascript
+   // Identity normalization function (fail-closed numeric validator)
+   function normalizeGithubId(val) {
+     if (val == null) return null;
+     const str = String(val).trim();
+     if (!/^\d+$/.test(str)) return null;
+     return str;
+   }
+
    const userRecord = await admin.auth().getUser(verifiedUid);
    const ghProvider = userRecord.providerData.find(p => p.providerId === 'github.com');
    if (!ghProvider || !ghProvider.uid) {
      throw new Error("UNAUTHORIZED: Caller has no verified GitHub identity linked in Firebase Auth");
    }
-   const verifiedCallerNumericId = ghProvider.uid; // Immutable numeric GitHub ID string
+   const verifiedCallerNumericId = normalizeGithubId(ghProvider.uid);
+   if (!verifiedCallerNumericId) {
+     throw new Error("UNAUTHORIZED: Caller GitHub provider UID is non-numeric or malformed");
+   }
    ```
-4. The worker **fails closed**: if the GitHub provider is missing, unlinked, or ambiguous, all elevated access is immediately aborted.
+4. **Data Type Representation Details (String vs Integer):**
+   - Firebase Authentication stores the GitHub user's numeric ID as a **string** in `userRecord.providerData[i].uid` (e.g. `"12345678"`).
+   - GitHub's REST API returns `id` and `owner.id` as **numeric integers** (e.g. `12345678`).
+   - Normalizing both values via `normalizeGithubId()` converts all inputs to trimmed numeric digit strings and verifies against `/^\d+$/`, eliminating type conversion vulnerabilities or whitespace manipulation.
+5. **Account Linking / Unlinking Invariants:**
+   - The worker never assumes `userRecord.uid === githubId`.
+   - If an account unlinks its GitHub provider, `providerData.find(p => p.providerId === 'github.com')` returns `undefined`, instantly terminating administrative privileges.
+6. The worker **fails closed**: if the GitHub provider is missing, unlinked, or ambiguous, all elevated access is immediately aborted.
 
 ### 3.3 Root Administrator Bootstrap Verification Flow
-Repository ownership alone does not authenticate the person making an administrative request. A secure, immutable bootstrap mechanism is enforced:
+Repository ownership alone does not authenticate the person making an administrative request. A secure, immutable bootstrap mechanism is designed:
 
 1. **Retrieve Canonical Repository Owner Identity:**
    The worker queries GitHub's repository metadata:
@@ -74,19 +96,20 @@ Repository ownership alone does not authenticate the person making an administra
    The response contains `owner.id`—an immutable integer assigned by GitHub (e.g. `12345678`). Alternatively, this integer is pre-verified and configured in the worker environment as `BOOTSTRAP_ROOT_ADMIN_GITHUB_ID`.
 2. **Compare Caller Identity Against Owner Identity:**
    ```javascript
-   const canonicalOwnerNumericId = String(repoMetadata.owner.id);
-   const isRootAdministrator = (String(verifiedCallerNumericId) === canonicalOwnerNumericId);
+   const canonicalOwnerNumericId = normalizeGithubId(repoMetadata.owner.id);
+   const isRootAdministrator = (verifiedCallerNumericId === canonicalOwnerNumericId);
    ```
 3. **Fail-Closed Authorization:**
    - If `isRootAdministrator` is `true`, root administrative authority is established.
    - If `false`, the worker checks whether the caller is an authorized delegated maintainer (Section 3.4).
    - If neither, the request is rejected with `403 FORBIDDEN` and an audit entry is created in `/admin_logs`.
+   *(Evidence: DESIGNED and DOCUMENTATION_VERIFIED; live comparison is PENDING_INTEGRATION_TEST).*
 4. **Account Unlinking & Provider Changes:**
    If the administrator unlinks their GitHub account or alters their sign-in provider in Firebase Auth, `providerData.find(...)` returns `undefined`, immediately terminating administrator access on the next worker cycle.
 5. **Emergency Administrator Revocation & Account Recovery:**
    - *GitHub Account Compromise:* The owner or organization revokes repository collaborator privileges on `Rohitpvt/GitStore` in GitHub settings.
    - *Firebase Token Invalidation:* The root administrator executes token revocation via Firebase Admin SDK: `await admin.auth().revokeRefreshTokens(compromisedUid)`.
-   - *Real-Time Enforcement:* Because the worker validates collaborator permissions live against GitHub on each batch cycle, revoking access on GitHub immediately halts worker execution for that identity.
+   - *Real-Time Verification:* Because the worker validates collaborator permissions live against GitHub on each batch cycle, revoking access on GitHub immediately halts worker execution for that identity.
 
 ### 3.4 Fail-Closed Collaborator Permission Check (Delegated Maintainers)
 For callers other than the root administrator, the worker resolves the current login handle via `GET https://api.github.com/user/{verifiedCallerNumericId}` and queries GitHub's collaborator permission endpoint:
@@ -119,7 +142,7 @@ if (!isAuthorizedAdmin && !isAuthorizedMaintainer) {
 Calling `/repos/{owner}/{repo}/collaborators/{username}/permission` requires `Metadata: read` permissions. In personal repositories, GitHub Actions tokens may behave differently from organization repositories. The worker implements a dual-token strategy:
 - Primary: attempts `secrets.GITHUB_TOKEN` with `permissions: { contents: read, metadata: read }`.
 - Fallback: uses `secrets.ADMIN_VERIFY_TOKEN` (a fine-grained PAT with `Metadata: read` stored in repository secrets).
-*Classification: PENDING INTEGRATION TEST.*
+*(Evidence: DOCUMENTATION_VERIFIED for schema; live Actions collaborator token verification is PENDING_INTEGRATION_TEST).*
 
 ### 3.5 Audit Logging Schema
 Every privileged operation executed by the batch worker generates an immutable entry in `/admin_logs/{logId}`:
@@ -144,18 +167,18 @@ interface AdminAuditLog {
 
 The architecture strictly rejects relying solely on repository name string checks. Forked repositories or malicious pull requests can compromise build environments if untrusted events are granted elevated secrets.
 
-GitStore enforces an **exhaustive event allowlist and restriction matrix**:
+GitStore enforces an **exhaustive event allowlist and restriction matrix** with formal evidence classifications:
 
-| Workflow Trigger Event | Authorization Status | Secrets Access | Allowed Context & Ref Restrictions | Security Controls & Rationale |
-|---|---|---|---|---|
-| **`schedule`** | **ALLOWED** | Yes (`FIREBASE_SERVICE_ACCOUNT`, `GITHUB_TOKEN`) | Default branch (`refs/heads/main`) only | Runs the scheduled batch worker. Executes strictly on the canonical repository default branch. Completely isolated from external PR code. |
-| **`workflow_dispatch`** | **ALLOWED** | Yes (`FIREBASE_SERVICE_ACCOUNT`, `ADMIN_VERIFY_TOKEN`) | Canonical repo collaborators with `write`/`admin` | Allows on-demand batch runs or manual catalog re-compilation. Gated to verified repository collaborators by GitHub Actions permissions. |
-| **`issues: opened, edited`** | **RESTRICTED INGEST** | Scoped / None | Ingestion workflow only | Ingests Issue Form submissions. Runs with minimal permissions (`issues: read`, `contents: read`). Runs parser in strict isolation; never executes user-supplied code or shell commands. |
-| **`pull_request`** | **RESTRICTED** | **NO SECRETS** | Pull requests targeting `main` | Read-only static linting and validation of docs/schema. GitHub Actions automatically withholds repository secrets from fork-originated PRs. |
-| **`pull_request_target`** | ❌ **FORBIDDEN** | **NONE (BANNED)** | Not permitted in GitStore repository | **CRITICAL:** `pull_request_target` executes in the context of the base repository with full access to secrets, but can check out and run untrusted code from the fork PR. Strictly prohibited. |
-| **`workflow_run`** | ❌ **FORBIDDEN** | **NONE (BANNED)** | Not permitted for untrusted triggers | Avoids untrusted artifact injection and cross-workflow privilege escalation. |
-| **`repository_dispatch`** | ❌ **RESTRICTED** | Restricted | Not used in MVP | Not needed under single-workflow Option A architecture. |
-| **`push`** | **RESTRICTED** | No Privileged Pipeline | Protected `main` branch only | Pushes to `main` are restricted by branch protection rules (require review/checks). Ordinary pushes do NOT trigger the privileged publisher to avoid push-suppression conflicts and deployment thrashing. |
+| Workflow Trigger Event | Authorization Status | Secrets Access | Allowed Context & Ref Restrictions | Security Controls & Rationale | Evidence Classification |
+|---|---|---|---|---|---|
+| **`schedule`** | **ALLOWED** | Yes (`FIREBASE_SERVICE_ACCOUNT`, `GITHUB_TOKEN`) | Default branch (`refs/heads/main`) only | Runs the scheduled batch worker. Executes strictly on the canonical repository default branch. Completely isolated from external PR code. | `DOCUMENTATION_VERIFIED` (Workflow syntax); live execution is `PENDING_INTEGRATION_TEST` |
+| **`workflow_dispatch`** | **ALLOWED** | Yes (`FIREBASE_SERVICE_ACCOUNT`, `ADMIN_VERIFY_TOKEN`) | Canonical repo collaborators with `write`/`admin` | Allows on-demand batch runs or manual catalog re-compilation. Gated to verified repository collaborators by GitHub Actions permissions. | `DOCUMENTATION_VERIFIED` (GitHub API permissions); live check is `PENDING_INTEGRATION_TEST` |
+| **`issues: opened, edited`** | **RESTRICTED INGEST** | Scoped / None | Ingestion workflow only | Ingests Issue Form submissions. Runs with minimal permissions (`issues: read`, `contents: read`). Runs parser in strict isolation; never executes user-supplied code or shell commands. | `DESIGNED` |
+| **`pull_request`** | **RESTRICTED** | **NO SECRETS** | Pull requests targeting `main` | Read-only static linting and validation of docs/schema. GitHub Actions automatically withholds repository secrets from fork-originated PRs. | `DOCUMENTATION_VERIFIED` (Actions runner security boundary) |
+| **`pull_request_target`** | ❌ **FORBIDDEN** | **NONE (BANNED)** | Not permitted in GitStore repository | **CRITICAL:** `pull_request_target` executes in the context of the base repository with full access to secrets, but can check out and run untrusted code from the fork PR. Strictly prohibited. | `DESIGNED` (Repository policy ban) |
+| **`workflow_run`** | ❌ **FORBIDDEN** | **NONE (BANNED)** | Not permitted for untrusted triggers | Avoids untrusted artifact injection and cross-workflow privilege escalation. | `DESIGNED` |
+| **`repository_dispatch`** | ❌ **RESTRICTED** | Restricted | Not used in MVP | Not needed under single-workflow Option A architecture. | `DESIGNED` |
+| **`push`** | **RESTRICTED** | No Privileged Pipeline | Protected `main` branch only | Pushes to `main` are restricted by branch protection rules (require review/checks). Ordinary pushes do NOT trigger the privileged publisher to avoid push-suppression conflicts and deployment thrashing. | `DOCUMENTATION_VERIFIED` (Token push suppression behavior) |
 
 #### Architectural Guardrails Against Fork Escalation:
 1. **Zero Untrusted Pull Request Secrets:** No workflow responding to `pull_request` receives `FIREBASE_SERVICE_ACCOUNT` or write tokens.
@@ -302,3 +325,26 @@ While GitHub documentation specifies that `Metadata: read` allows querying colla
 
 GitStore operates under an absolute non-execution invariant:
 > "GitStore provides discovery and metadata verification only. GitStore does NOT execute, sandbox, or certify compiled binaries. Downloads are served directly from the author's public GitHub repository. Verify software source and run appropriate local anti-malware scanners prior to running executables."
+
+---
+
+## 9. Comprehensive Evidence Alignment & Verification Matrix
+
+In accordance with Phase 0.1.4 requirements, every security control and operational boundary is classified by its verified evidence status. Controls are never labeled "enforced" until live integration verification succeeds:
+
+| Area | Design status | Evidence | Runtime test status | Remaining action |
+|---|---|---|---|---|
+| **GitHub Actions Event Allowlist** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Workflow trigger syntax, Actions runner security model) | `PENDING_INTEGRATION_TEST` | Validate trigger gating on live canonical repository in Phase 4/6. |
+| **Firebase ID-Token Verification** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Firebase Admin SDK `verifyIdToken(token, true)` official docs) | `PENDING_INTEGRATION_TEST` | Execute integration test in Phase 2 with simulated expired/revoked tokens. |
+| **Root Administrator Bootstrap** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (GitHub API `owner.id` numeric format & Firebase provider UID docs) | `PENDING_INTEGRATION_TEST` | Execute live comparison test against `Rohitpvt/GitStore` metadata in Phase 2/4. |
+| **Numeric ID Normalization (`normalizeGithubId`)** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (ECMAScript regex `/^\d+$/` and String conversion) | `PENDING_INTEGRATION_TEST` | Execute unit test suite with integer, string, whitespace, and corrupt inputs in Phase 2. |
+| **Firestore Claim-Request Rules Whitelist** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Firestore rules syntax `keys().hasOnly()` and size bounds) | `PENDING_INTEGRATION_TEST` | Run automated rules suite against Firebase Emulator in Phase 2. |
+| **Moderation Request Queue Security** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Firestore Security Rules specification) | `PENDING_INTEGRATION_TEST` | Verify client write restriction and worker processing in Phase 5. |
+| **Deployment Concurrency & Environment Boundary** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (GitHub Actions environment concurrency & Firestore lease mechanics) | `PENDING_INTEGRATION_TEST` | Test concurrent runner execution and queue serialization in Phase 4. |
+| **Deterministic Post-Commit SHA Recovery** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Git CLI `log` and `show` blob reading capabilities) | `PENDING_INTEGRATION_TEST` | Simulate crashed worker post-push and verify recovery in Phase 4 integration suite. |
+| **Four-Case Generation Ordering & Idempotency** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Firestore monotonic integer transaction logic) | `PENDING_INTEGRATION_TEST` | Simulate stale generations and sequence conflicts in Phase 4/6. |
+| **Pages Deployment API Status Verification** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Official GitHub Pages deployment endpoint `status: "succeed"`) | `PENDING_INTEGRATION_TEST` | Verify live polling against Pages API in Phase 4. |
+| **Public CDN Manifest Verification** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (HTTP GET cache-busting and JSON schema matching) | `PENDING_INTEGRATION_TEST` | Measure edge CDN propagation delay under live deployment in Phase 4/6. |
+| **reCAPTCHA Enterprise Auto-Refresh Config** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Firebase App Check v10 SDK `isTokenAutoRefreshEnabled: true` docs) | `PENDING_INTEGRATION_TEST` | Test client token auto-refresh in browser during Phase 2. |
+| **Collaborator API Dual-Token Strategy** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (GitHub REST API permissions documentation) | `PENDING_INTEGRATION_TEST` | Verify `GITHUB_TOKEN` vs `ADMIN_VERIFY_TOKEN` on personal repository in Phase 4. |
+| **GitHub Pages Non-Commercial Policy Gate** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Official published GitHub Pages limits and ToS) | `PENDING_INTEGRATION_TEST` | Obtain formal written confirmation from GitHub Support in Phase 4 Launch Gate. |

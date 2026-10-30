@@ -1,8 +1,8 @@
 # GitStore — Comprehensive Testing Strategy
 
-**Document Version:** 1.4.0  
-**Phase:** Phase 0.1.3 — Deployment Integrity, Administrator Bootstrap & Workflow Security  
-**Status:** Approved Quality Assurance & Testing Framework (Hardened)  
+**Document Version:** 1.5.0  
+**Phase:** Phase 0.1.4 — Evidence Alignment, Deployment Recovery & Governance Consistency  
+**Status:** Approved Quality Assurance & Testing Framework (Hardened & Reconciled)  
 
 ---
 
@@ -68,13 +68,24 @@ flowchart TD
 - **Key Test Scenarios:**
 
 ### 5.1 Root Administrator Bootstrap & Collaborator Permission Mapping
-Test both root admin bootstrap identity assertion and delegated maintainer fixtures:
-1. **Root Administrator Bootstrap Test:**
+Test root admin bootstrap identity assertion, numeric ID normalization, and delegated maintainer fixtures:
+1. **Numeric ID Normalization Unit Tests (`normalizeGithubId`):**
+   ```javascript
+   assert.strictEqual(normalizeGithubId(12345678), "12345678");
+   assert.strictEqual(normalizeGithubId("12345678"), "12345678");
+   assert.strictEqual(normalizeGithubId("  12345678  "), "12345678");
+   assert.strictEqual(normalizeGithubId(null), null);
+   assert.strictEqual(normalizeGithubId(undefined), null);
+   assert.strictEqual(normalizeGithubId(""), null);
+   assert.strictEqual(normalizeGithubId("abc123"), null);
+   assert.strictEqual(normalizeGithubId("12.34"), null);
+   ```
+2. **Root Administrator Bootstrap Test:**
    - Mock `GET /repos/Rohitpvt/GitStore` returning `{ owner: { id: 12345678, login: "Rohitpvt" } }`.
    - Mock Firebase Admin SDK `admin.auth().verifyIdToken()` returning `uid: "admin_uid"`.
    - Mock `admin.auth().getUser("admin_uid")` returning `providerData: [{ providerId: "github.com", uid: "12345678" }]`.
    - Assert: Caller is authenticated as ROOT ADMINISTRATOR directly without making collaborator endpoint queries.
-2. **Collaborator Permission Mapping Test Fixtures (Delegated Maintainers):**
+3. **Collaborator Permission Mapping Test Fixtures (Delegated Maintainers):**
    ```javascript
    const fixtures = [
      { resp: { permission: 'admin', role_name: 'admin' }, expected: 'AUTHORIZED' },
@@ -105,8 +116,17 @@ Test both root admin bootstrap identity assertion and delegated maintainer fixtu
 ### 5.4 Publication State Machine, Non-Circular Manifest & Dedicated Pages API Tests
 - **Non-Circular Manifest Content Check:**
   - Compile static catalog and inspect generated `data/deployment-manifest.json`.
-  - Assert manifest contains `generationId`, `generationSequence`, `deployedAt`, `productCount`, and `environment`.
-  - Assert manifest does **NOT** contain `commitSha`.
+  - Assert manifest contains `generationId`, `generationSequence`, `generatedAt`, `productCount`, and `environment`.
+  - Assert manifest does **NOT** contain `commitSha` and does **NOT** contain `deployedAt`.
+- **Post-Commit Firestore Failure Recovery Test:**
+  - Simulate pushed Git commit on `origin/main` containing manifest `{ generationId: "gen_test_02", generationSequence: 105 }`, but Firestore `/system_deployments/gen_test_02.catalogCommitSha` is null.
+  - Reconciler executes `git log -n 10` and `git show` blob inspection.
+  - Assert: Reconciler extracts matching commit SHA, atomically writes `catalogCommitSha` to Firestore, and resumes deployment idempotently.
+  - Simulate remote search finding no matching commit -> generation marked `status: 'failed'`, `failureReason: 'commit_not_found_on_remote'`, submissions cleanly coalesced into next run.
+- **Duplicate Sequence Conflict Test (Case 3):**
+  - Set `latestPublishedSequence = 105`, `latestPublishedGenerationId = "gen_first"`.
+  - Simulate a competing worker attempting finalization with `generationSequence = 105`, `generationId = "gen_second"`.
+  - Assert: Reconciler triggers Case 3, fails closed, logs `DEPLOYMENT_SEQUENCE_CONFLICT` alarm in `/admin_logs`, and aborts without mutating publication state.
 - **Dedicated GitHub Pages API Status Test:**
   - Mock dedicated Pages deployment endpoint `GET /repos/Rohitpvt/GitStore/pages/deployments/101` returning `{ "status": "succeed" }`.
   - Assert worker correctly identifies Pages-specific success status `"succeed"`.

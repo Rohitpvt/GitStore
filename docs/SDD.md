@@ -1,8 +1,8 @@
 # GitStore — System Design Document (SDD)
 
-**Document Version:** 1.4.0  
-**Phase:** Phase 0.1.3 — Deployment Integrity, Administrator Bootstrap & Workflow Security  
-**Status:** Approved Technical Architecture (Hardened)  
+**Document Version:** 1.5.0  
+**Phase:** Phase 0.1.4 — Evidence Alignment, Deployment Recovery & Governance Consistency  
+**Status:** Approved Technical Architecture (Hardened & Reconciled)  
 
 ---
 
@@ -164,14 +164,14 @@ sequenceDiagram
     end
     Note over Worker: Static Compilation & Single-Workflow Deployment (Option A)
     Worker->>DB: Set status to 'catalog_generating'
-    Worker->>Worker: Compile data/catalog.json & non-circular deployment-manifest.json
+    Worker->>Worker: Compile data/catalog.json & deployment-manifest.json (generatedAt, no SHA)
     Worker->>Worker: Git pull --rebase & push origin main
-    Worker->>Worker: Capture catalogCommitSha via git rev-parse HEAD
+    Worker->>Worker: Capture catalogCommitSha via git rev-parse HEAD (or recover via git log)
     Worker->>DB: Set status to 'catalog_committed', write /system_deployments/{genId}
-    Worker->>Worker: Execute actions/upload-pages-artifact & deploy-pages (in same run)
+    Worker->>Worker: Execute actions/upload-pages-artifact & deploy-pages (concurrency: github-pages)
     Worker->>GHAPI: Query Pages deployment API (GET /pages/deployments/{id})
     GHAPI-->>Worker: Return status: 'succeed'
-    Worker->>Worker: HTTP check data/deployment-manifest.json (verify genId & seq)
+    Worker->>Worker: HTTP check data/deployment-manifest.json (verify genId & 4-case monotonic seq)
     alt Deploy Succeeded & Manifest Verified via HTTP
         Worker->>DB: Update status to 'published'
         Worker->>DB: Set /products/prod_{repoNumericId}_{slug} to 'active'
@@ -265,7 +265,7 @@ GitStore/
 │       ├── components/             # Navbar, product cards, filter bars
 │       └── utils/                  # Sanitizers, formatters, semver helpers
 ├── data/
-│   ├── deployment-manifest.json    # Deployed generationId & generationSequence manifest (no SHA)
+│   ├── deployment-manifest.json    # Deployed generationId, generationSequence & generatedAt manifest (no SHA)
 │   ├── catalog.json                # Master searchable product index
 │   ├── categories.json             # Category taxonomy and counts
 │   └── products/                   # Granular product records

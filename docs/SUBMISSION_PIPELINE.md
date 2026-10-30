@@ -1,8 +1,8 @@
 # GitStore — Submission Pipeline & Batch Processing Engine
 
-**Document Version:** 1.4.0  
-**Phase:** Phase 0.1.3 — Deployment Integrity, Administrator Bootstrap & Workflow Security  
-**Status:** Approved Pipeline Architecture (Hardened)  
+**Document Version:** 1.5.0  
+**Phase:** Phase 0.1.4 — Evidence Alignment, Deployment Recovery & Governance Consistency  
+**Status:** Approved Pipeline Architecture (Hardened & Reconciled)  
 **Execution Engine:** GitHub Actions (`.github/workflows/batch-processor.yml`)
 
 ---
@@ -175,19 +175,19 @@ flowchart TD
 
 ### 5.1 Deployment Verification, Concurrency & Monotonic Ordering Details
 
-#### 1. Non-Circular Manifest Architecture
+#### 1. Non-Circular Manifest Architecture & Generation Timestamping
 The static catalog publication creates `data/deployment-manifest.json` containing:
 ```json
 {
   "generationId": "gen_1730300400000_a1b2c3d4",
   "generationSequence": 104,
-  "deployedAt": "2026-10-30T18:00:00.000Z",
+  "generatedAt": "2026-10-30T18:00:00.000Z",
   "productCount": 42,
-  "schemaVersion": "1.4.0",
+  "schemaVersion": "1.5.0",
   "environment": "github-pages"
 }
 ```
-**Strict Invariant:** The manifest does **not** contain the SHA of the Git commit that contains it. Instead:
+**Strict Invariant:** The manifest does **not** contain the SHA of the Git commit that contains it. Furthermore, it records `generatedAt` rather than `deployedAt` because the manifest is generated and committed *before* GitHub Pages deployment executes. The actual deployment timestamp is recorded post-deployment in Firestore (`verifiedAt`, `finalizedAt`, `lastPublishedAt`).
 - The worker commits the manifest and static catalog files.
 - The worker inspects `git rev-parse HEAD` to capture `catalogCommitSha`.
 - The tuple `(generationId, generationSequence, catalogCommitSha)` is recorded in Firestore `/system_deployments/{generationId}` and `/system_config/deployment_state`.
@@ -203,25 +203,44 @@ To resolve GitHub's behavior where commits pushed using `GITHUB_TOKEN` do not tr
 - Catalog generation, Git commit/push, Pages artifact upload (`actions/upload-pages-artifact@v3`), Pages deployment (`actions/deploy-pages@v4`), and database finalization run sequentially inside `.github/workflows/batch-processor.yml`.
 - Eliminates any dependency on push-triggered workflows or elevated personal access tokens.
 
-#### 4. GitHub Actions Concurrency & Durable Coalescing
-- **Queue Semantics:** Standard GitHub Actions concurrency (`concurrency: group: gitstore-batch-worker, cancel-in-progress: false`) retains at most **one running run and one pending run**. If a third run is triggered, the pending run is discarded and replaced.
-- **Durable Coalescing:** GitStore does not rely on runner-level queuing. Instead, when the batch processor runs, it queries **all** submissions currently in `approved` status, coalescing them into a single publication generation (`generationSequence = latestSequence + 1`).
-- **Monotonic Ordering Guard:** Firestore tracks `latestPublishedSequence`. A generation with `generationSequence <= latestPublishedSequence` is permanently barred from marking submissions published or mutating global state.
+#### 4. GitHub Actions Concurrency, Environment Boundaries & Durable Coalescing
+- **Actions Runner Queue & Environment Concurrency Boundary:**
+  - Standard GitHub Actions concurrency (`concurrency: group: gitstore-batch-worker, cancel-in-progress: false`) retains at most **one running run and one pending run**. Intermediate runs are discarded and replaced.
+  - To prevent an older Actions runner from deploying an older artifact to GitHub Pages out-of-order, Pages deployment is bounded by GitHub Environment Concurrency:
+    ```yaml
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    concurrency:
+      group: 'github-pages'
+      cancel-in-progress: false
+    ```
+- **Durable Coalescing (Work Preservation Guarantee):**
+  - GitStore does not rely on runner-level queuing to preserve work. When the batch processor runs, it queries **all** submissions currently in `approved` status via Firestore:
+    `db.collection('submissions').where('status', '==', 'approved').get()`
+  - Even if intermediate runner jobs were discarded by GitHub Actions, all pending approved submissions are safely coalesced into the single active catalog compilation generation. Zero submissions are lost.
+- **Four-Case Generation Ordering & Idempotency Matrix:**
+  Every deployment generation is checked against `/system_config/deployment_state.latestPublishedSequence`:
+  1. *Case 1: Stale Generation (`seq < latestPublishedSequence`):* Rejected immediately. Deployment and finalization aborted to prevent catalog rollback.
+  2. *Case 2: Idempotent Retry (`seq === latestPublishedSequence && id === latestPublishedGenerationId`):* Verified and finalized without re-compiling or re-committing catalog.
+  3. *Case 3: Duplicate Sequence Conflict (`seq === latestPublishedSequence && id !== latestPublishedGenerationId`):* Critical fail-closed condition. Two distinct generation IDs claiming the same sequence number. Deployment halted; high-severity audit alarm logged in `/admin_logs`; operator intervention required.
+  4. *Case 4: Valid New Generation (`seq > latestPublishedSequence`):* Valid progression. Concurrency lease prevents overlap; proceeds to Pages deploy and sequence advance.
 
-### 5.2 Comprehensive 10 Failure Scenarios & Idempotent Recovery Matrix
+### 5.2 Comprehensive 11 Failure Scenarios & Idempotent Recovery Matrix
 
 | # | Failure Scenario | Detection Mechanism | Idempotent Recovery & Consistency Resolution |
 |---|---|---|---|
 | **1** | **Catalog generation failure** | Node.js process throws syntax error or JSON compilation exception prior to commit. | Process aborts. Zero Git commits created. Submissions remain in `approved`. A failed generation record is logged with `stage: 'generation'`. Submissions are cleanly picked up on next batch cycle. |
 | **2** | **Catalog commit failure** | Git push rejected due to concurrent push or branch protection conflict. | Process executes `git reset --hard origin/main`. Submissions remain in `approved`. Zero invalid generation records persisted. Re-compiled on next cycle with updated `origin/main`. |
-| **3** | **Deployment workflow not triggered** | Artifact upload step fails or runner runs out of disk space before Pages deployment starts. | `catalogCommitSha` already exists in Git and is recorded in `/system_deployments/{generationId}` with `status: 'deploying'`. Submissions remain in `catalog_committed` (NOT reverted to `approved`). Reconciler re-executes `actions/upload-pages-artifact` for that exact commit SHA. |
-| **4** | **Deployment queued but never started** | GitHub Pages deployment infrastructure queued or suspended. | Worker 15-minute lease timer expires. Reconciler checks Pages deployment API. If deployment remains queued or unstarted beyond threshold (30m), reconciler cancels stale deployment and re-dispatches deployment for existing `catalogCommitSha`. |
-| **5** | **Pages deployment failure** | Dedicated Pages API returns `{ "status": "failed" }` or deployment times out. | Failure record retained in `/system_deployments/{generationId}` with `status: 'failed'`, `lastObservedPagesStatus: 'failed'`, and `reconciliationStatus: 'pending_retry'`. Submissions are **NEVER reverted to `approved`** because the commit exists on `main`. Reconciler executes retry up to 3 times for the same commit SHA. |
-| **6** | **Pages deploy success, public manifest not yet updated** | Dedicated Pages API reports `status: "succeed"`, but public HTTP fetch returns HTTP 404 or older manifest due to edge CDN propagation delay. | Worker polls public manifest with exponential backoff (5s, 10s, 20s, up to 5m). If still unpropagated, worker leaves generation in `/system_deployments` with `status: 'deploying'`. The startup reconciler in subsequent batch run verifies propagated manifest and finalizes Firestore. |
-| **7** | **Manifest generation mismatch** | Public manifest returns `generationId` different from expected generation. | If public `generationSequence < expectedSequence`, CDN edge cache has not yet refreshed; wait for cache TTL. If public `generationSequence > expectedSequence`, a newer generation already deployed; this older generation is marked `status: 'stale'` and aborted without rolling back Firestore. |
-| **8** | **Firestore finalization failure** | Network drop or Firestore rate limit while updating submission documents to `status: 'published'`. | Pages is already live! Generation record exists in `/system_deployments` with `catalogCommitSha` and `expectedProductIds`. Startup reconciler verifies live manifest and finishes updating unfinalized submissions to `published`. Operation is fully idempotent. |
-| **9** | **Worker interruption during finalization** | GitHub Actions runner preempted or terminated (SIGKILL) midway through batch writes. | 15-minute lease expires. Next batch run detects active generation with unfinalized submissions in `expectedProductIds`. Reconciler completes remaining updates and sets `/system_deployments/{generationId}.status = 'published'`. |
-| **10** | **Newer generation appearing while older generation is deploying** | Mutex lease expired and second worker started, or manual dispatch triggered. | Concurrency lease prevents simultaneous runs. If an older run attempts finalization after a newer generation has already published (`generationSequence <= latestPublishedSequence`), monotonic check drops the older update, preventing regression. |
+| **3** | **Post-commit Firestore failure (Missing commit SHA)** | Git push to `origin/main` succeeds, but runner terminates or network fails *before* worker can persist `catalogCommitSha` in Firestore `/system_deployments/{generationId}`. | **Deterministic Git Log Recovery:** Reconciler queries `git log -n 10 --format="%H" origin/main -- data/deployment-manifest.json`, reads candidate blobs directly via `git show ${sha}:data/deployment-manifest.json`, parses JSON, and matches `generationId` and `generationSequence`. Disambiguates by selecting latest commit on `origin/main`. Atomically saves recovered SHA in `/system_deployments/{generationId}` and resumes Pages deployment. If no remote commit matches, marks `failed` (`failureReason: 'commit_not_found_on_remote'`) and coalesces submissions into next run. |
+| **4** | **Deployment workflow not triggered** | Artifact upload step fails or runner runs out of disk space before Pages deployment starts. | `catalogCommitSha` already exists in Git and is recorded in `/system_deployments/{generationId}` with `status: 'deploying'`. Submissions remain in `catalog_committed` (NOT reverted to `approved`). Reconciler re-executes `actions/upload-pages-artifact` for that exact commit SHA. |
+| **5** | **Deployment queued but never started** | GitHub Pages deployment infrastructure queued or suspended. | Worker 15-minute lease timer expires. Reconciler checks Pages deployment API. If deployment remains queued or unstarted beyond threshold (30m), reconciler cancels stale deployment and re-dispatches deployment for existing `catalogCommitSha`. |
+| **6** | **Pages deployment failure** | Dedicated Pages API returns `{ "status": "failed" }` or deployment times out. | Failure record retained in `/system_deployments/{generationId}` with `status: 'failed'`, `lastObservedPagesStatus: 'failed'`, and `reconciliationStatus: 'pending_retry'`. Submissions are **NEVER reverted to `approved`** because the commit exists on `main`. Reconciler executes retry up to 3 times for the same commit SHA. |
+| **7** | **Pages deploy success, public manifest not yet updated** | Dedicated Pages API reports `status: "succeed"`, but public HTTP fetch returns HTTP 404 or older manifest due to edge CDN propagation delay. | Worker polls public manifest with exponential backoff (5s, 10s, 20s, up to 5m). If still unpropagated, worker leaves generation in `/system_deployments` with `status: 'deploying'`. The startup reconciler in subsequent batch run verifies propagated manifest and finalizes Firestore. |
+| **8** | **Manifest generation mismatch** | Public manifest returns `generationId` different from expected generation. | Evaluated against the 4-case matrix. If `generationSequence < latestPublishedSequence`, wait for CDN edge cache TTL. If `generationSequence > expectedSequence`, newer generation deployed; this generation marked `status: 'stale'`. If duplicate sequence conflict (`seq === latest && id !== latest`), fail closed. |
+| **9** | **Firestore finalization failure** | Network drop or Firestore rate limit while updating submission documents to `status: 'published'`. | Pages is already live! Generation record exists in `/system_deployments` with `catalogCommitSha` and `expectedProductIds`. Startup reconciler verifies live manifest and finishes updating unfinalized submissions to `published`. Operation is fully idempotent. |
+| **10** | **Worker interruption during finalization** | GitHub Actions runner preempted or terminated (SIGKILL) midway through batch writes. | 15-minute lease expires. Next batch run detects active generation with unfinalized submissions in `expectedProductIds`. Reconciler completes remaining updates and sets `/system_deployments/{generationId}.status = 'published'`. |
+| **11** | **Newer generation appearing while older generation is deploying** | Mutex lease expired and second worker started, or manual dispatch triggered. | Concurrency lease prevents simultaneous runs. If an older run attempts finalization after a newer generation has already published (`generationSequence <= latestPublishedSequence`), monotonic check drops the older update, preventing regression. |
 
 ### 5.3 Consistency Guarantee
 GitStore does not claim distributed ACID transactions across GitHub and Firebase. It provides **guaranteed eventual consistency**: if a deployment succeeds, Firestore will heal to match; if a deployment fails, Firestore will not prematurely expose the product on the storefront or create divergent Git-database states.

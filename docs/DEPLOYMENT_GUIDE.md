@@ -1,8 +1,8 @@
 # GitStore — Comprehensive Deployment & Operations Guide
 
-**Document Version:** 1.4.0  
-**Phase:** Phase 0.1.3 — Deployment Integrity, Administrator Bootstrap & Workflow Security  
-**Status:** Approved Operations Manual (Hardened)  
+**Document Version:** 1.5.0  
+**Phase:** Phase 0.1.4 — Evidence Alignment, Deployment Recovery & Governance Consistency  
+**Status:** Approved Operations Manual (Hardened & Reconciled)  
 **Target Environments:** GitHub (Pages & Actions) and Firebase (Auth, Firestore, App Check)
 
 ---
@@ -101,8 +101,9 @@ Before initiating deployment, ensure you possess:
 3. Ensure HTTPS is enforced by checking **Enforce HTTPS**.
 4. Publication Verification Architecture:
    - Modern deployments use `actions/upload-pages-artifact@v3` and `actions/deploy-pages@v4` targeting the `github-pages` environment within the same trusted workflow run (Option A).
-   - The batch worker generates `data/deployment-manifest.json` containing `{ generationId, generationSequence, deployedAt, productCount, schemaVersion: "1.4.0", environment: "github-pages" }` (omitting the Git commit SHA).
+   - The batch worker generates `data/deployment-manifest.json` containing `{ generationId, generationSequence, generatedAt, productCount, schemaVersion: "1.5.0", environment: "github-pages" }` (omitting the Git commit SHA, and accurately recording generation time; deployment timestamps are recorded in Firestore).
    - The worker commits to `main`, captures `catalogCommitSha` via `git rev-parse HEAD`, records the generation in Firestore `/system_deployments/{generationId}`, and queries the dedicated GitHub Pages deployment endpoint `GET /repos/Rohitpvt/GitStore/pages/deployments/{pages_deployment_id}` for status `"succeed"`.
+   - In case of a worker crash post-push before Firestore update, the startup reconciler recovers the SHA via `git log -n 10` and `git show` blob inspection with disambiguation.
    - Finally, the worker performs a public HTTP check on `https://rohitpvt.github.io/GitStore/data/deployment-manifest.json` confirming `generationId` and monotonic `generationSequence` before finalizing database status to `published`.
 
 ---
@@ -129,7 +130,7 @@ firebase deploy --only firestore:indexes
 
 ## 6. Step 5: Automating GitHub Actions Batch Processor
 
-Verify that `.github/workflows/batch-processor.yml` is enabled:
+Verify that `.github/workflows/batch-processor.yml` is enabled with least privilege permissions and environment concurrency:
 
 ```yaml
 name: GitStore Batch Processor
@@ -141,18 +142,22 @@ on:
   workflow_dispatch: # Allows manual trigger from Actions tab by collaborators
 
 permissions:
-  contents: write
-  pages: write
-  id-token: write
-  metadata: read
+  contents: write        # Required for committing static catalog and manifest
+  pages: write           # Required for minting GitHub Pages deployment artifacts
+  id-token: write        # Required for OpenID Connect (OIDC) token minting
+  metadata: read         # Required for inspecting collaborator permissions
 
 concurrency:
-  group: gitstore-batch-worker
+  group: 'github-pages'
   cancel-in-progress: false
 
 jobs:
-  process-and-deploy:
+  build-commit-and-deploy:
     runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -200,6 +205,8 @@ jobs:
         run: |
           node scripts/processor/finalize-publishing.js
 ```
+
+*(Evidence Classification: Workflow design and action versions are DOCUMENTATION_VERIFIED; live execution on the repository is PENDING_INTEGRATION_TEST).*
 
 ---
 

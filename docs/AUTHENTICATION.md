@@ -1,8 +1,8 @@
 # GitStore — Authentication Architecture & Identity Specification
 
-**Document Version:** 1.4.0  
-**Phase:** Phase 0.1.3 — Deployment Integrity, Administrator Bootstrap & Workflow Security  
-**Status:** Approved Authentication Specification (Hardened)  
+**Document Version:** 1.5.0  
+**Phase:** Phase 0.1.4 — Evidence Alignment, Deployment Recovery & Governance Consistency  
+**Status:** Approved Authentication Specification (Hardened & Reconciled)  
 **Provider:** Firebase Authentication (v10 Modular SDK)  
 **Host Environment:** GitHub Pages (`https://<org>.github.io/<repo>/`)
 
@@ -37,14 +37,22 @@ GitHub OAuth is the primary authentication vehicle for GitStore creators:
    `https://github.com/login/oauth/authorize?client_id=...&scope=read:user,user:email`
 4. The user completes authentication directly on `github.com`. **No credentials touch GitHub Pages.**
 5. GitHub issues an authorization code to the Firebase handler, which mints the Firebase session JWT containing the verified, immutable numeric GitHub user ID in `user.providerData`.
-6. Client extracts this verified ID using provider-specific search (never assuming it is the first entry):
+6. Client extracts this verified ID using provider-specific search (never assuming it is the first entry) and normalizes it:
    ```javascript
+   // Identity normalization function (fail-closed numeric validator)
+   function normalizeGithubId(val) {
+     if (val == null) return null;
+     const str = String(val).trim();
+     if (!/^\d+$/.test(str)) return null;
+     return str;
+   }
+
    const githubProvider = auth.currentUser.providerData.find(
      p => p.providerId === 'github.com'
    );
-   const verifiedGithubNumericId = githubProvider?.uid; // Immutable numeric string e.g. "583231"
+   const verifiedGithubNumericId = normalizeGithubId(githubProvider?.uid); // Immutable numeric string e.g. "583231"
    ```
-   Browser-submitted text is **never** trusted as proof of identity.
+   **Identity Format Specification:** Firebase Authentication stores GitHub numeric IDs as string digits in `providerData[i].uid`. GitHub's REST API (`GET /user`) returns this identifier as an integer (`id: 583231`). Both formats are canonicalized via `normalizeGithubId()`. Browser-submitted text is **never** trusted as proof of identity.
 
 ### 2.2 Secondary Identity: Passwordless Email Magic Link
 For developers without immediate GitHub access:
@@ -153,6 +161,7 @@ The architecture distinguishes three discrete operations:
      isTokenAutoRefreshEnabled: true // Must be explicitly configured; not assumed default
    });
    ```
+   *(Evidence: DOCUMENTATION_VERIFIED via official Firebase App Check v10 SDK documentation; browser runtime auto-refresh behavior is PENDING_INTEGRATION_TEST).*
 3. **Firestore Service Requests:** All queries and mutations attach the cached token in the `X-Firebase-AppCheck` header. The Firestore backend validates the token signature locally. **Firestore queries consume 0 additional reCAPTCHA assessments.**
 
 ### 5.3 Billing Configuration & "Zero Surprise Bills" Conditions
@@ -191,13 +200,21 @@ Repository ownership of `Rohitpvt/GitStore` alone does not authenticate the pers
    const decodedToken = await admin.auth().verifyIdToken(idToken, true);
    const userRecord = await admin.auth().getUser(decodedToken.uid);
    ```
-3. **Linked Provider Match:** The worker locates `userRecord.providerData.find(p => p.providerId === 'github.com')`. If absent, ambiguous, or unlinked, the caller is rejected with `403 FORBIDDEN`.
-4. **Immutable ID Assertion:** The worker asserts:
+3. **Linked Provider Match & Normalization:** The worker locates `userRecord.providerData.find(p => p.providerId === 'github.com')`. If absent, ambiguous, or unlinked, the caller is rejected with `403 FORBIDDEN`.
+4. **Immutable ID Assertion with Fail-Closed Normalization:**
    ```javascript
-   const callerGithubId = githubProvider.uid;
-   const isRootAdmin = (String(callerGithubId) === String(canonicalOwnerGithubId));
+   const callerGithubId = normalizeGithubId(githubProvider.uid);
+   const canonicalOwnerGithubId = normalizeGithubId(repoMetadata.owner.id);
+   if (!callerGithubId || !canonicalOwnerGithubId) {
+     throw new Error("UNAUTHORIZED: Invalid or non-numeric GitHub user identifier");
+   }
+   const isRootAdmin = (callerGithubId === canonicalOwnerGithubId);
    ```
-5. **Fail-Closed Principle:** Never trust client-supplied usernames, UIDs, or roles. If identity data is unavailable, all privileged operations fail closed.
-6. **Recovery & Emergency Revocation:**
+   *(Evidence: DOCUMENTATION_VERIFIED via GitHub and Firebase API specifications; live comparison is PENDING_INTEGRATION_TEST).*
+5. **Account Linking / Unlinking Rules:**
+   - The worker never assumes `userRecord.uid === githubId`.
+   - If an account unlinks its GitHub provider, `providerData.find(p => p.providerId === 'github.com')` returns `undefined`, immediately terminating administrative authority.
+6. **Fail-Closed Principle:** Never trust client-supplied usernames, UIDs, or roles. If identity data is unavailable, all privileged operations fail closed.
+7. **Recovery & Emergency Revocation:**
    - If an administrator account is compromised, the repository owner revokes repository collaborator privileges on GitHub and calls `admin.auth().revokeRefreshTokens(uid)` via the Admin SDK.
    - Dynamic real-time collaborator checks on each batch run ensure immediate revocation without waiting for cached credentials to expire.

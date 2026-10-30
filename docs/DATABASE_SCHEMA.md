@@ -1,8 +1,8 @@
 # GitStore — Cloud Firestore Database Schema & Data Architecture
 
-**Document Version:** 1.4.0  
-**Phase:** Phase 0.1.3 — Deployment Integrity, Administrator Bootstrap & Workflow Security  
-**Status:** Approved Schema Baseline (Hardened)  
+**Document Version:** 1.5.0  
+**Phase:** Phase 0.1.4 — Evidence Alignment, Deployment Recovery & Governance Consistency  
+**Status:** Approved Schema Baseline (Hardened & Reconciled)  
 **Database:** Google Cloud Firestore (Native Mode)
 
 ---
@@ -270,15 +270,15 @@ interface ProductDocument {
 ```
 
 ### 2.6 Deployment Manifest & Recovery Metadata (`data/deployment-manifest.json`)
-Compiled alongside `data/catalog.json` and deployed to GitHub Pages to provide public deployment verification. **Notice:** In accordance with non-circular integrity requirements, `data/deployment-manifest.json` does **not** contain the commit SHA of the Git commit containing it:
+Compiled alongside `data/catalog.json` and deployed to GitHub Pages to provide public deployment verification. **Notice:** In accordance with non-circular integrity requirements, `data/deployment-manifest.json` does **not** contain the commit SHA of the Git commit containing it, and records `generatedAt` rather than `deployedAt` (actual deployment timestamp is recorded post-verification in Firestore):
 
 ```typescript
 interface DeploymentManifest {
   generationId: string;              // "gen_{timestamp}_{randomSuffix}" e.g. "gen_1730300400000_a1b2c3d"
   generationSequence: number;        // Monotonically increasing sequence integer e.g. 104
-  deployedAt: string;                // ISO 8601 UTC timestamp
+  generatedAt: string;               // ISO 8601 UTC timestamp of catalog/manifest generation
   productCount: number;              // Total active products in catalog.json
-  schemaVersion: "1.4.0";            // Schema specification version
+  schemaVersion: "1.5.0";            // Schema specification version
   environment: 'github-pages';
 }
 ```
@@ -292,10 +292,10 @@ interface DeploymentManifest {
 interface SystemDeploymentRecord {
   generationId: string;              // Unique generation ID
   generationSequence: number;        // Monotonically incrementing sequence number
-  catalogCommitSha: string;          // Git commit SHA produced after commit (git rev-parse HEAD)
+  catalogCommitSha: string | null;   // Git commit SHA (git rev-parse HEAD or recovered via git log blob inspection)
   expectedProductIds: string[];      // Array of submission IDs included in this generation
   status: 'deploying' | 'published' | 'failed' | 'stale';
-  reconciliationStatus: 'pending_retry' | 'reconciled' | 'abandoned' | 'none';
+  reconciliationStatus: 'pending_retry' | 'reconciled' | 'reconciled_from_git_log' | 'abandoned' | 'none';
   attemptHistory: Array<{
     attemptNumber: number;
     startedAt: FirebaseFirestore.Timestamp;
@@ -345,17 +345,21 @@ interface GlobalDeploymentState {
 
 ## 3. Self-Healing Reconciliation Logic (`reconcilePublishedState`)
 
-This routine runs at the start of every GitHub Actions worker execution to recover from reverse failure scenarios (e.g. GitHub Pages deployment succeeded and propagated to CDN, but worker crashed or network failed before updating Firestore). It checks the dedicated GitHub Pages deployments API and enforces monotonic sequencing:
+This routine runs at the start of every GitHub Actions worker execution to recover from reverse failure scenarios (e.g. GitHub Pages deployment succeeded and propagated to CDN, but worker crashed or network failed before updating Firestore; or worker pushed to `origin/main` but crashed before recording `catalogCommitSha` in Firestore).
+
+It deterministically recovers missing commit SHAs via Git log blob inspection, evaluates the dedicated GitHub Pages deployments API, checks live CDN manifests, and enforces the 4-case monotonic sequencing matrix:
 
 ```javascript
+import { execSync } from 'child_process';
+
 /**
- * Reconciles live deployed GitHub Pages state with Cloud Firestore.
+ * Reconciles live deployed GitHub Pages state and recovers unpersisted Git commit SHAs.
  * Evaluates dedicated Pages deployment API and verifies public HTTP manifest.
  */
 async function reconcilePublishedState(db, octokit, pagesUrl) {
   // 1. Fetch current global deployment state
   const stateDoc = await db.collection('system_config').doc('deployment_state').get();
-  const state = stateDoc.exists ? stateDoc.data() : { latestPublishedSequence: 0 };
+  const state = stateDoc.exists ? stateDoc.data() : { latestPublishedSequence: 0, latestPublishedGenerationId: null };
 
   // 2. Fetch public deployment manifest from live GitHub Pages CDN
   let liveManifest = null;
@@ -370,22 +374,91 @@ async function reconcilePublishedState(db, octokit, pagesUrl) {
     console.warn('[Reconciler] Could not reach public Pages manifest.', err.message);
   }
 
-  // 3. Monotonic ordering assertion
-  if (liveManifest && liveManifest.generationSequence < state.latestPublishedSequence) {
-    console.warn(`[Reconciler] Stale manifest detected on CDN (seq ${liveManifest.generationSequence} < latest ${state.latestPublishedSequence}). Aborting finalization to prevent rollback.`);
-    return;
+  // 3. Four-Case Monotonic Sequence & Idempotency Evaluation
+  if (liveManifest) {
+    const manifestSeq = liveManifest.generationSequence;
+    const manifestId = liveManifest.generationId;
+
+    if (manifestSeq < state.latestPublishedSequence) {
+      // Case 1: Stale Generation on CDN
+      console.warn(`[Reconciler] Case 1 (Stale): CDN manifest sequence (${manifestSeq}) is older than latest published sequence (${state.latestPublishedSequence}). Aborting finalization to prevent rollback.`);
+      return;
+    } else if (manifestSeq === state.latestPublishedSequence && manifestId === state.latestPublishedGenerationId) {
+      // Case 2: Idempotent Retry / Already Verified
+      console.log(`[Reconciler] Case 2 (Idempotent): CDN matches currently published generation ${manifestId} (seq ${manifestSeq}).`);
+    } else if (manifestSeq === state.latestPublishedSequence && manifestId !== state.latestPublishedGenerationId) {
+      // Case 3: Duplicate Sequence Conflict (Split-Brain)
+      console.error(`[Reconciler] CRITICAL SECURITY ALERT: Case 3 (Sequence Conflict). Manifest sequence ${manifestSeq} claimed by distinct generation ${manifestId}, but Firestore has ${state.latestPublishedGenerationId}. Halting reconciler.`);
+      await db.collection('admin_logs').add({
+        action: 'DEPLOYMENT_SEQUENCE_CONFLICT',
+        manifestId,
+        storedId: state.latestPublishedGenerationId,
+        sequence: manifestSeq,
+        timestamp: new Date()
+      });
+      return; // Fail-closed
+    } else {
+      // Case 4: Valid New Generation (manifestSeq > state.latestPublishedSequence)
+      console.log(`[Reconciler] Case 4 (New Generation): CDN manifest sequence ${manifestSeq} advances state past ${state.latestPublishedSequence}.`);
+    }
   }
 
-  // 4. Query active deployments pending finalization
+  // 4. Query active deployments pending finalization or retry
   const pendingGenerations = await db.collection('system_deployments')
     .where('status', 'in', ['deploying', 'failed'])
-    .where('reconciliationStatus', '==', 'pending_retry')
+    .where('reconciliationStatus', 'in', ['pending_retry', 'none'])
     .get();
 
   for (const genDoc of pendingGenerations.docs) {
     const gen = genDoc.data();
 
-    // Check Pages deployment status using dedicated Pages deployment endpoint
+    // 4a. Post-Commit Firestore Failure Recovery: Recover missing catalogCommitSha
+    if (!gen.catalogCommitSha) {
+      console.log(`[Reconciler] Generation ${gen.generationId} has missing catalogCommitSha. Inspecting origin/main history...`);
+      try {
+        const rawLog = execSync('git log -n 10 --format="%H" origin/main -- data/deployment-manifest.json', { encoding: 'utf8' }).trim();
+        const candidateShas = rawLog ? rawLog.split('\n') : [];
+        let recoveredSha = null;
+
+        for (const sha of candidateShas) {
+          try {
+            const blobContent = execSync(`git show ${sha}:data/deployment-manifest.json`, { encoding: 'utf8' });
+            const manifest = JSON.parse(blobContent);
+            if (manifest.generationId === gen.generationId && manifest.generationSequence === gen.generationSequence) {
+              recoveredSha = sha; // Latest on origin/main is encountered first
+              break;
+            }
+          } catch (blobErr) {
+            // Blob unparseable or absent in this candidate commit; continue inspection
+          }
+        }
+
+        if (recoveredSha) {
+          console.log(`[Reconciler] Successfully recovered catalogCommitSha ${recoveredSha} for generation ${gen.generationId}.`);
+          gen.catalogCommitSha = recoveredSha;
+          await genDoc.ref.update({
+            catalogCommitSha: recoveredSha,
+            reconciliationStatus: 'reconciled_from_git_log',
+            updatedAt: new Date()
+          });
+        } else {
+          console.warn(`[Reconciler] No remote commit found on origin/main matching generation ${gen.generationId}. Concluding push never completed.`);
+          await genDoc.ref.update({
+            status: 'failed',
+            failureReason: 'commit_not_found_on_remote',
+            reconciliationStatus: 'abandoned',
+            retryEligibility: false,
+            updatedAt: new Date()
+          });
+          continue; // Move to next generation
+        }
+      } catch (gitErr) {
+        console.error(`[Reconciler] Git inspection failed during SHA recovery:`, gitErr.message);
+        continue;
+      }
+    }
+
+    // 4b. Check Pages deployment status using dedicated Pages deployment endpoint
     let isPagesSucceed = false;
     const latestAttempt = gen.attemptHistory?.[gen.attemptHistory.length - 1];
     if (latestAttempt?.pagesDeploymentId) {
@@ -401,7 +474,7 @@ async function reconcilePublishedState(db, octokit, pagesUrl) {
       }
     }
 
-    // Verify public manifest matches this generation
+    // 4c. Verify public manifest matches this generation
     const isManifestVerified = liveManifest && 
       (liveManifest.generationId === gen.generationId) && 
       (liveManifest.generationSequence === gen.generationSequence);

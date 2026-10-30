@@ -1,8 +1,8 @@
 # GitStore — Master Phase Plan & Development Control System
 
-**Document Version:** 1.3.0  
+**Document Version:** 1.4.0  
 **Last Updated:** 2026-10-30  
-**Current Project State:** Phase 0.1.3 (Deployment Integrity, Administrator Bootstrap & Workflow Security) — `IN_REVIEW` ⏳ | Awaiting User `APPROVED` Gate for Phase 1  
+**Current Project State:** Phase 0.1.4 (Evidence Alignment, Deployment Recovery & Governance Consistency) — `IN_REVIEW` ⏳ | Awaiting User `APPROVED` Gate for Phase 1  
 **Project Lead:** Technical Project Manager, Software Architect, & QA Lead  
 **Governing Standard:** Strict Dual-Platform Confinement (**GitHub** & **Firebase** ONLY)
 
@@ -30,7 +30,7 @@ To ensure strict quality control and eliminate premature execution:
 |---|---|---|---|---|
 | **Phase 0** | Architecture and Documentation | `APPROVED` ✅ | 100% (Baseline docs created) | User Approved |
 | **Phase 0.1** | Architecture Hardening & Final Validation | `IN_REVIEW` ⏳ | 100% (Audited & Hardened) | User Review Pending |
-| **Phase 0.1.3**| Deployment Integrity, Admin Bootstrap & Workflow Security | `IN_REVIEW` ⏳ | 100% (All 11 corrections closed) | User Review Pending |
+| **Phase 0.1.4**| Evidence Alignment, Deployment Recovery & Governance Consistency | `IN_REVIEW` ⏳ | 100% (All 8 core objectives closed) | User Review Pending |
 | **Phase 1** | Frontend Core Foundation (Mock Storefront) | `NOT_STARTED` 🛑 | 0 / 5 Subphases | Requires Phase 0.1 Approval |
 | **Phase 2** | Firebase Foundation and Authentication | `NOT_STARTED` 🛑 | 0 / 4 Subphases | Requires Phase 1 Approval |
 | **Phase 3** | Developer Dashboard and Submission System | `NOT_STARTED` 🛑 | 0 / 4 Subphases | Requires Phase 2 Approval |
@@ -61,21 +61,24 @@ To ensure strict quality control and eliminate premature execution:
 ---
 
 ### Phase 0.1.3: Deployment Integrity, Administrator Bootstrap & Workflow Security
-- **Status:** `IN_REVIEW` ⏳ (Hardening Authored & Synchronized; Awaiting Gate)
-- **Objective:** Execute independent hardening across 11 critical architecture pillars:
-  1. *Non-Circular Manifest Architecture:* Eliminated self-referential `commitSha` from `data/deployment-manifest.json`. Captures `catalogCommitSha` via `git rev-parse HEAD` post-commit and stores tuple `(generationId, generationSequence, catalogCommitSha)` outside Git in `/system_deployments/{generationId}`.
-  2. *Dedicated Pages Deployment API Verification:* Evaluated dedicated endpoint `GET /repos/{owner}/{repo}/pages/deployments/{id}` returning `"status": "succeed"` (Pages-specific).
-  3. *Single-Workflow Deployment Trigger (Option A):* Resolved `GITHUB_TOKEN` push suppression by deploying GitHub Pages in the same trusted workflow run (`.github/workflows/batch-processor.yml`) via `actions/upload-pages-artifact@v3` and `actions/deploy-pages@v4`.
-  4. *Root Administrator Bootstrap:* Established identity assertion comparing canonical owner's immutable numeric GitHub account ID (`owner.id` from `GET /repos/Rohitpvt/GitStore`) with caller's linked `github.com` provider ID extracted via `admin.auth().verifyIdToken()`.
-  5. *Workflow Event Allowlist & Fork Security:* Built explicit event matrix (`schedule`, `workflow_dispatch`, `issues`), strictly prohibiting `pull_request_target` and `workflow_run` to prevent fork PR secret exfiltration and arbitrary code execution.
-  6. *Concurrency & Monotonic Ordering:* Documented Actions queue semantics (single pending run replacement); designed durable coalescing in Firestore and monotonic integer `generationSequence`.
-  7. *Preserving Failed Publication Generations:* Retained full failed generation records in `/system_deployments/{generationId}` with attempt history, without prematurely resetting products to `approved`. Documented 10 idempotent failure recovery scenarios.
-  8. *Claim Request Field Whitelisting:* Hardened Security Rules with `hasOnly(['requestId', 'requesterUid', 'targetSubmissionId', 'status', 'createdAt'])`, blocking all privileged and worker fields.
-  9. *App Check Specification:* Documented `isTokenAutoRefreshEnabled: true`, distinguished token acquisition vs refresh vs Firestore requests, clarified 10,000 monthly assessments across Google Cloud Organization, and explicitly stated the no-billing Spark plan condition for "zero surprise bills".
-  10. *GitHub Token Strategy Classification:* Evaluated permissions and marked collaborator token checks as **PENDING INTEGRATION TEST**.
-  11. *GitHub Pages Policy Gate:* Maintained written confirmation from GitHub Support as a mandatory unresolved pre-launch gate.
-- **Files Modified:** All 13 architecture and specification documents under `docs/`, root `README.md`, and `docs/README.md`.
-- **Definition of Done (DoD):** All 11 pillars documented, ADR-05/07/10 revised, ADR-11/12 added, test fixtures specified, zero application code written, synchronized with `ROADMAP.md`.
+- **Status:** `COMPLETED` ✅ (Superseded by Phase 0.1.4)
+- **Objective:** Execute independent hardening across 11 critical architecture pillars (non-circular manifest, Pages status `succeed`, Option A single-run deployment, root admin bootstrap, workflow event security matrix, claim whitelisting, monotonic sequencing).
+
+---
+
+### Phase 0.1.4: Evidence Alignment, Deployment Recovery & Governance Consistency
+- **Status:** `IN_REVIEW` ⏳ (All 8 Core Objectives Closed; Awaiting User Gate)
+- **Objective:** Reconcile design claims with verified evidence, design deterministic deployment failure recovery, strengthen generation ordering, and synchronize governance documentation:
+  1. *Reconcile Design Claims with Actual Evidence:* Classified every security control as one of: `DESIGNED`, `DOCUMENTATION_VERIFIED`, `CONFIGURATION_VERIFIED`, `IMPLEMENTED`, `INTEGRATION_TESTED`, or `PENDING_INTEGRATION_TEST`. Stripped all unverified runtime claims of "enforced".
+  2. *Deterministic Post-Commit Firestore Failure Recovery:* Designed and specified the algorithm recovering missing `catalogCommitSha` via `git log -n 10 --format="%H" origin/main -- data/deployment-manifest.json` and `git show ${sha}:data/deployment-manifest.json` blob inspection with disambiguation, atomically persisting the matched SHA to Firestore and resuming deployment idempotently.
+  3. *Strengthened Generation Ordering & Idempotency (4-Case Matrix):* Specified exact handling for: (1) Stale generation (`seq < latestPublishedSequence` -> reject); (2) Idempotent retry (`seq === latestPublishedSequence && id === latestPublishedGenerationId` -> verify/retry); (3) Duplicate sequence conflict (`seq === latestPublishedSequence && id !== latestPublishedGenerationId` -> critical fail-closed alarm); (4) Valid new generation (`seq > latestPublishedSequence` -> advance). Documented GitHub Environment Concurrency (`group: 'github-pages'`, `cancel-in-progress: false`) and work preservation guarantee via Firestore coalescing.
+  4. *Corrected Deployment-Manifest Timestamps:* Replaced `deployedAt` with `generatedAt` in `data/deployment-manifest.json`. Established that actual deployment timestamps are recorded post-verification in Firestore (`verifiedAt`, `finalizedAt`, `lastPublishedAt`).
+  5. *Complete Pages Deployment Configuration Requirements:* Documented exact permissions (`contents: write`, `pages: write`, `id-token: write`, `metadata: read`), environment `github-pages`, default branch check, action versions (`checkout@v4`, `setup-node@v4`, `upload-pages-artifact@v3`, `deploy-pages@v4`), and job separation.
+  6. *GitHub-to-Firebase Identity Normalization:* Specified `normalizeGithubId(val)` function, string vs integer representation handling, account unlinking/linking impact, and formally classified live identity comparison as `PENDING_INTEGRATION_TEST`.
+  7. *Governance & ADR Locations Reconciled:* Documented that ADR-01 through ADR-13 reside inside `docs/ARCHITECTURE.md` Section 4; added ADR-13; verified no loose duplicate planning files exist at root.
+  8. *Revised 5-Column Verification Matrix:* Formatted and published comprehensive security verification matrix across all areas.
+- **Files Modified:** All 14 architecture, schema, security, and governance files across `docs/` and root repository.
+- **Definition of Done (DoD):** All 8 problem areas formally closed, ADR-13 added, documentation synchronized, zero application code written, working tree verified clean.
 
 ---
 

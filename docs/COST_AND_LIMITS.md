@@ -1,8 +1,8 @@
 # GitStore — Cost Analysis & Operational Limits Specification
 
-**Document Version:** 1.4.0  
-**Phase:** Phase 0.1.3 — Deployment Integrity, Administrator Bootstrap & Workflow Security  
-**Status:** Approved Operational Cost Baseline (Hardened)  
+**Document Version:** 1.5.0  
+**Phase:** Phase 0.1.4 — Evidence Alignment, Deployment Recovery & Governance Consistency  
+**Status:** Approved Operational Cost Baseline (Hardened & Reconciled)  
 **Budget Objective:** Target $0.00 / Month under Strict Free Quotas (Architectural Estimates; No Unrealistic "Free Forever" Guarantees)
 
 ---

@@ -1,8 +1,8 @@
 # GitStore — Product Requirements Document (PRD)
 
-**Document Version:** 1.4.0  
-**Phase:** Phase 0.1.3 — Deployment Integrity, Administrator Bootstrap & Workflow Security  
-**Status:** Approved Product Requirements (Hardened)  
+**Document Version:** 1.5.0  
+**Phase:** Phase 0.1.4 — Evidence Alignment, Deployment Recovery & Governance Consistency  
+**Status:** Approved Product Requirements (Hardened & Reconciled)  
 **Target Systems:** GitHub (Pages, Actions, Issues, Releases) & Firebase (Auth, Cloud Firestore, Security Rules, App Check)
 
 ---
@@ -90,11 +90,11 @@ GitStore is a specialized, open, high-performance software discovery and distrib
 - **Non-Execution Invariant:** GitStore never executes submitted files or binaries. All validation is structural, cryptographic, and metadata-focused via the GitHub REST API.
 - **Zero-Trust Client Security:** Firestore Security Rules prohibit client privilege self-escalation. Admin operations execute strictly inside GitHub Actions.
 - **Recoverable Two-Tier Publication State Machine:** Submissions transition to `published` in Firestore only after:
-  1. Compiling a non-circular manifest (`data/deployment-manifest.json` omits commit SHAs).
+  1. Compiling a non-circular manifest (`data/deployment-manifest.json` records `generatedAt` and monotonic `generationSequence`, omitting commit SHAs).
   2. Single-workflow deployment (Option A) executing `actions/upload-pages-artifact@v3` and `actions/deploy-pages@v4` in `.github/workflows/batch-processor.yml`.
   3. GitHub Pages deployment confirmation via the dedicated Pages deployment endpoint (`GET .../pages/deployments/{id}` returning `"status": "succeed"`).
-  4. Public HTTP manifest verification asserting matching `generationId` and monotonic `generationSequence`.
-  5. Backed by an automated reconciliation loop and durable preservation of failed generations in `/system_deployments/{generationId}` (never prematurely reverting products to `approved`).
+  4. Public HTTP manifest verification asserting matching `generationId` and monotonic `generationSequence` evaluated against the 4-case ordering matrix.
+  5. Backed by an automated reconciliation loop featuring deterministic post-commit SHA recovery via Git log inspection, and durable preservation of failed generations in `/system_deployments/{generationId}` (never prematurely reverting products to `approved`). Zero work loss guaranteed by Firestore coalescing.
 
 ### 5.3 Mandatory GitHub Pages Pre-Launch Gate
 - **Pre-Launch Policy Clarification:** While password forms are eliminated to satisfy the sensitive transaction policy, formal written clarification regarding the classification of GitStore as a non-commercial open directory must be obtained from GitHub Support as a formal **Phase 4 Launch Gate**. *Classified as Unresolved / Pending External Confirmation.*
