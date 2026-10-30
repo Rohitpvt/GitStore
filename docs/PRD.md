@@ -1,7 +1,7 @@
 # GitStore — Product Requirements Document (PRD)
 
-**Document Version:** 1.3.0  
-**Phase:** Phase 0.1.2 — Final Security & Architecture Corrections  
+**Document Version:** 1.4.0  
+**Phase:** Phase 0.1.3 — Deployment Integrity, Administrator Bootstrap & Workflow Security  
 **Status:** Approved Product Requirements (Hardened)  
 **Target Systems:** GitHub (Pages, Actions, Issues, Releases) & Firebase (Auth, Cloud Firestore, Security Rules, App Check)
 
@@ -47,7 +47,7 @@ GitStore is a specialized, open, high-performance software discovery and distrib
 ### 3.2 Submission Channels & Account Reconciliation
 - **Developer Web Dashboard:** Authenticated developers submit products with real-time status tracking.
 - **GitHub Issue Forms:** Alternative issue-based submission route. Issue submitters do **not** receive fake placeholder accounts; submissions are recorded as `unclaimed` with their immutable numeric GitHub ID (`sub_issue_{repoNumericId}_{issueNumber}`).
-- **Secure Asynchronous Claiming Queue:** Developers claim issue-submitted applications through `/claim_requests`, validated authoritatively against their linked GitHub account in Firebase Auth by the batch worker.
+- **Secure Asynchronous Claiming Queue:** Developers claim issue-submitted applications through `/claim_requests`, validated authoritatively against their linked GitHub account in Firebase Auth by the batch worker. Client creation is strictly whitelisted via `hasOnly(['requestId', 'requesterUid', 'targetSubmissionId', 'status', 'createdAt'])`, blocking all privileged and worker fields.
 
 ### 3.3 Strict Ownership, Release Authority & Verified Developer Distinction
 1. **Repository Ownership:** Proves control over the repository configuration (`repo.owner.id === submitterGithubId`).
@@ -57,7 +57,7 @@ GitStore is a specialized, open, high-performance software discovery and distrib
 
 ### 3.4 Decoupled Administrator Moderation Workflow
 - Administrative operations write commands to `/moderation_requests`.
-- The Actions worker validates permissions against **GitStore's canonical repository** (`Rohitpvt/GitStore`) collaborator permissions (`role_name === 'admin'` or `'maintain'`) before applying mutations via `firebase-admin`.
+- The Actions worker validates permissions against **GitStore's canonical repository** (`Rohitpvt/GitStore`) root owner immutable numeric ID (`owner.id`) for bootstrap authorization and collaborator roles (`role_name === 'admin'` or `'maintain'`) for maintainers before applying mutations via `firebase-admin`. Zero browser credentials exist.
 
 ### 3.5 Public Storefront Capabilities
 - **Homepage:** Hero showcase, featured applications, category shelves, recent releases.
@@ -89,7 +89,12 @@ GitStore is a specialized, open, high-performance software discovery and distrib
 ### 5.2 Security & Integrity
 - **Non-Execution Invariant:** GitStore never executes submitted files or binaries. All validation is structural, cryptographic, and metadata-focused via the GitHub REST API.
 - **Zero-Trust Client Security:** Firestore Security Rules prohibit client privilege self-escalation. Admin operations execute strictly inside GitHub Actions.
-- **Recoverable Two-Tier Publication State Machine:** Submissions transition to `published` in Firestore only after GitHub Pages deployment confirms success via both the GitHub Deployments API and public HTTP manifest verification, backed by an automated reconciliation loop.
+- **Recoverable Two-Tier Publication State Machine:** Submissions transition to `published` in Firestore only after:
+  1. Compiling a non-circular manifest (`data/deployment-manifest.json` omits commit SHAs).
+  2. Single-workflow deployment (Option A) executing `actions/upload-pages-artifact@v3` and `actions/deploy-pages@v4` in `.github/workflows/batch-processor.yml`.
+  3. GitHub Pages deployment confirmation via the dedicated Pages deployment endpoint (`GET .../pages/deployments/{id}` returning `"status": "succeed"`).
+  4. Public HTTP manifest verification asserting matching `generationId` and monotonic `generationSequence`.
+  5. Backed by an automated reconciliation loop and durable preservation of failed generations in `/system_deployments/{generationId}` (never prematurely reverting products to `approved`).
 
 ### 5.3 Mandatory GitHub Pages Pre-Launch Gate
 - **Pre-Launch Policy Clarification:** While password forms are eliminated to satisfy the sensitive transaction policy, formal written clarification regarding the classification of GitStore as a non-commercial open directory must be obtained from GitHub Support as a formal **Phase 4 Launch Gate**. *Classified as Unresolved / Pending External Confirmation.*

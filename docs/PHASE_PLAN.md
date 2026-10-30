@@ -1,8 +1,8 @@
 # GitStore — Master Phase Plan & Development Control System
 
-**Document Version:** 1.2.0  
+**Document Version:** 1.3.0  
 **Last Updated:** 2026-10-30  
-**Current Project State:** Phase 0.1.2 (Final Security & Architecture Corrections) — `IN_REVIEW` ⏳ | Awaiting User `APPROVED` Gate for Phase 1  
+**Current Project State:** Phase 0.1.3 (Deployment Integrity, Administrator Bootstrap & Workflow Security) — `IN_REVIEW` ⏳ | Awaiting User `APPROVED` Gate for Phase 1  
 **Project Lead:** Technical Project Manager, Software Architect, & QA Lead  
 **Governing Standard:** Strict Dual-Platform Confinement (**GitHub** & **Firebase** ONLY)
 
@@ -30,7 +30,7 @@ To ensure strict quality control and eliminate premature execution:
 |---|---|---|---|---|
 | **Phase 0** | Architecture and Documentation | `APPROVED` ✅ | 100% (Baseline docs created) | User Approved |
 | **Phase 0.1** | Architecture Hardening & Final Validation | `IN_REVIEW` ⏳ | 100% (Audited & Hardened) | User Review Pending |
-| **Phase 0.1.2**| Final Security & Architecture Corrections | `IN_REVIEW` ⏳ | 100% (All 5 corrections closed) | User Review Pending |
+| **Phase 0.1.3**| Deployment Integrity, Admin Bootstrap & Workflow Security | `IN_REVIEW` ⏳ | 100% (All 11 corrections closed) | User Review Pending |
 | **Phase 1** | Frontend Core Foundation (Mock Storefront) | `NOT_STARTED` 🛑 | 0 / 5 Subphases | Requires Phase 0.1 Approval |
 | **Phase 2** | Firebase Foundation and Authentication | `NOT_STARTED` 🛑 | 0 / 4 Subphases | Requires Phase 1 Approval |
 | **Phase 3** | Developer Dashboard and Submission System | `NOT_STARTED` 🛑 | 0 / 4 Subphases | Requires Phase 2 Approval |
@@ -60,17 +60,22 @@ To ensure strict quality control and eliminate premature execution:
 
 ---
 
-### Phase 0.1.2: Final Security and Architecture Corrections
-- **Status:** `IN_REVIEW` ⏳ (Corrections Authored & Synchronized; Awaiting Gate)
-- **Objective:** Execute independent corrections on 5 critical architecture domains:
-  1. *Correction A — Collaborator Permission Mapping:* Fix `permission` vs `role_name` check against `GET /repos/Rohitpvt/GitStore/collaborators/{username}/permission`. Fail-closed policy for `admin` and `maintain`. Token access classified as pending integration verification.
-  2. *Correction B — Provider Identity Lookup & Secure Claiming:* Use `.find(p => p.providerId === 'github.com')?.uid`. Implement asynchronous `/claim_requests` queue with Firebase Admin SDK validation and rules protection.
-  3. *Correction C — Globally Unique Entity Identities:* Base repository and product keys on GitHub's immutable numeric repository ID (`gh_repo_{repoId}`, `prod_{repoId}_{productSlug}`). Eliminate cross-repo collisions.
-  4. *Correction D — Two-Tier Publication State Machine:* Implement recoverable state machine (`approved` -> `catalog_committed` -> `deploying` -> `deployment_verified` -> `published`). Verify deployment via Deployments API and public HTTP `deployment-manifest.json`. Detail 10 failure recovery scenarios.
-  5. *Correction E — App Check reCAPTCHA Enterprise:* Clarify that the 10,000 free monthly assessment allowance applies to reCAPTCHA Enterprise. Detail 1-hour token TTL caching and decouple assessments from Firestore operations.
-  6. *Additional Safeguards & Ownership Distinction:* Enforce `process.env.GITHUB_REPOSITORY === 'Rohitpvt/GitStore'`, distinguish repo ownership vs release authority vs verified developer badge, and retain GitHub Pages policy gate as unresolved.
-- **Files Modified:** All 13 architecture and specification documents under `docs/` and root `README.md`.
-- **Definition of Done (DoD):** All 5 corrections and safeguards documented, test fixtures specified, zero application code written, synchronized with `ROADMAP.md`.
+### Phase 0.1.3: Deployment Integrity, Administrator Bootstrap & Workflow Security
+- **Status:** `IN_REVIEW` ⏳ (Hardening Authored & Synchronized; Awaiting Gate)
+- **Objective:** Execute independent hardening across 11 critical architecture pillars:
+  1. *Non-Circular Manifest Architecture:* Eliminated self-referential `commitSha` from `data/deployment-manifest.json`. Captures `catalogCommitSha` via `git rev-parse HEAD` post-commit and stores tuple `(generationId, generationSequence, catalogCommitSha)` outside Git in `/system_deployments/{generationId}`.
+  2. *Dedicated Pages Deployment API Verification:* Evaluated dedicated endpoint `GET /repos/{owner}/{repo}/pages/deployments/{id}` returning `"status": "succeed"` (Pages-specific).
+  3. *Single-Workflow Deployment Trigger (Option A):* Resolved `GITHUB_TOKEN` push suppression by deploying GitHub Pages in the same trusted workflow run (`.github/workflows/batch-processor.yml`) via `actions/upload-pages-artifact@v3` and `actions/deploy-pages@v4`.
+  4. *Root Administrator Bootstrap:* Established identity assertion comparing canonical owner's immutable numeric GitHub account ID (`owner.id` from `GET /repos/Rohitpvt/GitStore`) with caller's linked `github.com` provider ID extracted via `admin.auth().verifyIdToken()`.
+  5. *Workflow Event Allowlist & Fork Security:* Built explicit event matrix (`schedule`, `workflow_dispatch`, `issues`), strictly prohibiting `pull_request_target` and `workflow_run` to prevent fork PR secret exfiltration and arbitrary code execution.
+  6. *Concurrency & Monotonic Ordering:* Documented Actions queue semantics (single pending run replacement); designed durable coalescing in Firestore and monotonic integer `generationSequence`.
+  7. *Preserving Failed Publication Generations:* Retained full failed generation records in `/system_deployments/{generationId}` with attempt history, without prematurely resetting products to `approved`. Documented 10 idempotent failure recovery scenarios.
+  8. *Claim Request Field Whitelisting:* Hardened Security Rules with `hasOnly(['requestId', 'requesterUid', 'targetSubmissionId', 'status', 'createdAt'])`, blocking all privileged and worker fields.
+  9. *App Check Specification:* Documented `isTokenAutoRefreshEnabled: true`, distinguished token acquisition vs refresh vs Firestore requests, clarified 10,000 monthly assessments across Google Cloud Organization, and explicitly stated the no-billing Spark plan condition for "zero surprise bills".
+  10. *GitHub Token Strategy Classification:* Evaluated permissions and marked collaborator token checks as **PENDING INTEGRATION TEST**.
+  11. *GitHub Pages Policy Gate:* Maintained written confirmation from GitHub Support as a mandatory unresolved pre-launch gate.
+- **Files Modified:** All 13 architecture and specification documents under `docs/`, root `README.md`, and `docs/README.md`.
+- **Definition of Done (DoD):** All 11 pillars documented, ADR-05/07/10 revised, ADR-11/12 added, test fixtures specified, zero application code written, synchronized with `ROADMAP.md`.
 
 ---
 

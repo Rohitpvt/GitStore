@@ -1,7 +1,7 @@
 # GitStore — Comprehensive Testing Strategy
 
-**Document Version:** 1.3.0  
-**Phase:** Phase 0.1.2 — Final Security & Architecture Corrections  
+**Document Version:** 1.4.0  
+**Phase:** Phase 0.1.3 — Deployment Integrity, Administrator Bootstrap & Workflow Security  
 **Status:** Approved Quality Assurance & Testing Framework (Hardened)  
 
 ---
@@ -55,8 +55,9 @@ flowchart TD
   3. **Self-Escalation Attack:** Authenticated developer CANNOT update their user document to set `isAdmin: true` or `isVerifiedDeveloper: true`.
   4. **Submission Tampering:** Authenticated developer CANNOT update a submission that is already in `processing`, `approved`, or `published` status, and CANNOT alter ownership fields (`developerUid`, `claimStatus`, `ownershipProof`).
   5. **Claim Request Protection:** Authenticated user CAN create a `claim_requests` doc with their own `auth.uid` and `status: 'pending'`, but CANNOT update, delete, or create a claim request with another user's UID.
-  6. **Unauthorized Publish:** Authenticated developer CANNOT create a document directly in the `products` collection.
-  7. **Moderation Queue Security:** Authenticated user CAN create a `moderation_requests` doc with `status: 'pending'`, but CANNOT update or delete it.
+  6. **Claim Request Field Injection Attack:** Authenticated user CANNOT inject privileged or worker fields (`developerUid`, `verifiedGithubId`, `claimStatus`, `isAdmin`, `processedAt`, `reviewedAt`, `reviewedBy`, `resolution`, `rejectionReason`, `workerLease`, `workerId`) into `/claim_requests`. Any unwhitelisted key triggers an immediate `PERMISSION_DENIED` rule violation.
+  7. **Moderation Queue Security & Whitelisting:** Authenticated user CAN create a `moderation_requests` doc with `status: 'pending'`, but CANNOT update or delete it, and CANNOT inject unwhitelisted keys.
+  8. **Unauthorized Publish:** Authenticated developer CANNOT create a document directly in the `products` or `system_deployments` collections.
 
 ---
 
@@ -66,24 +67,30 @@ flowchart TD
 - **Mock Framework:** Mock the GitHub REST API using `nock` or `msw`.
 - **Key Test Scenarios:**
 
-### 5.1 Collaborator Permission Mapping Test Fixtures
-Test the worker authorization logic against official response fixtures for `GET /repos/Rohitpvt/GitStore/collaborators/{username}/permission`:
-```javascript
-const fixtures = [
-  { resp: { permission: 'admin', role_name: 'admin' }, expected: 'AUTHORIZED' },
-  { resp: { permission: 'write', role_name: 'maintain' }, expected: 'AUTHORIZED' },
-  { resp: { permission: 'write', role_name: 'write' }, expected: 'FORBIDDEN' },
-  { resp: { permission: 'read', role_name: 'triage' }, expected: 'FORBIDDEN' },
-  { resp: { permission: 'read', role_name: 'read' }, expected: 'FORBIDDEN' },
-  { resp: { permission: 'write', role_name: 'custom_reviewer' }, expected: 'FORBIDDEN' },
-  { resp: { permission: 'admin' }, expected: 'AUTHORIZED' }, // Legacy admin without role_name
-  { resp: {}, expected: 'FORBIDDEN' },                      // Empty response
-];
-```
+### 5.1 Root Administrator Bootstrap & Collaborator Permission Mapping
+Test both root admin bootstrap identity assertion and delegated maintainer fixtures:
+1. **Root Administrator Bootstrap Test:**
+   - Mock `GET /repos/Rohitpvt/GitStore` returning `{ owner: { id: 12345678, login: "Rohitpvt" } }`.
+   - Mock Firebase Admin SDK `admin.auth().verifyIdToken()` returning `uid: "admin_uid"`.
+   - Mock `admin.auth().getUser("admin_uid")` returning `providerData: [{ providerId: "github.com", uid: "12345678" }]`.
+   - Assert: Caller is authenticated as ROOT ADMINISTRATOR directly without making collaborator endpoint queries.
+2. **Collaborator Permission Mapping Test Fixtures (Delegated Maintainers):**
+   ```javascript
+   const fixtures = [
+     { resp: { permission: 'admin', role_name: 'admin' }, expected: 'AUTHORIZED' },
+     { resp: { permission: 'write', role_name: 'maintain' }, expected: 'AUTHORIZED' },
+     { resp: { permission: 'write', role_name: 'write' }, expected: 'FORBIDDEN' },
+     { resp: { permission: 'read', role_name: 'triage' }, expected: 'FORBIDDEN' },
+     { resp: { permission: 'read', role_name: 'read' }, expected: 'FORBIDDEN' },
+     { resp: { permission: 'write', role_name: 'custom_reviewer' }, expected: 'FORBIDDEN' },
+     { resp: { permission: 'admin' }, expected: 'AUTHORIZED' }, // Legacy admin without role_name
+     { resp: {}, expected: 'FORBIDDEN' },                      // Empty response
+   ];
+   ```
 
 ### 5.2 Token Permission Classification
-- *Verification Status:* **Pending Integration Verification**.
-- Assert that if the worker receives `403 Resource not accessible by integration` using `secrets.GITHUB_TOKEN`, it automatically falls back to `secrets.ADMIN_VERIFY_TOKEN` (fine-grained PAT / GitHub App token) and successfully authenticates.
+- *Verification Status:* **PENDING INTEGRATION TEST**.
+- Assert that if the worker receives `403 Resource not accessible by integration` using `secrets.GITHUB_TOKEN`, it automatically falls back to `secrets.ADMIN_VERIFY_TOKEN` (fine-grained PAT) and successfully authenticates.
 
 ### 5.3 Globally Unique Entity ID Collision Tests
 - **Cross-Repository Same-Slug Collision:**
@@ -95,23 +102,33 @@ const fixtures = [
   - Repo 2 issue #42 -> `sub_issue_945112002_42`.
   - Assert submission keys are globally unique.
 
-### 5.4 Publication State Machine & Two-Tier Verification Tests
-- **Commit on `main` without Pages Deployment Success:**
-  - Worker commits `data/catalog.json`, but mocked Deployments API returns `state: "failure"`.
-  - Assert submissions are marked `deployment_failed` and reset to `approved`.
-  - Assert Firestore document status is **NOT** marked `published`.
-- **Public HTTP Manifest Check:**
-  - Mock Deployments API returning `success` for SHA `abc123`.
-  - Mock public HTTP fetch to `data/deployment-manifest.json` returning `{ commitSha: 'abc123', generationId: 'gen_1' }`.
-  - Assert submissions are finalized to `published`.
-- **Reconciliation Self-Healing:**
-  - Simulate reverse failure: deployment succeeded, but Firestore update timed out.
-  - Reconciler runs on next batch startup, verifies public manifest, and heals unconfirmed submissions to `published`.
+### 5.4 Publication State Machine, Non-Circular Manifest & Dedicated Pages API Tests
+- **Non-Circular Manifest Content Check:**
+  - Compile static catalog and inspect generated `data/deployment-manifest.json`.
+  - Assert manifest contains `generationId`, `generationSequence`, `deployedAt`, `productCount`, and `environment`.
+  - Assert manifest does **NOT** contain `commitSha`.
+- **Dedicated GitHub Pages API Status Test:**
+  - Mock dedicated Pages deployment endpoint `GET /repos/Rohitpvt/GitStore/pages/deployments/101` returning `{ "status": "succeed" }`.
+  - Assert worker correctly identifies Pages-specific success status `"succeed"`.
+  - Mock endpoint returning `{ "status": "failed" }` and assert generation record is preserved in `/system_deployments` without reverting products to `approved`.
+- **Monotonic Generation Ordering Assertion:**
+  - Set `latestPublishedSequence = 104` in Firestore.
+  - Simulate a stale worker attempting to finalize generation with `generationSequence = 103`.
+  - Assert worker aborts finalization to prevent catalog regression.
+- **Durable Failed Generation Preservation:**
+  - Simulate Pages deployment failure for generation `gen_test_01` (commit `abc1234`).
+  - Assert `/system_deployments/gen_test_01` document is preserved with `attemptHistory`, `lastObservedPagesStatus: 'failed'`, and `retryEligibility: true`.
+  - Assert product documents remain associated with `gen_test_01` and are NOT reverted to `approved`.
 
 ### 5.5 Secure Submission Claiming (`/claim_requests`)
 - **Valid Claim:** User with verified `github.com` provider ID `'583231'` claims submission with `submitterGithubId: '583231'`. Assert `developerUid` is set and status is `claimed`.
 - **Identity Mismatch:** User with provider ID `'999999'` attempts to claim submission `'583231'`. Assert claim request is marked `rejected_mismatch`, submission remains `unclaimed`.
 - **Duplicate Claim:** Assert claiming an already-claimed submission is rejected with `rejected_already_claimed`.
+
+### 5.6 GitHub Actions Event and Fork Security Tests
+- Assert privileged workflows specify only `schedule` and `workflow_dispatch` triggers on default branch.
+- Assert `pull_request_target` and `workflow_run` are absent from all repository workflow files.
+- Assert pull request validation workflows have zero access to repository secrets.
 
 ---
 

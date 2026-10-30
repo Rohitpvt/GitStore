@@ -1,7 +1,7 @@
 # GitStore — System Design Document (SDD)
 
-**Document Version:** 1.3.0  
-**Phase:** Phase 0.1.2 — Final Security & Architecture Corrections  
+**Document Version:** 1.4.0  
+**Phase:** Phase 0.1.3 — Deployment Integrity, Administrator Bootstrap & Workflow Security  
 **Status:** Approved Technical Architecture (Hardened)  
 
 ---
@@ -162,17 +162,23 @@ sequenceDiagram
     else Submitter IS Direct Personal Owner (Valid Release Authority)
         Worker->>DB: Update status directly to 'approved'
     end
-    Note over Worker: Static Compilation & Deployment
+    Note over Worker: Static Compilation & Single-Workflow Deployment (Option A)
     Worker->>DB: Set status to 'catalog_generating'
-    Worker->>Worker: Compile data/catalog.json & deployment-manifest.json
+    Worker->>Worker: Compile data/catalog.json & non-circular deployment-manifest.json
     Worker->>Worker: Git pull --rebase & push origin main
-    Worker->>DB: Set status to 'catalog_committed'
-    Worker->>Worker: Dispatch actions/deploy-pages
+    Worker->>Worker: Capture catalogCommitSha via git rev-parse HEAD
+    Worker->>DB: Set status to 'catalog_committed', write /system_deployments/{genId}
+    Worker->>Worker: Execute actions/upload-pages-artifact & deploy-pages (in same run)
+    Worker->>GHAPI: Query Pages deployment API (GET /pages/deployments/{id})
+    GHAPI-->>Worker: Return status: 'succeed'
+    Worker->>Worker: HTTP check data/deployment-manifest.json (verify genId & seq)
     alt Deploy Succeeded & Manifest Verified via HTTP
         Worker->>DB: Update status to 'published'
         Worker->>DB: Set /products/prod_{repoNumericId}_{slug} to 'active'
+        Worker->>DB: Advance latestPublishedSequence in /system_config/deployment_state
     else Deploy Failed or Timed Out
-        Worker->>DB: Set status to 'deployment_failed' -> reset to 'approved'
+        Worker->>DB: Set /system_deployments/{genId} status: 'failed', record attemptHistory
+        Note over Worker: Submissions retained in catalog_committed/deploying (retryable)
     end
 ```
 
@@ -192,13 +198,13 @@ sequenceDiagram
     Worker->>DB: Create /submissions/sub_issue_892341901_42 (submitterGithubId: "583231", claimStatus: "unclaimed")
     Dev->>Client: Log in via GitHub OAuth
     Client->>Auth: Authenticate
-    Client->>DB: Create /claim_requests (requesterUid: auth.uid, targetSubmissionId: "sub_issue_892341901_42")
+    Client->>DB: Create /claim_requests (whitelisted fields: requesterUid, targetSubmissionId, status, createdAt)
     Note over Worker: Worker executes batch run
     Worker->>DB: Fetch pending claim requests
     Worker->>Auth: admin.auth().getUser(requesterUid)
     Worker->>Worker: Find provider 'github.com' -> verifiedGithubId: "583231"
     Worker->>DB: Verify targetSubmission.submitterGithubId === "583231"
-    Worker->>DB: Transaction: Set developerUid = requesterUid, claimStatus = 'claimed'
+    Worker->>DB: Transaction: Check developerUid == null, set developerUid = requesterUid, claimStatus = 'claimed'
     Worker->>DB: Set /claim_requests status to 'completed'
 ```
 
@@ -219,9 +225,13 @@ sequenceDiagram
     Note over Dashboard: Dashboard listens via onSnapshot
     Actions->>FS: Fetch pending moderation requests
     Actions->>Actions: Extract verified GitHub numeric ID from Firebase Auth
-    Actions->>GH: GET /user/{verifiedNumericId} -> get verifiedLogin
-    Actions->>GH: GET /repos/Rohitpvt/GitStore/collaborators/{verifiedLogin}/permission
-    GH-->>Actions: Return role_name: 'admin' (or 'maintain')
+    alt Caller is Root Repository Owner
+        Actions->>Actions: Assert callerGithubNumericId === canonicalOwnerNumericId (owner.id)
+    else Caller is Delegated Maintainer
+        Actions->>GH: GET /user/{verifiedNumericId} -> get verifiedLogin
+        Actions->>GH: GET /repos/Rohitpvt/GitStore/collaborators/{verifiedLogin}/permission
+        GH-->>Actions: Return role_name: 'admin' (or 'maintain')
+    end
     Actions->>FS: Update /submissions/{id} to 'approved'
     Actions->>FS: Write immutable entry to /admin_logs
     Actions->>FS: Update /moderation_requests/{id} (status: 'completed')
@@ -237,8 +247,7 @@ sequenceDiagram
 GitStore/
 ├── .github/
 │   ├── workflows/
-│   │   ├── batch-processor.yml     # Cron batch worker (every 10m)
-│   │   └── pages-deploy.yml        # Pages deployment workflow
+│   │   └── batch-processor.yml     # Cron batch worker + Pages deployment (Option A)
 │   └── ISSUE_TEMPLATE/
 │       ├── product-submission.yml  # Structured issue form
 │       ├── bug_report.yml          # Bug report form
@@ -256,7 +265,7 @@ GitStore/
 │       ├── components/             # Navbar, product cards, filter bars
 │       └── utils/                  # Sanitizers, formatters, semver helpers
 ├── data/
-│   ├── deployment-manifest.json    # Deployed generationId & commitSha manifest
+│   ├── deployment-manifest.json    # Deployed generationId & generationSequence manifest (no SHA)
 │   ├── catalog.json                # Master searchable product index
 │   ├── categories.json             # Category taxonomy and counts
 │   └── products/                   # Granular product records
@@ -267,7 +276,7 @@ GitStore/
 │       ├── reconciler.js           # Self-healing publication reconciler
 │       ├── lease-manager.js        # Atomic transaction lease claimer
 │       ├── issue-parser.js         # Issue form ingest & ownership validator
-│       ├── moderation-handler.js   # Canonical repo collaborator verifier
+│       ├── moderation-handler.js   # Canonical repo collaborator & root admin verifier
 │       ├── github-verifier.js      # REST API repository & asset validator
 │       └── catalog-compiler.js     # Static JSON generator
 ├── docs/                           # Complete 13 Architectural Documents

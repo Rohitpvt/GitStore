@@ -1,7 +1,7 @@
 # GitStore — Cloud Firestore Database Schema & Data Architecture
 
-**Document Version:** 1.3.0  
-**Phase:** Phase 0.1.2 — Final Security & Architecture Corrections  
+**Document Version:** 1.4.0  
+**Phase:** Phase 0.1.3 — Deployment Integrity, Administrator Bootstrap & Workflow Security  
 **Status:** Approved Schema Baseline (Hardened)  
 **Database:** Google Cloud Firestore (Native Mode)
 
@@ -161,6 +161,8 @@ interface SubmissionDocument {
 - **Path:** `/claim_requests/{requestId}`
 - **Document ID:** Auto-generated ID (`claim_req_{nanoid}`).
 - **Description:** Secure queue for claiming unclaimed GitHub Issue Form submissions without giving browser clients write access to submission ownership fields.
+- **Client Creation Whitelist:** Clients can ONLY supply `requestId`, `requesterUid`, `targetSubmissionId`, `status`, and `createdAt`.
+- **Strictly Blocked Privileged Fields:** `developerUid`, `verifiedGithubId`, `claimStatus`, `isAdmin`, `processedAt`, `reviewedAt`, `reviewedBy`, `resolution`, `rejectionReason`, `workerLease`, and `workerId` are rejected by Security Rules if present in client create requests.
 
 ```typescript
 interface ClaimRequestDocument {
@@ -168,11 +170,11 @@ interface ClaimRequestDocument {
   requesterUid: string;              // Must equal request.auth.uid (enforced by Security Rules)
   targetSubmissionId: string;        // Foreign key to submissions/{id}
   status: 'pending' | 'processing' | 'completed' | 'rejected_mismatch' | 'rejected_already_claimed';
-  rejectionReason: string | null;
+  rejectionReason: string | null;    // Worker-managed
   verifiedGithubId: string | null;   // Extracted by worker from Firebase Admin SDK
-  processedByWorkerRunId: string | null;
+  processedByWorkerRunId: string | null; // Worker-managed
   createdAt: FirebaseFirestore.Timestamp;
-  processedAt: FirebaseFirestore.Timestamp | null;
+  processedAt: FirebaseFirestore.Timestamp | null; // Worker-managed
 }
 ```
 
@@ -268,19 +270,72 @@ interface ProductDocument {
 ```
 
 ### 2.6 Deployment Manifest & Recovery Metadata (`data/deployment-manifest.json`)
-Compiled alongside `data/catalog.json` and deployed to GitHub Pages to provide public deployment verification:
+Compiled alongside `data/catalog.json` and deployed to GitHub Pages to provide public deployment verification. **Notice:** In accordance with non-circular integrity requirements, `data/deployment-manifest.json` does **not** contain the commit SHA of the Git commit containing it:
 
 ```typescript
 interface DeploymentManifest {
   generationId: string;              // "gen_{timestamp}_{randomSuffix}" e.g. "gen_1730300400000_a1b2c3d"
-  commitSha: string;                 // 40-character Git commit SHA deployed to main
+  generationSequence: number;        // Monotonically increasing sequence integer e.g. 104
   deployedAt: string;                // ISO 8601 UTC timestamp
   productCount: number;              // Total active products in catalog.json
+  schemaVersion: "1.4.0";            // Schema specification version
   environment: 'github-pages';
 }
 ```
 
-### 2.7 Collections: `categories`, `reports`, `admin_logs`, `system_config`
+### 2.7 Collection: `system_deployments`
+- **Path:** `/system_deployments/{generationId}`
+- **Document ID:** Generation ID matching manifest (`gen_{timestamp}_{randomSuffix}`).
+- **Description:** Durable ledger of every catalog compilation and deployment attempt. Preserved permanently upon failure to prevent desynchronization between Git commits and Firestore records.
+
+```typescript
+interface SystemDeploymentRecord {
+  generationId: string;              // Unique generation ID
+  generationSequence: number;        // Monotonically incrementing sequence number
+  catalogCommitSha: string;          // Git commit SHA produced after commit (git rev-parse HEAD)
+  expectedProductIds: string[];      // Array of submission IDs included in this generation
+  status: 'deploying' | 'published' | 'failed' | 'stale';
+  reconciliationStatus: 'pending_retry' | 'reconciled' | 'abandoned' | 'none';
+  attemptHistory: Array<{
+    attemptNumber: number;
+    startedAt: FirebaseFirestore.Timestamp;
+    completedAt?: FirebaseFirestore.Timestamp;
+    stage: 'generation' | 'commit' | 'artifact_upload' | 'pages_deploy' | 'cdn_verification' | 'db_finalization';
+    pagesDeploymentId?: number;
+    pagesStatus?: 'succeed' | 'failed' | 'in_progress';
+    error?: string;
+  }>;
+  lastObservedPagesStatus?: 'succeed' | 'failed' | 'in_progress';
+  failureReason?: string;
+  retryEligibility: boolean;
+  createdAt: FirebaseFirestore.Timestamp;
+  verifiedAt?: FirebaseFirestore.Timestamp;
+  finalizedAt?: FirebaseFirestore.Timestamp;
+}
+```
+
+### 2.8 Document: `system_config/deployment_state`
+- **Path:** `/system_config/deployment_state`
+- **Description:** Global monotonic deployment sequence pointer and concurrency lease tracker.
+
+```typescript
+interface GlobalDeploymentState {
+  latestGenerationId: string;
+  latestSequence: number;            // Current highest sequence number generated
+  latestPublishedSequence: number;   // Current highest sequence confirmed published on Pages
+  latestPublishedGenerationId: string;
+  latestCommitSha: string;
+  status: 'idle' | 'deploying';
+  activeWorkerLease?: {
+    workerId: string;
+    leaseExpiresAt: FirebaseFirestore.Timestamp;
+  };
+  lastPublishedAt?: FirebaseFirestore.Timestamp;
+  updatedAt: FirebaseFirestore.Timestamp;
+}
+```
+
+### 2.9 Collections: `categories`, `reports`, `admin_logs`, `system_config`
 - `categories`: Taxonomy slugs (`/categories/{id}`).
 - `reports`: User-generated abuse reports (`/reports/{id}`).
 - `admin_logs`: Immutable audit trail written strictly by Actions worker (`/admin_logs/{id}`).
@@ -290,16 +345,20 @@ interface DeploymentManifest {
 
 ## 3. Self-Healing Reconciliation Logic (`reconcilePublishedState`)
 
-This routine runs at the start of every GitHub Actions worker execution to recover from reverse failure scenarios (e.g. GitHub Pages deployment succeeded and propagated to CDN, but worker crashed or network failed before updating Firestore):
+This routine runs at the start of every GitHub Actions worker execution to recover from reverse failure scenarios (e.g. GitHub Pages deployment succeeded and propagated to CDN, but worker crashed or network failed before updating Firestore). It checks the dedicated GitHub Pages deployments API and enforces monotonic sequencing:
 
 ```javascript
 /**
  * Reconciles live deployed GitHub Pages state with Cloud Firestore.
- * Verifies deployment via both public HTTP manifest and GitHub Deployments API.
+ * Evaluates dedicated Pages deployment API and verifies public HTTP manifest.
  */
 async function reconcilePublishedState(db, octokit, pagesUrl) {
-  // 1. Fetch public deployment manifest from live GitHub Pages CDN
-  let liveManifest;
+  // 1. Fetch current global deployment state
+  const stateDoc = await db.collection('system_config').doc('deployment_state').get();
+  const state = stateDoc.exists ? stateDoc.data() : { latestPublishedSequence: 0 };
+
+  // 2. Fetch public deployment manifest from live GitHub Pages CDN
+  let liveManifest = null;
   try {
     const res = await fetch(`${pagesUrl}/data/deployment-manifest.json?t=${Date.now()}`, {
       headers: { 'Cache-Control': 'no-cache' }
@@ -308,63 +367,74 @@ async function reconcilePublishedState(db, octokit, pagesUrl) {
       liveManifest = await res.json();
     }
   } catch (err) {
-    console.warn('[Reconciler] Could not reach public Pages manifest. Falling back to Deployments API.', err.message);
+    console.warn('[Reconciler] Could not reach public Pages manifest.', err.message);
   }
 
-  // 2. Fetch latest GitHub Pages deployment status via GitHub REST API
-  const deployments = await octokit.rest.repos.listDeployments({
-    owner: 'Rohitpvt',
-    repo: 'GitStore',
-    environment: 'github-pages',
-    per_page: 1
-  });
+  // 3. Monotonic ordering assertion
+  if (liveManifest && liveManifest.generationSequence < state.latestPublishedSequence) {
+    console.warn(`[Reconciler] Stale manifest detected on CDN (seq ${liveManifest.generationSequence} < latest ${state.latestPublishedSequence}). Aborting finalization to prevent rollback.`);
+    return;
+  }
 
-  if (!deployments.data || deployments.data.length === 0) return;
-  const latestDeploy = deployments.data[0];
-
-  const statuses = await octokit.rest.repos.listDeploymentStatuses({
-    owner: 'Rohitpvt',
-    repo: 'GitStore',
-    deployment_id: latestDeploy.id,
-    per_page: 1
-  });
-
-  const isDeploySuccess = statuses.data[0]?.state === 'success';
-  const deployedCommitSha = latestDeploy.sha;
-
-  // 3. Find any submissions in unconfirmed publication states
-  const pendingPublishSnapshots = await db.collection('submissions')
-    .where('status', 'in', ['catalog_committed', 'deploying', 'deployment_verified'])
+  // 4. Query active deployments pending finalization
+  const pendingGenerations = await db.collection('system_deployments')
+    .where('status', 'in', ['deploying', 'failed'])
+    .where('reconciliationStatus', '==', 'pending_retry')
     .get();
 
-  for (const doc of pendingPublishSnapshots.docs) {
-    const sub = doc.data();
+  for (const genDoc of pendingGenerations.docs) {
+    const gen = genDoc.data();
 
-    // Verify whether this submission's catalog generation was successfully deployed
-    const isManifestVerified = liveManifest && liveManifest.commitSha === deployedCommitSha;
-    const isApiVerified = isDeploySuccess && deployedCommitSha === sub.catalogCommitSha;
+    // Check Pages deployment status using dedicated Pages deployment endpoint
+    let isPagesSucceed = false;
+    const latestAttempt = gen.attemptHistory?.[gen.attemptHistory.length - 1];
+    if (latestAttempt?.pagesDeploymentId) {
+      try {
+        const pagesRes = await octokit.request('GET /repos/{owner}/{repo}/pages/deployments/{pages_deployment_id}', {
+          owner: 'Rohitpvt',
+          repo: 'GitStore',
+          pages_deployment_id: latestAttempt.pagesDeploymentId
+        });
+        isPagesSucceed = (pagesRes.data.status === 'succeed');
+      } catch (pagesErr) {
+        console.warn(`[Reconciler] Pages deployment check failed for ID ${latestAttempt.pagesDeploymentId}`, pagesErr.message);
+      }
+    }
 
-    if (isManifestVerified || isApiVerified) {
-      console.log(`[Reconciler] Healing submission ${doc.id}: Verified live on Pages (SHA ${deployedCommitSha}). Finalizing to published.`);
-      
+    // Verify public manifest matches this generation
+    const isManifestVerified = liveManifest && 
+      (liveManifest.generationId === gen.generationId) && 
+      (liveManifest.generationSequence === gen.generationSequence);
+
+    if (isPagesSucceed && isManifestVerified) {
+      console.log(`[Reconciler] Healing generation ${gen.generationId} (Commit ${gen.catalogCommitSha}). Finalizing Firestore to published.`);
+
       await db.runTransaction(async (transaction) => {
-        transaction.update(doc.ref, {
+        // Finalize submissions
+        for (const subId of gen.expectedProductIds) {
+          const subRef = db.collection('submissions').doc(subId);
+          transaction.update(subRef, {
+            status: 'published',
+            'processingLease.leaseHolder': null,
+            updatedAt: new Date()
+          });
+        }
+
+        // Finalize system deployment record
+        transaction.update(genDoc.ref, {
           status: 'published',
-          publishedProductId: sub.targetProductId,
-          'processingLease.leaseHolder': null,
-          updatedAt: new Date()
+          reconciliationStatus: 'reconciled',
+          verifiedAt: new Date(),
+          finalizedAt: new Date()
         });
 
-        const productRef = db.collection('products').doc(sub.targetProductId);
-        transaction.set(productRef, {
-          id: sub.targetProductId,
-          slug: sub.productData.slug,
-          name: sub.productData.name,
-          repoNumericId: sub.repoNumericId,
-          repoId: sub.repoId,
-          developerUid: sub.developerUid,
-          catalogCommitSha: deployedCommitSha,
-          status: 'active',
+        // Advance global published sequence monotonically
+        transaction.set(db.collection('system_config').doc('deployment_state'), {
+          latestPublishedSequence: gen.generationSequence,
+          latestPublishedGenerationId: gen.generationId,
+          latestCommitSha: gen.catalogCommitSha,
+          status: 'idle',
+          lastPublishedAt: new Date(),
           updatedAt: new Date()
         }, { merge: true });
       });
@@ -420,20 +490,31 @@ service cloud.firestore {
 
     match /claim_requests/{requestId} {
       allow read: if isAuthenticated() && resource.data.requesterUid == request.auth.uid;
+      // Client creation is strictly whitelisted: privileged fields (developerUid, verifiedGithubId, claimStatus, isAdmin, workerLease) are blocked
       allow create: if isAuthenticated()
+        && request.resource.data.keys().hasOnly(['requestId', 'requesterUid', 'targetSubmissionId', 'status', 'createdAt'])
+        && request.resource.data.requestId == requestId
         && request.resource.data.requesterUid == request.auth.uid
+        && request.resource.data.targetSubmissionId is string
+        && request.resource.data.targetSubmissionId.size() > 0
+        && request.resource.data.targetSubmissionId.size() <= 128
         && request.resource.data.status == 'pending'
         && request.resource.data.createdAt == request.time;
-      allow update, delete: if false; // Worker only via Admin SDK
+      allow update, delete: if false; // Privileged batch worker only via Admin SDK
     }
 
     match /moderation_requests/{requestId} {
       allow read: if isAuthenticated() && resource.data.requestedByUid == request.auth.uid;
       allow create: if isAuthenticated()
+        && request.resource.data.keys().hasOnly(['requestId', 'action', 'targetId', 'payload', 'requestedByUid', 'status', 'createdAt'])
+        && request.resource.data.requestId == requestId
         && request.resource.data.requestedByUid == request.auth.uid
+        && request.resource.data.action in ['APPROVE_SUBMISSION', 'REJECT_SUBMISSION', 'VERIFY_DEVELOPER', 'REVOKE_DEVELOPER', 'DELIST_PRODUCT']
+        && request.resource.data.targetId is string
+        && request.resource.data.targetId.size() > 0
         && request.resource.data.status == 'pending'
         && request.resource.data.createdAt == request.time;
-      allow update, delete: if false; // Worker only via Admin SDK
+      allow update, delete: if false; // Privileged batch worker only via Admin SDK
     }
 
     match /products/{productId} {
@@ -452,6 +533,7 @@ service cloud.firestore {
     }
 
     match /admin_logs/{logId} { allow read, write: if false; }
+    match /system_deployments/{generationId} { allow read: if true; allow write: if false; }
     match /system_config/{configId} { allow read: if true; allow write: if false; }
   }
 }

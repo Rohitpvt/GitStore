@@ -1,7 +1,7 @@
 # GitStore — Authentication Architecture & Identity Specification
 
-**Document Version:** 1.3.0  
-**Phase:** Phase 0.1.2 — Final Security & Architecture Corrections  
+**Document Version:** 1.4.0  
+**Phase:** Phase 0.1.3 — Deployment Integrity, Administrator Bootstrap & Workflow Security  
 **Status:** Approved Authentication Specification (Hardened)  
 **Provider:** Firebase Authentication (v10 Modular SDK)  
 **Host Environment:** GitHub Pages (`https://<org>.github.io/<repo>/`)
@@ -77,17 +77,22 @@ Because Cloud Functions are excluded and browser clients must never directly upd
      createdAt: serverTimestamp();
    }
    ```
-3. **Firestore Security Rules Protection:**
+3. **Firestore Security Rules Protection & Field Whitelisting:**
    ```javascript
    match /claim_requests/{requestId} {
      allow read: if request.auth != null && resource.data.requesterUid == request.auth.uid;
      allow create: if request.auth != null 
+       && request.resource.data.keys().hasOnly(['requestId', 'requesterUid', 'targetSubmissionId', 'status', 'createdAt'])
+       && request.resource.data.requestId == requestId
        && request.resource.data.requesterUid == request.auth.uid
+       && request.resource.data.targetSubmissionId is string
+       && request.resource.data.targetSubmissionId.size() > 0
        && request.resource.data.status == 'pending'
        && request.resource.data.createdAt == request.time;
-     allow update, delete: if false; // Worker only
+     allow update, delete: if false; // Privileged worker only
    }
    ```
+   **Blocked Privileged Fields:** Client create requests cannot inject `developerUid`, `verifiedGithubId`, `claimStatus`, `isAdmin`, `processedAt`, `reviewedAt`, `reviewedBy`, `resolution`, `rejectionReason`, `workerLease`, or `workerId`.
 4. **Worker Execution Logic:**
    - The scheduled batch worker fetches `admin.auth().getUser(claimReq.requesterUid)`.
    - The worker locates `userRecord.providerData.find(p => p.providerId === 'github.com')`. If absent, the claim is rejected (`rejected_no_github_provider`).
@@ -133,27 +138,66 @@ In GitHub (`Settings -> Developer settings -> OAuth Apps -> GitStore`):
 
 ### 5.1 Provider Selection: reCAPTCHA Enterprise
 - **Recommended Provider:** **reCAPTCHA Enterprise** (`ReCaptchaEnterpriseProvider`).
-- **Official Google Cloud Allowance:** Google Cloud provides a no-cost tier of **10,000 assessments per month** for reCAPTCHA Enterprise under Fraud Defense.
-- **Provider Distinction:** Standard reCAPTCHA v3 is part of legacy reCAPTCHA admin terms; reCAPTCHA Enterprise is the modern provider managed under Google Cloud and recommended by Firebase for all new web integrations.
+- **Organization-Level Allowance:** Google Cloud provides a no-cost tier of **10,000 assessments per month** for reCAPTCHA Enterprise under Fraud Defense. This quota is calculated at the **Google Cloud Organization / Billing Account level** (shared across all projects within the organization).
+- **Provider Distinction:** Standard reCAPTCHA v3 is part of legacy reCAPTCHA admin terms; reCAPTCHA Enterprise is the modern cloud-native provider recommended by Firebase for all new web integrations.
 
-### 5.2 Token TTL, Caching & Request Separation
-- **Assessments vs. Service Requests:** An App Check assessment occurs **only** when minting or refreshing an App Check token (`getToken()`), not on every Firestore document request.
-- **Token TTL:** App Check tokens have a default TTL of **1 hour** and are auto-refreshed by the Firebase Web SDK at roughly 30–45 minutes.
-- **Token Caching:** The Firebase SDK caches the token locally. When queries or writes are sent to Cloud Firestore, the cached token is attached in the `X-Firebase-AppCheck` header. The Firebase backend validates the signature locally without contacting reCAPTCHA.
+### 5.2 Token Acquisition, Token Refresh & Request Decoupling
+The architecture distinguishes three discrete operations:
+1. **Token Acquisition:** An assessment occurs **only** when acquiring an initial token via `getToken()` on page load or user action.
+2. **Token Refresh:** Handled automatically in background by the Firebase SDK. The client configuration **must explicitly set `isTokenAutoRefreshEnabled: true`**:
+   ```javascript
+   import { initializeAppCheck, ReCaptchaEnterpriseProvider } from 'firebase/app-check';
 
-### 5.3 The Lazy-Loading Architecture & Usage Estimates
+   const appCheck = initializeAppCheck(app, {
+     provider: new ReCaptchaEnterpriseProvider(RECAPTCHA_ENTERPRISE_SITE_KEY),
+     isTokenAutoRefreshEnabled: true // Must be explicitly configured; not assumed default
+   });
+   ```
+3. **Firestore Service Requests:** All queries and mutations attach the cached token in the `X-Firebase-AppCheck` header. The Firestore backend validates the token signature locally. **Firestore queries consume 0 additional reCAPTCHA assessments.**
+
+### 5.3 Billing Configuration & "Zero Surprise Bills" Conditions
+> [!IMPORTANT]
+> The guarantee of "Zero surprise bills" holds **strictly and only when NO Google Cloud / Firebase billing account (Blaze plan) is attached to the project.**
+- Under the no-cost **Spark Plan** without an attached billing account, exceeding the 10,000 monthly assessments causes reCAPTCHA Enterprise to return HTTP 429 (`RESOURCE_EXHAUSTED`). Token acquisition fails and subsequent unverified Firestore writes are rejected, but zero financial charges are incurred.
+- If a billing account is linked, assessments beyond 10,000 automatically incur charges ($1 per 1,000). GitStore strictly enforces the Spark no-billing configuration.
+
+### 5.4 The Lazy-Loading Architecture & Usage Estimates
 - **Storefront Visitors:** Browse static catalogs (`data/catalog.json`) served directly by GitHub Pages. They make **0 Firestore requests** and **do NOT initialize App Check**.
 - **Authenticated Developers:** App Check is lazy-loaded **only on pages that interact with Cloud Firestore**:
   - `submit.html` (Submissions wizard)
   - `dashboard.html` (Developer dashboard)
   - `admin.html` (Admin dashboard)
-- **Architectural Consumption Estimate:**
-  - 50 active developers/day $\times$ 4 visits/month = 200 sessions/month.
-  - Average session: 30 minutes $\rightarrow$ 1 assessment per session.
-  - Estimated Monthly Assessments: $\approx 200 - 1,000$ assessments/month (2% to 10% of the 10,000 free monthly quota).
-  - *All estimates are architectural projections, not guaranteed free usage.*
-- **Quota Exceeded Behavior:** If assessments exceed 10,000 in a month on the Spark plan without a billing account, reCAPTCHA Enterprise returns HTTP 429 (`RESOURCE_EXHAUSTED`). Token acquisition fails, causing backend App Check enforcement to reject subsequent Firestore writes.
+- **Architectural Usage Projections (Unmeasured Engineering Estimates):**
+  - Assumes 10–50 submission and claim operations per month.
+  - Assumes 5–10 active developer visits per day (150–300 sessions/month).
+  - Assumes average session duration of 30 minutes with token caching (1 token acquisition per session).
+  - Projected Monthly Assessments: $\approx 200 - 1,000$ assessments/month (2% to 10% of the 10,000 free monthly quota).
+  - *All estimates are engineering projections, not measured production telemetry.*
 
-### 5.4 Phased Enforcement Strategy
+### 5.5 Phased Enforcement Strategy
 - **Phase 2 (Integration):** App Check initialized in **metrics/monitoring mode** (tokens validated, but unverified requests are not dropped).
 - **Phase 6 (Pre-Launch QA):** App Check switched to **strict enforcement** only after verifying zero false-positive dropouts.
+
+---
+
+## 6. Administrator Bootstrap & Identity Verification
+
+### 6.1 Root Administrator Verification Flow
+Repository ownership of `Rohitpvt/GitStore` alone does not authenticate the person making an administrative request. The batch worker enforces an authoritative identity verification flow:
+
+1. **Owner Account Resolution:** The worker retrieves the canonical repository owner's immutable numeric GitHub account ID from trusted GitHub repository metadata (`GET /repos/Rohitpvt/GitStore` -> `response.data.owner.id`) or verified worker environment configuration (`BOOTSTRAP_ROOT_ADMIN_GITHUB_ID`).
+2. **Firebase Token Verification:** The caller submits their Firebase ID token. The worker executes:
+   ```javascript
+   const decodedToken = await admin.auth().verifyIdToken(idToken, true);
+   const userRecord = await admin.auth().getUser(decodedToken.uid);
+   ```
+3. **Linked Provider Match:** The worker locates `userRecord.providerData.find(p => p.providerId === 'github.com')`. If absent, ambiguous, or unlinked, the caller is rejected with `403 FORBIDDEN`.
+4. **Immutable ID Assertion:** The worker asserts:
+   ```javascript
+   const callerGithubId = githubProvider.uid;
+   const isRootAdmin = (String(callerGithubId) === String(canonicalOwnerGithubId));
+   ```
+5. **Fail-Closed Principle:** Never trust client-supplied usernames, UIDs, or roles. If identity data is unavailable, all privileged operations fail closed.
+6. **Recovery & Emergency Revocation:**
+   - If an administrator account is compromised, the repository owner revokes repository collaborator privileges on GitHub and calls `admin.auth().revokeRefreshTokens(uid)` via the Admin SDK.
+   - Dynamic real-time collaborator checks on each batch run ensure immediate revocation without waiting for cached credentials to expire.

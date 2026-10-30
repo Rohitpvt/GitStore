@@ -1,7 +1,7 @@
 # GitStore — Strategic Implementation Roadmap
 
-**Document Version:** 1.3.0  
-**Phase:** Phase 0.1.2 — Final Security & Architecture Corrections  
+**Document Version:** 1.4.0  
+**Phase:** Phase 0.1.3 — Deployment Integrity, Administrator Bootstrap & Workflow Security  
 **Status:** Approved Master Roadmap (Synchronized with `PHASE_PLAN.md`)  
 **Single Source of Execution Truth:** [`PHASE_PLAN.md`](./PHASE_PLAN.md)
 
@@ -18,7 +18,7 @@ gantt
     section Phase 0 & 0.1
     Phase 0: Architecture & Baseline Docs   :done, p0, 2026-10-30, 1d
     Phase 0.1: Architecture Hardening & Plan:done, p0_1, 2026-10-30, 1d
-    Phase 0.1.2: Final Security Corrections :done, p0_1_2, 2026-10-30, 1d
+    Phase 0.1.3: Deployment & Admin Security :done, p0_1_3, 2026-10-30, 1d
     section Phase 1 & 2
     Phase 1: Frontend Core Foundation (Mock):active, p1, 2026-11-01, 7d
     Phase 2: Firebase Foundation & Auth     :p2, after p1, 6d
@@ -41,7 +41,7 @@ gantt
 |---|---|---|---|
 | **Phase 0** | Architecture and Documentation | Core product requirements, dual-platform architecture, 13 baseline docs. | `APPROVED` ✅ |
 | **Phase 0.1** | Architecture Hardening & Validation | Audited admin workflow, issue ownership framework, security rules, `PHASE_PLAN.md`. | `IN_REVIEW` ⏳ |
-| **Phase 0.1.2**| Final Security & Architecture Corrections | Collaborator mapping, async claiming queue, unique numeric IDs, two-tier publishing. | `IN_REVIEW` ⏳ (Awaiting Gate) |
+| **Phase 0.1.3**| Deployment Integrity, Admin Bootstrap & Workflow Security | Non-circular manifest, Pages status `succeed`, Option A single workflow, admin bootstrap, event security matrix, claim whitelisting, monotonic sequencing. | `IN_REVIEW` ⏳ (Awaiting Gate) |
 | **Phase 1** | Frontend Core Foundation | Responsive Vanilla HTML5/CSS3/ES6 static storefront using mock catalogs. | `NOT_STARTED` 🛑 |
 | **Phase 2** | Firebase Foundation and Auth | GitHub OAuth, Passwordless Magic Links, App Check (reCAPTCHA Enterprise), security rules. | `NOT_STARTED` 🛑 |
 | **Phase 3** | Developer Dashboard & Submissions | Submission form wizard, developer management portal, rate limiting. | `NOT_STARTED` 🛑 |

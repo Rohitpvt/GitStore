@@ -1,7 +1,7 @@
 # GitStore — Submission Pipeline & Batch Processing Engine
 
-**Document Version:** 1.3.0  
-**Phase:** Phase 0.1.2 — Final Security & Architecture Corrections  
+**Document Version:** 1.4.0  
+**Phase:** Phase 0.1.3 — Deployment Integrity, Administrator Bootstrap & Workflow Security  
 **Status:** Approved Pipeline Architecture (Hardened)  
 **Execution Engine:** GitHub Actions (`.github/workflows/batch-processor.yml`)
 
@@ -16,8 +16,9 @@ The GitStore Submission Pipeline is the ingestion, verification, and static publ
 2. **Unified Ingestion Without Fake Accounts:** Submissions from the Developer Dashboard and GitHub Issue Forms feed the same queue. Issue form submitters do **not** receive placeholder Firebase accounts; their submissions are stored with `submitterGithubId` and `claimStatus: 'unclaimed'`, claimed securely via an asynchronous `/claim_requests` queue when they log in.
 3. **Rigorous Ownership & Authority Tiers:** Only Direct Personal Repository Owners (`repo.owner.id == submitter.githubId`) possess inherent release authority to qualify for automated publication. Organization members, committers, and community nominators lack proven release authority and are strictly gated to manual administrator review (`needs_review`).
 4. **Distinction of Verified Developer Status:** Personal repository ownership does **not** automatically award the platform "Verified Developer" badge. Auto-published products from unverified personal owners carry standard community attribution.
-5. **Recoverable Two-Tier Publication State Machine:** Consistency between GitHub Pages and Cloud Firestore is guaranteed via an eventually consistent state machine requiring both GitHub Deployments API confirmation and public HTTP deployment-manifest verification before marking records `published`.
-6. **Realistic Cron Expectations:** Scheduled cron triggers on GitHub Actions are best-effort (5–30 minute delays during platform peak load). Exact 10-minute turnaround is neither promised nor required.
+5. **Non-Circular, Recoverable Two-Tier Publication State Machine:** Consistency between GitHub Pages and Cloud Firestore is guaranteed via an eventually consistent state machine. The publication manifest (`data/deployment-manifest.json`) strictly omits commit SHAs. Verification requires both confirmation from the dedicated GitHub Pages deployments API (`GET /repos/{owner}/{repo}/pages/deployments/{id}` returning `"status": "succeed"`) and public HTTP manifest verification matching `generationId` and monotonic `generationSequence` before marking records `published`.
+6. **Single-Workflow In-Run Deployment (Option A):** Because pushes executed with `GITHUB_TOKEN` do not trigger ordinary push workflows, catalog compilation, Git commit, Pages artifact upload (`actions/upload-pages-artifact@v3`), and Pages deployment (`actions/deploy-pages@v4`) execute sequentially within the **same trusted workflow run**.
+7. **Realistic Cron Expectations:** Scheduled cron triggers on GitHub Actions are best-effort (5–30 minute delays during platform peak load). Exact 10-minute turnaround is neither promised nor required.
 
 ---
 
@@ -45,13 +46,13 @@ stateDiagram-v2
     needs_review --> rejected: Admin Rejects Listing with Feedback
     
     approved --> catalog_generating: Leased by Static Compilation Worker
-    catalog_generating --> catalog_committed: data/catalog.json & manifest Pushed to main
-    catalog_committed --> deploying: Dispatch actions/deploy-pages Workflow
-    deploying --> deployment_success: Deploy Step Exits with Code 0
-    deployment_success --> deployment_verified: Confirmed via Deployments API & HTTP Manifest
+    catalog_generating --> catalog_committed: Catalog & Non-Circular Manifest Committed to Git
+    catalog_committed --> deploying: In-Workflow actions/deploy-pages Executed
+    deploying --> deployment_success: Dedicated Pages API Reports "succeed"
+    deployment_success --> deployment_verified: Confirmed via HTTP Manifest (generationId & seq)
     deployment_verified --> published: Firestore Document Finalized to published
-    deploying --> deployment_failed: Deploy Times Out / Errored (Reverted to approved)
-    deployment_failed --> approved: Re-queued for Next Run Compilation
+    deploying --> deployment_failed: Deploy Times Out / Errored
+    deployment_failed --> deployment_retained: Record Preserved in /system_deployments (Retryable)
     published --> [*]
     failed --> queued: Developer Corrects Metadata & Resubmits
     rejected --> [*]
@@ -83,22 +84,36 @@ stateDiagram-v2
      createdAt: serverTimestamp();
    }
    ```
-4. **Security Rules Guardrails:**
-   - Client can only create requests with `requesterUid == request.auth.uid`.
-   - Client cannot update or delete claim requests.
-   - Client cannot directly update ownership fields (`developerUid`, `claimStatus`) on `submissions`.
+4. **Strict Client Whitelist & Security Rules Guardrails:**
+   Clients must **never** be able to inject worker-managed or privileged fields. Security Rules enforce:
+   ```javascript
+   match /claim_requests/{requestId} {
+     allow read: if request.auth != null && resource.data.requesterUid == request.auth.uid;
+     allow create: if request.auth != null
+       && request.resource.data.keys().hasOnly(['requestId', 'requesterUid', 'targetSubmissionId', 'status', 'createdAt'])
+       && request.resource.data.requestId == requestId
+       && request.resource.data.requesterUid == request.auth.uid
+       && request.resource.data.targetSubmissionId is string
+       && request.resource.data.targetSubmissionId.size() > 0
+       && request.resource.data.status == 'pending'
+       && request.resource.data.createdAt == request.time;
+     allow update, delete: if false; // Privileged worker only
+   }
+   ```
+   **Rejected Client Fields:** Any request attempting to inject `developerUid`, `verifiedGithubId`, `claimStatus`, `isAdmin`, `processedAt`, `reviewedAt`, `reviewedBy`, `resolution`, `rejectionReason`, `workerLease`, or `workerId` is immediately rejected.
 5. Worker reads pending claim requests during batch run:
    - Queries Firebase Admin SDK: `admin.auth().getUser(req.requesterUid)`.
-   - Finds `userRecord.providerData.find(p => p.providerId === 'github.com')`.
+   - Finds `userRecord.providerData.find(p => p.providerId === 'github.com')`. Fail closed if absent.
    - Extracts `verifiedGithubId = provider.uid`.
-   - Checks target submission: `submission.submitterGithubId === verifiedGithubId && submission.claimStatus === 'unclaimed'`.
+   - Checks target submission: `submission.submitterGithubId === verifiedGithubId`.
    - Executes atomic Firestore transaction:
-     - `submission.developerUid = req.requesterUid`
-     - `submission.claimStatus = 'claimed'`
-     - `submission.claimedAt = serverTimestamp()`
-     - `claimReq.status = 'completed'`
+     - Checks `submission.developerUid == null` (prevents competing claims).
+     - Sets `submission.developerUid = req.requesterUid`
+     - Sets `submission.claimStatus = 'claimed'`
+     - Sets `submission.claimedAt = serverTimestamp()`
+     - Sets `claimReq.status = 'completed'`
      - Appends log to `/admin_logs`
-   - Rejects with `rejected_mismatch` if IDs do not match, or `rejected_already_claimed` if claimed.
+   - Rejects with `rejected_mismatch` if IDs do not match, or `rejected_already_claimed` if claimed. Handles duplicates idempotently.
 
 ### 3.2 Ownership Verification Proof Matrix
 1. **Tier 1 (Direct Personal Owner):** `repo.owner.id == submitter.githubId`. Possesses inherent release authority. Auto-publishes on valid asset checks.
@@ -135,52 +150,78 @@ GitHub Repository: https://github.com/microsoft/sysinternals (Repo ID: 892341901
 ```mermaid
 flowchart TD
     A[Worker Starts Batch Cycle] --> B[Step 0: Run reconcilePublishedState]
-    B --> C{Is live deployment verified for unconfirmed catalog_committed docs?}
-    C -->|Yes| D[Heal Firestore: Finalize status to published]
+    B --> C{Is live deployment verified for unconfirmed generations?}
+    C -->|Yes| D[Heal Firestore: Finalize status to published & advance publishedSequence]
     C -->|No| E[Step 1: Process Pending claim_requests & moderation_requests]
     D --> E
     E --> F[Step 2: Claim Queued Submissions Limit 3]
     F --> G[Step 3: Run GitHub Verification Suite]
     G --> H{Any Submissions Transition to approved?}
     H -->|No| I[Exit Run]
-    H -->|Yes| J[Step 4: Transition to catalog_generating & Compile Static JSON]
-    J --> K[Step 5: Generate deployment-manifest.json with generationId]
+    H -->|Yes| J[Step 4: Transition to catalog_generating & Coalesce Approved Submissions]
+    J --> K[Step 5: Generate deployment-manifest.json with generationId & generationSequence]
     K --> L[Step 6: Git Pull --rebase, Commit & Push origin main]
-    L --> M[Step 7: Mark Submissions catalog_committed]
-    M --> N[Step 8: Dispatch actions/deploy-pages]
-    N --> O{Deploy Step Succeeded & API Verified?}
-    O -->|Yes| P[Step 9: Public HTTP Manifest Verification]
-    P -->|Verified| Q[Step 10: Finalize Submissions to published]
-    P -->|Not Yet Propagated| R[Leave catalog_committed; Reconciler will finalize]
-    O -->|Failed / Timeout| S[Mark deployment_failed -> Revert to approved]
+    L --> M[Step 7: Capture catalogCommitSha via git rev-parse HEAD & Record in /system_deployments]
+    M --> N[Step 8: Execute actions/upload-pages-artifact & deploy-pages in same workflow]
+    N --> O{Dedicated Pages API Reports status: 'succeed'?}
+    O -->|Yes| P[Step 9: Public HTTP Manifest Verification on Pages CDN]
+    P -->|Verified & Monotonic| Q[Step 10: Finalize Submissions to published & advance latestPublishedSequence]
+    P -->|Cache Propagating| R[Leave in system_deployments as deploying; Reconciler will finalize]
+    O -->|Failed / Timeout| S[Record failure in /system_deployments; Retain catalogCommitSha for retry]
     Q --> T[Release Leases, Log admin_logs & Exit]
     R --> T
     S --> T
 ```
 
-### 5.1 Deployment Verification Details
-A Git commit on `main` does **not** prove successful publication. The worker performs two checks:
-1. **GitHub Deployments API Check:**
-   `GET /repos/Rohitpvt/GitStore/deployments?environment=github-pages`
-   Checks that the latest deployment matching the catalog commit SHA has reached status `state: "success"`.
-2. **Public HTTP Manifest Check:**
-   `GET https://rohitpvt.github.io/GitStore/data/deployment-manifest.json?t={Date.now()}`
-   Confirms that `manifest.commitSha === catalogCommitSha` and `manifest.generationId === expectedGenerationId`.
+### 5.1 Deployment Verification, Concurrency & Monotonic Ordering Details
 
-### 5.2 Comprehensive 10 Failure Scenarios & Recovery Matrix
+#### 1. Non-Circular Manifest Architecture
+The static catalog publication creates `data/deployment-manifest.json` containing:
+```json
+{
+  "generationId": "gen_1730300400000_a1b2c3d4",
+  "generationSequence": 104,
+  "deployedAt": "2026-10-30T18:00:00.000Z",
+  "productCount": 42,
+  "schemaVersion": "1.4.0",
+  "environment": "github-pages"
+}
+```
+**Strict Invariant:** The manifest does **not** contain the SHA of the Git commit that contains it. Instead:
+- The worker commits the manifest and static catalog files.
+- The worker inspects `git rev-parse HEAD` to capture `catalogCommitSha`.
+- The tuple `(generationId, generationSequence, catalogCommitSha)` is recorded in Firestore `/system_deployments/{generationId}` and `/system_config/deployment_state`.
 
-| Failure Scenario | Description | Detection Mechanism | Recovery & Eventual Consistency Resolution |
+#### 2. Dedicated GitHub Pages Deployment Endpoint Check
+Deployments are verified via the dedicated GitHub Pages deployments API:
+`GET https://api.github.com/repos/Rohitpvt/GitStore/pages/deployments/{pages_deployment_id}`
+- Returns `{ "status": "succeed" }` upon verified completion. (Distinct from the generic Deployments API `state: "success"`).
+- Other status states include `"in_progress"`, `"queued"`, and `"failed"`.
+
+#### 3. Single-Workflow Execution (Option A)
+To resolve GitHub's behavior where commits pushed using `GITHUB_TOKEN` do not trigger ordinary `push` event workflows:
+- Catalog generation, Git commit/push, Pages artifact upload (`actions/upload-pages-artifact@v3`), Pages deployment (`actions/deploy-pages@v4`), and database finalization run sequentially inside `.github/workflows/batch-processor.yml`.
+- Eliminates any dependency on push-triggered workflows or elevated personal access tokens.
+
+#### 4. GitHub Actions Concurrency & Durable Coalescing
+- **Queue Semantics:** Standard GitHub Actions concurrency (`concurrency: group: gitstore-batch-worker, cancel-in-progress: false`) retains at most **one running run and one pending run**. If a third run is triggered, the pending run is discarded and replaced.
+- **Durable Coalescing:** GitStore does not rely on runner-level queuing. Instead, when the batch processor runs, it queries **all** submissions currently in `approved` status, coalescing them into a single publication generation (`generationSequence = latestSequence + 1`).
+- **Monotonic Ordering Guard:** Firestore tracks `latestPublishedSequence`. A generation with `generationSequence <= latestPublishedSequence` is permanently barred from marking submissions published or mutating global state.
+
+### 5.2 Comprehensive 10 Failure Scenarios & Idempotent Recovery Matrix
+
+| # | Failure Scenario | Detection Mechanism | Idempotent Recovery & Consistency Resolution |
 |---|---|---|---|
-| **1. Catalog Generation Failure** | Worker encounters invalid JSON metadata or disk error during static compilation. | Node.js process throws compilation exception. | Batch aborted; submissions remain in `approved`. Zero Git commits created. Retried automatically next batch run. |
-| **2. Git Commit Failure** | Local Git lock or disk error prevents committing static files. | `git commit` exits with non-zero code. | Workspace reset via `git reset --hard origin/main`; submissions remain in `approved`. |
-| **3. Git Push / Rebase Conflict** | Concurrent push to `main` causes push rejection. | `git push` fails with rejected non-fast-forward. | Worker executes `git pull --rebase origin main`. If conflict occurs, resets to origin and re-compiles next run. |
-| **4. Deployment Workflow Failure** | `pages-deploy.yml` or `actions/deploy-pages` fails during artifact extraction or deploy. | Deployments API reports `state: "failure"` or `"error"`. | Submissions transition from `deploying` to `deployment_failed`, which resets them to `approved`. Recompiled in next run. |
-| **5. Deployment Timeout** | Pages deployment takes longer than worker execution wait window. | Worker timeout reached before deployment API reports success. | Worker leaves submissions in `catalog_committed` without marking `published`. Next batch reconciler checks status. |
-| **6. Reverse Failure (Deploy Succeeded, Firestore Failed)** | GitHub Pages deploy succeeds and propagates, but worker crashes or network drops before updating Firestore. | Startup reconciler runs `reconcilePublishedState()`. | Reconciler fetches public `deployment-manifest.json` and Deployments API; detects matching SHA; **finalizes Firestore to `published`**. |
-| **7. Worker Crashes Mid-Run** | GitHub Actions runner aborted (SIGKILL / runner preemption). | 15-minute lease timer expires. | Subsequent batch worker identifies expired lease (`leaseExpiresAt < now`) and reclaims submission cleanly. |
-| **8. Multiple Reconciliation Runs** | Reconciler executes repeatedly on consecutive cron triggers. | Idempotency guard (`status == 'published'` check). | Safe no-op; already finalized products are skipped. |
-| **9. Concurrent Worker Races** | Scheduled cron overlaps with manual workflow dispatch. | GitHub Actions concurrency group `gitstore-batch-worker`. | Second job is queued (`cancel-in-progress: false`), preventing overlapping runs. |
-| **10. Out-of-Order Deployments** | An older queued deployment completes after a newer generation was pushed. | Serialized deployment concurrency and generation timestamps. | Concurrency locks ensure only one deployment is in flight. Reconciler only advances forward (`generationTimestamp >= currentDeployed`). |
+| **1** | **Catalog generation failure** | Node.js process throws syntax error or JSON compilation exception prior to commit. | Process aborts. Zero Git commits created. Submissions remain in `approved`. A failed generation record is logged with `stage: 'generation'`. Submissions are cleanly picked up on next batch cycle. |
+| **2** | **Catalog commit failure** | Git push rejected due to concurrent push or branch protection conflict. | Process executes `git reset --hard origin/main`. Submissions remain in `approved`. Zero invalid generation records persisted. Re-compiled on next cycle with updated `origin/main`. |
+| **3** | **Deployment workflow not triggered** | Artifact upload step fails or runner runs out of disk space before Pages deployment starts. | `catalogCommitSha` already exists in Git and is recorded in `/system_deployments/{generationId}` with `status: 'deploying'`. Submissions remain in `catalog_committed` (NOT reverted to `approved`). Reconciler re-executes `actions/upload-pages-artifact` for that exact commit SHA. |
+| **4** | **Deployment queued but never started** | GitHub Pages deployment infrastructure queued or suspended. | Worker 15-minute lease timer expires. Reconciler checks Pages deployment API. If deployment remains queued or unstarted beyond threshold (30m), reconciler cancels stale deployment and re-dispatches deployment for existing `catalogCommitSha`. |
+| **5** | **Pages deployment failure** | Dedicated Pages API returns `{ "status": "failed" }` or deployment times out. | Failure record retained in `/system_deployments/{generationId}` with `status: 'failed'`, `lastObservedPagesStatus: 'failed'`, and `reconciliationStatus: 'pending_retry'`. Submissions are **NEVER reverted to `approved`** because the commit exists on `main`. Reconciler executes retry up to 3 times for the same commit SHA. |
+| **6** | **Pages deploy success, public manifest not yet updated** | Dedicated Pages API reports `status: "succeed"`, but public HTTP fetch returns HTTP 404 or older manifest due to edge CDN propagation delay. | Worker polls public manifest with exponential backoff (5s, 10s, 20s, up to 5m). If still unpropagated, worker leaves generation in `/system_deployments` with `status: 'deploying'`. The startup reconciler in subsequent batch run verifies propagated manifest and finalizes Firestore. |
+| **7** | **Manifest generation mismatch** | Public manifest returns `generationId` different from expected generation. | If public `generationSequence < expectedSequence`, CDN edge cache has not yet refreshed; wait for cache TTL. If public `generationSequence > expectedSequence`, a newer generation already deployed; this older generation is marked `status: 'stale'` and aborted without rolling back Firestore. |
+| **8** | **Firestore finalization failure** | Network drop or Firestore rate limit while updating submission documents to `status: 'published'`. | Pages is already live! Generation record exists in `/system_deployments` with `catalogCommitSha` and `expectedProductIds`. Startup reconciler verifies live manifest and finishes updating unfinalized submissions to `published`. Operation is fully idempotent. |
+| **9** | **Worker interruption during finalization** | GitHub Actions runner preempted or terminated (SIGKILL) midway through batch writes. | 15-minute lease expires. Next batch run detects active generation with unfinalized submissions in `expectedProductIds`. Reconciler completes remaining updates and sets `/system_deployments/{generationId}.status = 'published'`. |
+| **10** | **Newer generation appearing while older generation is deploying** | Mutex lease expired and second worker started, or manual dispatch triggered. | Concurrency lease prevents simultaneous runs. If an older run attempts finalization after a newer generation has already published (`generationSequence <= latestPublishedSequence`), monotonic check drops the older update, preventing regression. |
 
 ### 5.3 Consistency Guarantee
-GitStore does not claim distributed ACID transactions across GitHub and Firebase. It provides **guaranteed eventual consistency**: if a deployment succeeds, Firestore will heal to match; if a deployment fails, Firestore will not prematurely expose the product on the storefront.
+GitStore does not claim distributed ACID transactions across GitHub and Firebase. It provides **guaranteed eventual consistency**: if a deployment succeeds, Firestore will heal to match; if a deployment fails, Firestore will not prematurely expose the product on the storefront or create divergent Git-database states.

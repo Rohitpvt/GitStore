@@ -1,7 +1,7 @@
 # GitStore — Comprehensive Deployment & Operations Guide
 
-**Document Version:** 1.3.0  
-**Phase:** Phase 0.1.2 — Final Security & Architecture Corrections  
+**Document Version:** 1.4.0  
+**Phase:** Phase 0.1.3 — Deployment Integrity, Administrator Bootstrap & Workflow Security  
 **Status:** Approved Operations Manual (Hardened)  
 **Target Environments:** GitHub (Pages & Actions) and Firebase (Auth, Firestore, App Check)
 
@@ -82,13 +82,14 @@ Before initiating deployment, ensure you possess:
 2. Click **New repository secret** and add:
    - **`FIREBASE_SERVICE_ACCOUNT_JSON`**: Paste the entire raw JSON content of the Firebase service account private key generated in Step 2.5.
    - **`FIREBASE_CLIENT_CONFIG`**: Paste the JSON containing your public web app keys (apiKey, authDomain, projectId, appId).
-   - **`ADMIN_VERIFY_TOKEN`**: A Fine-Grained Personal Access Token (or GitHub App Installation Token) with `Metadata: read` permission on `Rohitpvt/GitStore`. (Used as a fallback if the default `GITHUB_TOKEN` is denied access to collaborator permission endpoints with HTTP 403).
+   - **`ADMIN_VERIFY_TOKEN`**: A Fine-Grained Personal Access Token with repository `Metadata: read` permission on `Rohitpvt/GitStore`. (Used as a fallback if the default `GITHUB_TOKEN` is denied access to collaborator permission endpoints with HTTP 403. *Classified as PENDING INTEGRATION TEST*).
 
-### 3.3 Configure Canonical GitStore Collaborators
+### 3.3 Configure Canonical GitStore Collaborators & Root Administrator
 1. In your GitHub repository (`Rohitpvt/GitStore`), navigate to **Settings -> Collaborators**.
-2. Add designated platform administrators as collaborators with role **Admin** or **Maintain**.
-3. The GitHub Actions batch worker uses the GitHub REST API (`GET /repos/Rohitpvt/GitStore/collaborators/{username}/permission`) to verify collaborator permissions before executing privileged moderation requests from `/moderation_requests`.
-4. Note that GitHub maps the `maintain` role to `write` in its legacy `permission` field; the worker checks `role_name === 'admin' || role_name === 'maintain'`.
+2. The repository owner (`Rohitpvt`) is verified automatically as the root administrator by matching their linked immutable numeric GitHub ID (`owner.id`) from repository metadata.
+3. Add designated platform administrators as collaborators with role **Admin** or **Maintain**.
+4. The GitHub Actions batch worker uses the GitHub REST API (`GET /repos/Rohitpvt/GitStore/collaborators/{username}/permission`) to verify collaborator permissions before executing privileged moderation requests from `/moderation_requests`.
+5. Note that GitHub maps the `maintain` role to `write` in its legacy `permission` field; the worker checks `role_name === 'admin' || role_name === 'maintain'`.
 
 ---
 
@@ -99,9 +100,10 @@ Before initiating deployment, ensure you possess:
    - **Source:** Select **GitHub Actions**.
 3. Ensure HTTPS is enforced by checking **Enforce HTTPS**.
 4. Publication Verification Architecture:
-   - Modern deployments use `actions/deploy-pages@v4` targeting the `github-pages` environment.
-   - The batch worker generates `data/deployment-manifest.json` containing `{ generationId, commitSha, deployedAt, productCount }`.
-   - The worker verifies publication by querying `GET /repos/Rohitpvt/GitStore/deployments?environment=github-pages` and performing a public HTTP check on `https://rohitpvt.github.io/GitStore/data/deployment-manifest.json` before finalizing database status to `published`.
+   - Modern deployments use `actions/upload-pages-artifact@v3` and `actions/deploy-pages@v4` targeting the `github-pages` environment within the same trusted workflow run (Option A).
+   - The batch worker generates `data/deployment-manifest.json` containing `{ generationId, generationSequence, deployedAt, productCount, schemaVersion: "1.4.0", environment: "github-pages" }` (omitting the Git commit SHA).
+   - The worker commits to `main`, captures `catalogCommitSha` via `git rev-parse HEAD`, records the generation in Firestore `/system_deployments/{generationId}`, and queries the dedicated GitHub Pages deployment endpoint `GET /repos/Rohitpvt/GitStore/pages/deployments/{pages_deployment_id}` for status `"succeed"`.
+   - Finally, the worker performs a public HTTP check on `https://rohitpvt.github.io/GitStore/data/deployment-manifest.json` confirming `generationId` and monotonic `generationSequence` before finalizing database status to `published`.
 
 ---
 
@@ -136,7 +138,13 @@ on:
   schedule:
     # Executes approximately every 10 minutes (subject to Actions platform queue load)
     - cron: '*/10 * * * *'
-  workflow_dispatch: # Allows manual trigger from Actions tab
+  workflow_dispatch: # Allows manual trigger from Actions tab by collaborators
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+  metadata: read
 
 concurrency:
   group: gitstore-batch-worker
@@ -150,29 +158,45 @@ jobs:
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Run Self-Healing Reconciliation & Batch Verification
+      - name: Run Reconciliation, Verification & Static Catalog Compilation
         env:
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ADMIN_VERIFY_TOKEN: ${{ secrets.ADMIN_VERIFY_TOKEN }}
           CANONICAL_REPOSITORY: ${{ github.repository }}
         run: |
           node scripts/processor/index.js
 
-      - name: Deploy to GitHub Pages
+      - name: Commit & Push Catalog to Main
+        run: |
+          git config user.name "gitstore-bot"
+          git config user.email "bot@gitstore.dev"
+          git add data/
+          git diff-index --quiet HEAD || git commit -m "chore(catalog): publish static catalog [skip ci]"
+          git push origin main
+          echo "CATALOG_SHA=$(git rev-parse HEAD)" >> $GITHUB_ENV
+
+      - name: Package Pages Artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: .
+
+      - name: Deploy to GitHub Pages (Option A: Same Trusted Run)
         id: deploy
         uses: actions/deploy-pages@v4
-        if: success()
 
       - name: Finalize Published Status in Firestore
         if: steps.deploy.outcome == 'success'
         env:
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+          CATALOG_SHA: ${{ env.CATALOG_SHA }}
         run: |
           node scripts/processor/finalize-publishing.js
 ```
