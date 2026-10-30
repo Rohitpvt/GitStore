@@ -3,7 +3,7 @@
 **Document Version:** 1.2.0  
 **Phase:** Phase 0.1 — Architecture Audit, Hardening & Master Phase Control  
 **Status:** Approved Master Roadmap (Synchronized with `PHASE_PLAN.md`)  
-**Single Source of Execution Truth:** [`PHASE_PLAN.md`](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/PHASE_PLAN.md)
+**Single Source of Execution Truth:** [`PHASE_PLAN.md`](./PHASE_PLAN.md)
 
 ---
 
@@ -53,7 +53,7 @@ gantt
 
 ## 3. Governance and Execution Control
 
-Execution is strictly governed by the rules set forth in [`PHASE_PLAN.md`](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/PHASE_PLAN.md):
+Execution is strictly governed by the rules set forth in [`PHASE_PLAN.md`](./PHASE_PLAN.md):
 1. **One Phase at a Time:** Active implementation occurs strictly on the currently authorized phase.
 2. **Definition of Done (DoD):** Every phase has explicit technical acceptance criteria that must be verified and reported.
 3. **Approval Gates:** A phase being marked `COMPLETED` by Antigravity does **not** grant authorization to begin implementation on the next phase. Explicit user authorization (`APPROVED`) is mandatory.

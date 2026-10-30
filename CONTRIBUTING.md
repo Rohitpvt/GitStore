@@ -13,7 +13,7 @@ Before contributing, please review our core architectural invariants:
 1. **Two External Platforms Only:** GitStore strictly operates on **GitHub** (Pages, Actions, Issues, Releases) and **Firebase** (Auth, Firestore, Security Rules, App Check). Do not submit PRs introducing AWS, Supabase, Vercel, Netlify, or third-party servers.
 2. **Framework-Free Frontend:** The frontend is built with **HTML5, CSS3, and Vanilla JavaScript (ES6 Modules)**. PRs introducing React, Vue, Next.js, or complex bundler toolchains will not be accepted.
 3. **Binary Non-Execution:** GitStore never re-hosts or executes third-party binaries. All download buttons link directly to official upstream GitHub Releases assets.
-4. **Phase Control:** All active work must adhere to the current phase documented in [`PHASE_PLAN.md`](PHASE_PLAN.md).
+4. **Phase Control:** All active work must adhere to the current phase documented in [`PHASE_PLAN.md`](docs/PHASE_PLAN.md).
 
 ---
 

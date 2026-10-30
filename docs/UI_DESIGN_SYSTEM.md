@@ -3,7 +3,7 @@
 **Document Version:** 1.1.0  
 **Phase:** Phase 0.1 — Architecture Audit, Hardening & Final Validation  
 **Status:** Approved Design System (Hardened)  
-**Design Influence:** Cyberpunk Hardware / Technical Obsidian Aesthetic (Derived from `Sample Design MD/brew-coffee-shop-DESIGN.md` & `https://brew-coffee-shop.aura.build/`)  
+**Design Influence:** Cyberpunk Hardware / Technical Obsidian Aesthetic (Derived from [`Sample Design MD/brew-coffee-shop-DESIGN.md`](./Sample%20Design%20MD/brew-coffee-shop-DESIGN.md) & `https://brew-coffee-shop.aura.build/`)  
 **Product Identity:** "The Terminal-Grade Open Software Depot"
 
 ---

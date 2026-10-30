@@ -89,19 +89,20 @@ All 13 foundational architecture documents are synchronized and available in `do
 
 | Document | Title | Purpose & Corrected Scope |
 |---|---|---|
-| [**PRD.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/PRD.md) | Product Requirements Document | User personas, multi-product formats, ownership framework, pre-launch gates. |
-| [**SDD.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/SDD.md) | System Design Document | System components, sequence diagrams, self-healing two-phase publish protocol. |
-| [**ARCHITECTURE.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/ARCHITECTURE.md) | Architecture Specification | System invariants, interface contracts, ADRs 01–10 (ADR-05 to 10 corrected). |
-| [**DATABASE_SCHEMA.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/DATABASE_SCHEMA.md) | Cloud Firestore Schema | `moderation_requests`, multi-product keys (`prod_{owner}_{slug}`), reconciler pseudocode. |
-| [**AUTHENTICATION.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/AUTHENTICATION.md) | Authentication & Identity | GitHub OAuth, Magic Links, reCAPTCHA v3 lazy-loading, account linking. |
-| [**SUBMISSION_PIPELINE.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/SUBMISSION_PIPELINE.md) | Submission Pipeline | FSM states, batch worker engine, 4-tier ownership verification, self-healing compiler. |
-| [**SECURITY.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/SECURITY.md) | Security & Threat Model | Actor privilege matrix, canonical repo admin flow, threat mitigations. |
-| [**UI_DESIGN_SYSTEM.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/UI_DESIGN_SYSTEM.md) | UI Design System | Obsidian cyberpunk tokens, chamfered buttons, crosshairs, disclaimer panel. |
-| [**ROADMAP.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/ROADMAP.md) | Implementation Roadmap | Phased execution milestones (Phase 0 to Phase 8) and exit criteria. |
-| [**DEPLOYMENT_GUIDE.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/DEPLOYMENT_GUIDE.md) | Operations Manual | Setup for Pages, Actions secrets, canonical collaborators, and Firebase. |
-| [**TESTING_STRATEGY.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/TESTING_STRATEGY.md) | Testing Strategy | Security rules tests, reconciler tests, multi-product collision tests. |
-| [**COST_AND_LIMITS.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/COST_AND_LIMITS.md) | Cost & Quota Analysis | Quota failure behaviors (`RESOURCE_EXHAUSTED`), reCAPTCHA v3 10k allowance. |
-| [**README.md**](file:///C:/Users/rghos/OneDrive%20-%20Vivekananda%20Institute%20of%20Professional%20Studies/PROJECTS/GitStore/docs/README.md) | Repository Readme | Project overview, navigation guide, and corrected architectural summary. |
+| [**PHASE_PLAN.md**](./PHASE_PLAN.md) | Master Phase Tracking Plan | Detailed lifecycle execution tracker, gate definitions, audit logs, and status. |
+| [**PRD.md**](./PRD.md) | Product Requirements Document | User personas, multi-product formats, ownership framework, pre-launch gates. |
+| [**SDD.md**](./SDD.md) | System Design Document | System components, sequence diagrams, self-healing two-phase publish protocol. |
+| [**ARCHITECTURE.md**](./ARCHITECTURE.md) | Architecture Specification | System invariants, interface contracts, ADRs 01–10 (ADR-05 to 10 corrected). |
+| [**DATABASE_SCHEMA.md**](./DATABASE_SCHEMA.md) | Cloud Firestore Schema | `moderation_requests`, multi-product keys (`prod_{owner}_{slug}`), reconciler pseudocode. |
+| [**AUTHENTICATION.md**](./AUTHENTICATION.md) | Authentication & Identity | GitHub OAuth, Magic Links, reCAPTCHA v3 lazy-loading, account linking. |
+| [**SUBMISSION_PIPELINE.md**](./SUBMISSION_PIPELINE.md) | Submission Pipeline | FSM states, batch worker engine, 4-tier ownership verification, self-healing compiler. |
+| [**SECURITY.md**](./SECURITY.md) | Security & Threat Model | Actor privilege matrix, canonical repo admin flow, threat mitigations. |
+| [**UI_DESIGN_SYSTEM.md**](./UI_DESIGN_SYSTEM.md) | UI Design System | Obsidian cyberpunk tokens, chamfered buttons, crosshairs, disclaimer panel. |
+| [**ROADMAP.md**](./ROADMAP.md) | Implementation Roadmap | Phased execution milestones (Phase 0 to Phase 8) and exit criteria. |
+| [**DEPLOYMENT_GUIDE.md**](./DEPLOYMENT_GUIDE.md) | Operations Manual | Setup for Pages, Actions secrets, canonical collaborators, and Firebase. |
+| [**TESTING_STRATEGY.md**](./TESTING_STRATEGY.md) | Testing Strategy | Security rules tests, reconciler tests, multi-product collision tests. |
+| [**COST_AND_LIMITS.md**](./COST_AND_LIMITS.md) | Cost & Quota Analysis | Quota failure behaviors (`RESOURCE_EXHAUSTED`), reCAPTCHA v3 10k allowance. |
+| [**Sample Design Reference**](./Sample%20Design%20MD/brew-coffee-shop-DESIGN.md) | Design Token Specification | Reference cyberpunk hardware obsidian design tokens & components. |
 
 ---
 
