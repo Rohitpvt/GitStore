@@ -1,7 +1,7 @@
 # GitStore — Authentication Architecture & Identity Specification
 
-**Document Version:** 1.7.0  
-**Phase:** Phase 0.1.6 — Step-Up Proof Integrity, Firestore Rules & Deployment Reconciliation  
+**Document Version:** 1.8.0  
+**Phase:** Phase 0.1.7 — Replay Protection, Firestore Field Integrity & Deployment State Consistency  
 **Status:** IN_REVIEW — Awaiting Explicit User Approval  
 **Provider:** Firebase Authentication (v10 Modular SDK)  
 **Host Environment:** GitHub Pages (`https://<org>.github.io/<repo>/`)
@@ -182,9 +182,9 @@ Repository ownership of `Rohitpvt/GitStore` alone does not authenticate the pers
 
 ---
 
-## 7. Action-Bound Step-Up Authentication Proof Integrity (Option A)
+## 7. Action-Bound Step-Up Authentication Proof Integrity & Replay Protection (Option A)
 
-To eliminate the risks of stolen session tokens, cross-tab session hijacking, or unauthorized administrative actions performed through linked email accounts, GitStore enforces **Mandatory Fresh GitHub Step-Up Reauthentication with Action-Bound Proofs (Option A)** for all privileged operations (`APPROVE_SUBMISSION`, `REJECT_SUBMISSION`, `VERIFY_DEVELOPER`, `REVOKE_DEVELOPER`, `DELIST_PRODUCT`, `FEATURE_PRODUCT`):
+To eliminate the risks of stolen session tokens, cross-tab session hijacking, or unauthorized administrative actions performed through linked email accounts, GitStore enforces **Mandatory Fresh GitHub Step-Up Reauthentication with Action-Bound Proofs and Atomic Nonce Consumption (Option A)** for all privileged operations (`APPROVE_SUBMISSION`, `REJECT_SUBMISSION`, `VERIFY_DEVELOPER`, `REVOKE_DEVELOPER`, `DELIST_PRODUCT`, `FEATURE_PRODUCT`):
 
 ### 7.1 Interactive Step-Up Challenge Flow
 1. When an administrator initiates a moderation action on `admin.html`, the client triggers:
@@ -200,9 +200,9 @@ To eliminate the risks of stolen session tokens, cross-tab session hijacking, or
    const tokenResult = await auth.currentUser.getIdTokenResult(true);
    ```
 
-2. **Elimination of Raw Token Storage & Action Hash Binding:**
-   **Zero raw OAuth access tokens are written to or stored in Cloud Firestore.**
-   Instead, the client binds the user's freshly authenticated token claims to the specific action and target document:
+2. **ActionHash Classification & Cryptographic Reality:**
+   **No raw OAuth access tokens are stored in Cloud Firestore.**
+   Instead, the client constructs an action-bound proof:
    ```javascript
    const actionNonce = crypto.randomUUID().replace(/-/g, '') + crypto.randomUUID().replace(/-/g, '');
    const authTime = tokenResult.claims.auth_time;
@@ -221,8 +221,26 @@ To eliminate the risks of stolen session tokens, cross-tab session hijacking, or
      actionHash: actionHash
    };
    ```
+   > [!IMPORTANT]
+   > **Integrity Checksum Classification:** The client-generated SHA-256 `actionHash` contains no server secret or private cryptographic key. It is **not** an independent digital signature or authentication proof. It functions strictly as a **client data-integrity checksum** ensuring that the tuple `(action, targetDocumentPath, actionNonce, authTime)` was not corrupted or modified in transit.
 
-3. **Security Rules Freshness Gate:**
+3. **Atomic Nonce Reservation in `/consumed_stepup_nonces`:**
+   To guarantee that an action nonce cannot be reused across different request documents:
+   - When the worker leases a moderation request, it calculates `nonceHash = SHA256(actionNonce)`.
+   - In the exact same atomic Firestore transaction that transitions the request from `pending` to `processing`, the worker asserts that `/consumed_stepup_nonces/{nonceHash}` does not exist.
+   - If it exists, the transaction fails and the request is marked `rejected` (`NONCE_ALREADY_CONSUMED`).
+   - If it does not exist, the worker creates `/consumed_stepup_nonces/{nonceHash}` with `{ nonceHash, requestId, requestedByUid, action, targetDocumentPath, workerRunId, consumedAt }`.
+   - **Recovery Policy:** If the worker terminates unexpectedly post-consumption (e.g. runner SIGKILL or GitHub API 500), the nonce remains consumed. The administrator must initiate a new action in the dashboard, generating a fresh nonce.
+   - Client access to `/consumed_stepup_nonces` is default-deny (`allow read, write: if false;`).
+
+4. **Target Document Path Mapping:**
+   The worker derives the expected canonical path from an explicit action-to-collection mapping:
+   - `APPROVE_SUBMISSION`, `REJECT_SUBMISSION` -> Must match `submissions/{id}`.
+   - `VERIFY_DEVELOPER`, `REVOKE_DEVELOPER` -> Must match `users/{id}` or `public_profiles/{id}`.
+   - `DELIST_PRODUCT`, `FEATURE_PRODUCT` -> Must match `products/{id}`.
+   The worker asserts `docData.targetDocumentPath === expectedPath`. Target documents in internal collections (`system_deployments`, `system_config`, `admin_logs`, `consumed_stepup_nonces`) are strictly rejected.
+
+5. **Security Rules Freshness Gate:**
    Firestore Security Rules evaluate the `auth_time` claim within the Firebase ID token:
    ```javascript
    function isFreshlyAuthenticated() {
@@ -256,13 +274,11 @@ To eliminate the risks of stolen session tokens, cross-tab session hijacking, or
    }
    ```
 
-4. **Dual Timing Model (Creation Gate vs Queue Retention):**
+6. **Dual Timing Model (Creation Gate vs Queue Retention):**
    - **5-Minute Creation Window:** The freshness constraint `request.time - auth_time < 300` is enforced **only at document creation time**. This ensures the administrator authenticated within 5 minutes when placing the command in the queue.
    - **30-Minute Queue Execution Window:** Once accepted, the document cannot be modified by clients. The Actions worker processes requests within a 30-minute queue TTL (`now - doc.createdAt.toMillis() < 30 * 60 * 1000`). If older than 30 minutes, it is marked `expired`.
 
-5. **Authoritative Worker Validation & Anti-Replay Guarantees:**
-   - Worker retrieves `requestedByUid` and queries Firebase Admin SDK `getUser()`.
-   - Worker verifies linked GitHub provider UID matches `docData.githubUserId`.
-   - Worker verifies `docData.stepUpProof.actionHash === sha256(`${action}:${targetDocumentPath}:${actionNonce}:${authTime}`)`.
-   - Worker verifies canonical repository collaborator permissions (`Rohitpvt/GitStore`).
-   - Worker atomically updates request status to `processing` with `workerRunId`. Because clients cannot update or delete documents in `/moderation_requests`, replay attacks are mathematically prevented.
+7. **Mixed-Provider Firebase Reauthentication Status:**
+   - **Scenario Tested:** Account created via passwordless email link, linked to GitHub, signs in via email, reauthenticates via GitHub popup.
+   - **Evaluation:** Firebase Auth updates `auth_time` upon reauthentication, but public Firebase docs do not guarantee `firebase.sign_in_provider` switches from `'emailLink'` to `'github.com'` without a fresh sign-in.
+   - **Status:** Classified truthfully as **`PENDING_INTEGRATION_TEST`**. Under current rules, administrators executing privileged tasks must authenticate their active session via GitHub OAuth.

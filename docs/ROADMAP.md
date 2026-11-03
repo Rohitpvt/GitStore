@@ -1,7 +1,7 @@
 # GitStore — Strategic Implementation Roadmap
 
-**Document Version:** 1.7.0  
-**Phase:** Phase 0.1.6 — Step-Up Proof Integrity, Firestore Rules & Deployment Reconciliation  
+**Document Version:** 1.8.0  
+**Phase:** Phase 0.1.7 — Replay Protection, Firestore Field Integrity & Deployment State Consistency  
 **Status:** IN_REVIEW — Awaiting Explicit User Approval  
 **Single Source of Execution Truth:** [`PHASE_PLAN.md`](./PHASE_PLAN.md)
 
@@ -21,7 +21,8 @@ gantt
     Phase 0.1.3: Deployment & Admin Security :done, p0_1_3, 2026-10-30, 1d
     Phase 0.1.4: Evidence & Deployment Recovery :done, p0_1_4, 2026-10-30, 1d
     Phase 0.1.5: Security Rules, Step-Up & Recovery :done, p0_1_5, 2026-11-03, 1d
-    Phase 0.1.6: Proof Integrity & Reconciliation :active, p0_1_6, 2026-11-03, 1d
+    Phase 0.1.6: Proof Integrity & Reconciliation :done, p0_1_6, 2026-11-03, 1d
+    Phase 0.1.7: Replay Protection & Field Integrity :active, p0_1_7, 2026-11-03, 1d
     section Phase 1 & 2
     Phase 1: Frontend Core Foundation (Mock):p1, 2026-11-04, 7d
     Phase 2: Firebase Foundation & Auth     :p2, after p1, 6d
@@ -47,7 +48,8 @@ gantt
 | **Phase 0.1.3**| Deployment Integrity, Admin Bootstrap & Workflow Security | Non-circular manifest, Pages status `succeed`, Option A single workflow, admin bootstrap, event security matrix, claim whitelisting, monotonic sequencing. | `COMPLETED` ✅ |
 | **Phase 0.1.4**| Evidence Alignment, Deployment Recovery & Governance Consistency | Evidence classification matrix, deterministic post-commit SHA recovery, 4-case monotonic sequence matrix, generatedAt manifest, Pages deploy requirements, ID normalization. | `COMPLETED` ✅ |
 | **Phase 0.1.5**| Final Security Rules, Administrator Step-Up Authentication & Deployment Recovery Audit | Profile separation, private user data lockout, mandatory fresh step-up reauthentication (Option A), 12-state recovery machine, unshallow full-history search, digest verification, Cases A-D recovery, split-job workflow with `@v7`/`@v5` actions, 20-row matrix. | `COMPLETED` ✅ |
-| **Phase 0.1.6**| Step-Up Proof Integrity, Firestore Rules & Deployment Reconciliation | Action-bound step-up proof without raw tokens, 5-min creation gate vs 30-min queue TTL, exhaustive security rules schemas (`diff().affectedKeys()`), reconciliation query fix across non-terminal states, executable Case B recovery, official Pages deployment endpoint by commit SHA, Commits API pagination loop, recursive canonical catalog digest (`sha256:v1`), transactional revision updates, and pre-deploy 4-case guard. | `IN_REVIEW` ⏳ (Awaiting Gate) |
+| **Phase 0.1.6**| Step-Up Proof Integrity, Firestore Rules & Deployment Reconciliation | Action-bound step-up proof without raw tokens, 5-min creation gate vs 30-min queue TTL, exhaustive security rules schemas (`diff().affectedKeys()`), reconciliation query fix across non-terminal states, executable Case B recovery, official Pages deployment endpoint by commit SHA, Commits API pagination loop, recursive canonical catalog digest (`sha256:v1`), transactional revision updates, and pre-deploy 4-case guard. | `COMPLETED` ✅ |
+| **Phase 0.1.7**| Replay Protection, Firestore Field Integrity & Deployment State Consistency | GitHub Pages dedicated status endpoint (`status === 'succeed'`), Case B real artifact handoff to `$GITHUB_OUTPUT`, submission client create allowlist without worker fields, `/consumed_stepup_nonces` atomic single-use reservation ledger, truthful client checksum classification of `actionHash`, canonical target doc validation, mixed-provider reauth test scenario, durable revision transactions with stale abort (`capturedRevision < currentPublishedRevision`), single shared generation ordering function, complete commit pagination loop without depth limits. | `IN_REVIEW` ⏳ (Awaiting Gate) |
 | **Phase 1** | Frontend Core Foundation | Responsive Vanilla HTML5/CSS3/ES6 static storefront using mock catalogs. | `NOT_STARTED` 🛑 |
 | **Phase 2** | Firebase Foundation and Auth | GitHub OAuth, Passwordless Magic Links, App Check (reCAPTCHA Enterprise), security rules. | `NOT_STARTED` 🛑 |
 | **Phase 3** | Dev Dashboard & Submission System | Multi-format submission wizard, state polling, async claim queue. | `NOT_STARTED` 🛑 |

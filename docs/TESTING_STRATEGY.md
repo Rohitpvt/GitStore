@@ -1,7 +1,7 @@
 # GitStore — Comprehensive Testing Strategy
 
-**Document Version:** 1.7.0  
-**Phase:** Phase 0.1.6 — Step-Up Proof Integrity, Firestore Rules & Deployment Reconciliation  
+**Document Version:** 1.8.0  
+**Phase:** Phase 0.1.7 — Replay Protection, Firestore Field Integrity & Deployment State Consistency  
 **Status:** IN_REVIEW — Awaiting Explicit User Approval  
 
 ---
@@ -12,7 +12,7 @@ GitStore adheres to a layered testing hierarchy designed to guarantee platform r
 
 ### Testing Invariants
 1. **Zero-Trust Security Verification:** All Firestore Security Rules must be proven secure using automated unit tests executed against the **Firebase Local Emulator Suite** before production deployment.
-2. **Deterministic Batch Pipeline & Recovery:** The GitHub Actions batch processor must be tested against simulated GitHub API failures, rate limits, corrupt assets, lease race conditions, full-history commit recoveries, and deployment aborts using mocked HTTP fixtures.
+2. **Deterministic Batch Pipeline & Recovery:** The GitHub Actions batch processor must be tested against simulated GitHub API failures, rate limits, corrupt assets, lease race conditions, complete pagination commit recoveries, and deployment aborts using mocked HTTP fixtures.
 3. **Cross-Browser Vanilla Compliance:** Frontend modules and CSS components must operate natively across Chromium, Gecko, and WebKit rendering engines without requiring transpilers or polyfills.
 
 ---
@@ -114,9 +114,16 @@ describe('Deterministic Recursive Canonical Digest Tests', () => {
      - Client (anonymous or authenticated) CANNOT read or write `/system_deployments/{generationId}`.
      - Client CANNOT read or write `/system_config/deployment_state`.
      - Client CANNOT read or write `/system_config/catalog_state`.
+     - Client CANNOT read or write `/consumed_stepup_nonces/{nonceHash}`.
      - Client CANNOT read or write `/admin_logs/{logId}`.
      - Client CAN read `/system_config/global_settings`, but CANNOT write.
-  5. **Submission Tampering Protection:** Authenticated developer CANNOT update a submission that is already in `processing`, `approved`, or `published` status, and CANNOT alter ownership fields (`developerUid`, `claimStatus`, `ownershipProof`).
+  5. **Submission Field Tampering & Creation Allowlist Enforcement:**
+     - Client CAN create submission document with exact allowed client payload keys: `['id', 'developerUid', 'submissionSource', 'repoNumericId', 'repoId', 'targetProductId', 'productData', 'status', 'claimStatus', 'createdAt', 'updatedAt']`.
+     - Client CANNOT create submission containing ANY worker-managed fields: `validationResults`, `ownershipProof`, `processingLease`, `adminNotes`, `reviewedBy`, `reviewedAt`, `publishedProductId`. Test asserts create operation is REJECTED with permission-denied.
+     - Client CANNOT create submission with `status != 'queued'` or `claimStatus != 'claimed'`.
+     - Client CANNOT create submission with invalid `productData` (missing `name`, `category`, `shortDescription`, `selectedAsset`).
+     - Authenticated developer CANNOT update a submission that is in `processing`, `approved`, or `published` status.
+     - Authenticated developer CAN only update `productData`, `status`, `updatedAt` on existing submissions while status is `queued` or `needs_review`.
   6. **Claim Request Whitelist:** Authenticated user CAN create a `claim_requests` doc with their own `auth.uid` and `status: 'pending'`, but CANNOT inject privileged or worker fields (`developerUid`, `verifiedGithubId`, `claimStatus`, `isAdmin`, `workerLease`, `workerId`).
   7. **Moderation Queue Security & Action-Bound Step-Up Proof:**
      - Request write FAILS if token `auth_time` is older than 300 seconds (`(request.time - auth_time) >= 300`).
@@ -168,46 +175,88 @@ describe('Deterministic Recursive Canonical Digest Tests', () => {
    ];
    ```
 
-### 5.2 Action-Bound Step-Up Reauthentication & Zero-Token Tests
-- **Valid Step-Up Flow:**
+### 5.2 Action-Bound Step-Up Reauthentication & Atomic Nonce Ledger Tests
+- **Valid Step-Up Flow & Single-Use Nonce Consumption:**
   - Request contains action-bound proof `{ providerId: 'github.com', authTime, actionNonce, targetDocumentPath, actionHash }`.
   - Worker computes `expectedHash = sha256(`${action}:${targetDocumentPath}:${actionNonce}:${authTime}`)`.
-  - Worker asserts hash matches, checks collaborator rights, and updates status to `processing`.
+  - Assert: Worker confirms `actionHash === expectedHash` as client data-integrity checksum.
+  - Worker atomically leases request AND inserts `/consumed_stepup_nonces/{nonceHash}` in one transaction.
   - Assert: Zero raw OAuth access tokens existed in document.
-- **Identity Mismatch Rejection:**
-  - Caller linked GitHub ID does not match `githubUserId`.
-  - Assert: Worker aborts with security alarm and marks request `rejected`.
-- **Anti-Replay Protection Test:**
-  - Attempting to re-execute a request already in `processing` or `completed`.
-  - Assert: Worker fails closed and ignores replayed request.
+- **Nonce Replay Prevention Across Documents & Actions:**
+  - Simulate submission of a second moderation request containing the same `actionNonce` (targeting a different document or action).
+  - Worker enters atomic transaction, attempts to read `/consumed_stepup_nonces/{nonceHash}`.
+  - Document exists; transaction immediately aborts with `NONCE_ALREADY_CONSUMED`.
+  - Assert: Moderation request status transitions to `failed`, lease is rejected, and second privileged action is blocked.
+- **Failed Execution Nonce Burning:**
+  - Simulate request failure during privileged processing (e.g., GitHub API outage during product delist).
+  - Assert: Nonce document in `/consumed_stepup_nonces` remains written and burned. Recovery requires client to initiate fresh reauthentication producing a brand-new nonce.
+- **Target Document Path Validation:**
+  - Mock request with `action: 'APPROVE_SUBMISSION'` and `targetDocumentPath: 'system_config/catalog_state'`.
+  - Worker asserts canonical target mapping: `APPROVE_SUBMISSION` requires path matching `^submissions/[a-zA-Z0-9_-]+$`.
+  - Assert: Worker rejects request with `TARGET_DOCUMENT_INVALID` and raises security alarm.
 
-### 5.3 Full-History Commit Discovery & Branch Ancestry Tests
-- **Discovery Beyond 10-Commit Window:**
-  - Simulate commit history where candidate manifest commit is at depth 15 (`origin/main~15`).
-  - Worker runs unshallow `git log --format="%H" origin/main -- data/deployment-manifest.json`.
-  - Assert: Worker recovers commit SHA at depth 15 where legacy `git log -n 10` failed.
-- **Branch Ancestry Assertion (`git merge-base --is-ancestor`):**
-  - Simulate candidate commit from an unmerged feature branch or fork.
-  - Assert `git merge-base --is-ancestor ${candidateSha} origin/main` exits non-zero; reconciler rejects candidate commit.
-- **Commits API Full Pagination Loop Test:**
-  - Simulate multi-page response with `Link: <...page=2>; rel="next"`.
-  - Assert: Worker iterates through pages to locate commit when local git log is unavailable.
+### 5.3 Complete Commit Pagination & Error Classification Tests
+- **Discovery Beyond 100 Commits via Link Header Pagination:**
+  - Simulate commit history where candidate manifest commit is at depth 250 across 3 API pages.
+  - Mock `GET /repos/Rohitpvt/GitStore/commits` returning page 1 with `Link: <...page=2>; rel="next"`, page 2 with `Link: <...page=3>; rel="next"`, and page 3 with matching commit.
+  - Assert: Worker loop traverses all pages without hitting arbitrary 5-page depth limits and successfully discovers the commit.
+- **Incomplete Search vs Empty Search Distinction:**
+  - Simulate network timeout or HTTP 403 Secondary Rate Limit on page 2.
+  - Assert: Worker classifies failure as `INCOMPLETE_SEARCH`, preserves generation in `pending_retry`, and DOES NOT classify search as `EMPTY_SEARCH` (which would erroneously abandon or fail closed).
+- **Commit SHA Shell Injection Defense:**
+  - Simulate candidate commit SHA containing shell metacharacters: `abc123; rm -rf /`.
+  - Assert: Worker regex validation `/^[0-9a-f]{40}$/i` rejects the SHA before passing it to any git command.
 
-### 5.4 Missing Pages Deployment ID Handling (Cases A, B, C, D)
-- **Case A Test:** Pages deployment exists and `status === 'built'` on GitHub Pages API -> capture ID, verify CDN, finalize Firestore.
-- **Case B Test:** GitHub Pages API returns 404 (no deployment for commit) -> worker restores git tree at `gen.catalogCommitSha`, validates digest against `gen.catalogDigest`, rebuilds artifact into `site/`, sets `deploy_needed = true`, and sets `reconciliationStatus = 'pages_dispatched'`.
-- **Case C Test:** Remote Pages deployment failed (`errored`) -> retry same commit up to 3 times before preserving in `deployment_retained`.
-- **Case D Test:** Remote deploy succeeded, DB finalization interrupted -> idempotent finalization without re-deploying.
+### 5.4 GitHub Pages Status & Deployment Recovery Cases (A, B, C, D)
+- **Status Endpoint Matrix Tests (`GET /repos/Rohitpvt/GitStore/pages/deployments/{pages_deployment_id}`):**
+  - Response `{ status: "succeed" }` -> Assert worker accepts deployment as live and finalizes database status.
+  - Response `{ status: "queued" }` or `{ status: "in_progress" }` -> Assert worker enters polling loop with exponential backoff.
+  - Response `{ status: "errored" }` -> Assert worker retries deployment or flags for admin review.
+  - Response `HTTP 404` -> Assert worker transitions to Case B recovery.
+  - Response `HTTP 401` or `HTTP 403` -> Assert worker throws fatal permissions error and halts workflow.
+  - Response `HTTP 5xx` -> Assert worker preserves generation state for subsequent retry.
+  - Response `{ status: "built" }` or unknown string -> Assert worker REJECTS unrecognized status and halts execution.
+- **Case B Recovery & Cross-Job Artifact Handoff Test:**
+  - Simulate worker finding commit exists on remote `main`, but GitHub Pages API returns 404.
+  - Assert: Worker checks out commit, computes canonical catalog digest, verifies matching digest, stages `site/`, returns `{ deployNeeded: true, generationId, generationSequence, catalogCommitSha, catalogDigest }`, and writes `deploy_needed=true` to `$GITHUB_OUTPUT`.
+  - Assert: Job 1 uploads Pages artifact via `actions/upload-pages-artifact@v3`.
+  - Assert: Job 2 (`deploy-to-pages`) executes conditionally when `needs.build-and-commit.outputs.deploy_needed == 'true'` and triggers `actions/deploy-pages@v4`.
 
-### 5.5 Pre-Deployment Generation Ordering Guard Tests
-- Test Case 1: `artifact.sequence < state.latestPublishedSequence` -> Abort deploy with exit code 1.
-- Test Case 2: `artifact.sequence === state.latestPublishedSequence && artifact.id === state.latestPublishedGenerationId` -> Allow deploy.
-- Test Case 3: `artifact.sequence === state.latestPublishedSequence && artifact.id !== state.latestPublishedGenerationId` -> Critical alarm; fail closed.
-- Test Case 4: `artifact.sequence > state.latestPublishedSequence` -> Allow deploy.
+### 5.5 Single Shared Generation Ordering Decision Function Tests
+```javascript
+import { test, describe } from 'node:test';
+import assert from 'node:assert';
+import { evaluateGenerationOrdering } from './generation-order.js';
 
-### 5.6 Durable Catalog Revisions & Work Preservation Tests
-- Increment `latestRequestedRevision` in `/system_config/catalog_state` while compilation worker is running.
-- Post-deployment inside atomic transaction, assert worker detects `latestRequestedRevision > activeCapturedRevision` (`isDirty: true`) and triggers follow-up compilation.
+describe('Unified Generation Ordering Decision Matrix', () => {
+  test('Branch 1: Reject Stale Generation', () => {
+    assert.strictEqual(evaluateGenerationOrdering(9, 'gen_old', 10, 'gen_active'), 'REJECT_STALE');
+  });
+
+  test('Branch 2: Allow Idempotent Re-execution', () => {
+    assert.strictEqual(evaluateGenerationOrdering(10, 'gen_active', 10, 'gen_active'), 'ALLOW_IDEMPOTENT');
+  });
+
+  test('Branch 3: Halt Conflicting Sequence Collision', () => {
+    assert.strictEqual(evaluateGenerationOrdering(10, 'gen_fork', 10, 'gen_active'), 'HALT_CONFLICT');
+  });
+
+  test('Branch 4: Allow Strictly Monotonic Generation', () => {
+    assert.strictEqual(evaluateGenerationOrdering(11, 'gen_new', 10, 'gen_active'), 'ALLOW_NEW');
+  });
+});
+```
+
+### 5.6 Durable Catalog Revision Transaction & Stale Abort Tests
+- **Stale Generation Abort Test:**
+  - Mock `latestPublishedRevision: 5` in `/system_config/catalog_state`.
+  - Worker attempts to finalize generation with `capturedRevision: 4`.
+  - Transaction checks `capturedRevision < currentPublishedRevision`.
+  - Assert: Transaction throws immediately, rolls back, aborts finalization, marks `/system_deployments/{generationId}` as `status: 'stale_aborted'`, and preserves published revision 5 unchanged.
+- **Valid Revision Advancement Test:**
+  - Mock `latestPublishedRevision: 5` and `latestRequestedRevision: 6`.
+  - Worker finalizes generation with `capturedRevision: 6`.
+  - Assert: Transaction updates `latestPublishedRevision` to 6, sets `isDirty: false`, marks generation `published`, and commits atomically.
 
 ---
 

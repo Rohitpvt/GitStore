@@ -1,7 +1,7 @@
 # GitStore — Comprehensive Deployment & Operations Guide
 
-**Document Version:** 1.7.0  
-**Phase:** Phase 0.1.6 — Step-Up Proof Integrity, Firestore Rules & Deployment Reconciliation  
+**Document Version:** 1.8.0  
+**Phase:** Phase 0.1.7 — Replay Protection, Firestore Field Integrity & Deployment State Consistency  
 **Status:** IN_REVIEW — Awaiting Explicit User Approval  
 **Target Environments:** GitHub (Pages & Actions) and Firebase (Auth, Firestore, App Check)
 
@@ -28,7 +28,7 @@ Before initiating deployment, ensure you possess:
 2. Click **Create Database**.
 3. Select **Firestore Native Mode**.
 4. Choose a region close to your primary audience (e.g., `us-central1` or `europe-west1`). Note: Region selection is permanent.
-5. Deploy GitStore’s verified security rules from `docs/DATABASE_SCHEMA.md` to ensure private user documents and internal collections are locked down immediately.
+5. Deploy GitStore’s verified security rules from `docs/DATABASE_SCHEMA.md` to ensure private user documents, internal collections, and `/consumed_stepup_nonces` are locked down immediately.
 
 ### 2.3 Configure Firebase Authentication
 1. Go to **Build -> Authentication** and click **Get Started**.
@@ -90,7 +90,7 @@ Before initiating deployment, ensure you possess:
 3. Add designated platform administrators as collaborators with role **Admin** or **Maintain**.
 4. The GitHub Actions batch worker uses the GitHub REST API (`GET /repos/Rohitpvt/GitStore/collaborators/{username}/permission`) to verify collaborator permissions before executing privileged moderation requests from `/moderation_requests`.
 5. Note that GitHub maps the `maintain` role to `write` in its legacy `permission` field; the worker checks `role_name === 'admin' || role_name === 'maintain'`.
-6. For every administrative action, the frontend requires interactive **fresh GitHub reauthentication with action-bound proof (Option A)**, producing a cryptographic proof verified by the worker without raw OAuth token storage.
+6. For every administrative action, the frontend requires interactive **fresh GitHub reauthentication with action-bound proof (Option A)**, producing a client data-integrity checksum (`actionHash`) and single-use `actionNonce` recorded and leased atomically in `/consumed_stepup_nonces/{nonceHash}` by the worker.
 
 ---
 
@@ -102,11 +102,19 @@ Before initiating deployment, ensure you possess:
 3. Ensure HTTPS is enforced by checking **Enforce HTTPS**.
 4. Publication Verification Architecture:
    - Deployments use the **least-privilege split-job architecture** (`build-and-commit` and `deploy-to-pages`) targeting the `github-pages` environment within the same trusted workflow run (Option A).
-   - The batch worker generates `data/deployment-manifest.json` containing `{ generationId, generationSequence, generatedAt, catalogDigest, productCount, schemaVersion: "1.7.0", environment: "github-pages" }`.
-   - The worker commits to `main`, captures `catalogCommitSha` via `git rev-parse HEAD`, records the generation in Firestore `/system_deployments/{generationId}`, and queries the official GitHub Pages deployment endpoint `GET /repos/Rohitpvt/GitStore/pages/deployments/{catalogCommitSha}` for status `"built"`.
-   - In case of a worker crash post-push before Firestore update, the startup reconciler recovers the SHA via full-history search on `origin/main` (`git log` and GitHub Commits API loop), proves branch ancestry via `git merge-base --is-ancestor`, and matches the recursive canonical `catalogDigest`.
-   - Missing Pages deployment IDs are deterministically resolved across Cases A, B, C, and D.
-   - Public HTTP checks on `https://rohitpvt.github.io/GitStore/data/deployment-manifest.json` confirm `generationId`, `generationSequence`, and `catalogDigest` before finalizing database status to `published` and advancing durable revisions in `/system_config/catalog_state`.
+   - The batch worker generates `data/deployment-manifest.json` containing `{ generationId, generationSequence, generatedAt, catalogDigest, productCount, schemaVersion: "1.8.0", environment: "github-pages" }`.
+   - The worker commits to `main`, captures `catalogCommitSha` via `git rev-parse HEAD`, records the generation in Firestore `/system_deployments/{generationId}`, and queries the official GitHub Pages deployment endpoint `GET /repos/Rohitpvt/GitStore/pages/deployments/{pages_deployment_id}` (where the parameter accepts a numeric deployment ID or string commit SHA) for status `"succeed"`.
+   - Status interpretation strictly adheres to official GitHub Pages documentation:
+     - `status === 'succeed'`: Deployment succeeded and is live.
+     - `status === 'queued' || status === 'in_progress'`: Deployment is currently building; worker waits and polls with exponential backoff.
+     - `status === 'errored'`: Deployment failed on GitHub Pages infrastructure.
+     - `HTTP 404`: No deployment exists for this SHA/ID (triggers Case B in recovery reconciler).
+     - `HTTP 401 / 403`: Workflow permissions defect. Worker halts immediately.
+     - `HTTP 5xx`: Transient GitHub outage. Worker preserves pending state for next cycle.
+     - Any unrecognized or unexpected status string is rejected and halts execution.
+   - In case of a worker crash post-push before Firestore update, the startup reconciler recovers the SHA via complete pagination of `origin/main` commits following `Link: rel="next"`, proves branch ancestry via `git merge-base --is-ancestor`, and matches the recursive canonical `catalogDigest`.
+   - In Case B (commit exists on remote, but no Pages deployment exists), the reconciler stages `site/`, returns `{ deployNeeded: true, generationId, generationSequence, catalogCommitSha, catalogDigest }`, and sets `deploy_needed=true` in `$GITHUB_OUTPUT`. Job 1 uploads the Pages artifact, and Job 2 runs conditionally to execute the pre-deployment guard and `actions/deploy-pages@v4`.
+   - Public HTTP checks on `https://rohitpvt.github.io/GitStore/data/deployment-manifest.json` confirm `generationId`, `generationSequence`, and `catalogDigest` before finalizing database status to `published` and advancing durable revisions in `/system_config/catalog_state` via an atomic transaction. If `capturedRevision < currentPublishedRevision`, the transaction aborts with `stale_aborted` to prevent rollbacks.
 
 ---
 
@@ -160,7 +168,7 @@ jobs:
     outputs:
       generation_id: ${{ steps.catalog.outputs.generation_id }}
       generation_sequence: ${{ steps.catalog.outputs.generation_sequence }}
-      catalog_commit_sha: ${{ steps.commit.outputs.commit_sha }}
+      catalog_commit_sha: ${{ steps.commit.outputs.commit_sha || steps.catalog.outputs.catalog_commit_sha }}
       catalog_digest: ${{ steps.catalog.outputs.catalog_digest }}
       deploy_needed: ${{ steps.catalog.outputs.deploy_needed }}
     steps:
@@ -237,7 +245,7 @@ jobs:
         with:
           node-version: 24
 
-      - name: Pre-Deployment Generation Ordering Guard (4-Case Matrix)
+      - name: Pre-Deployment Generation Ordering Guard (Shared Decision Function)
         env:
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
           GENERATION_SEQUENCE: ${{ needs.build-and-commit.outputs.generation_sequence }}
@@ -271,6 +279,13 @@ Execute these checks after initial deployment:
 1. **Storefront Availability:** Visit `https://rohitpvt.github.io/GitStore/` and verify that the obsidian dark UI loads without console errors.
 2. **Static Catalog Access:** Confirm that `https://rohitpvt.github.io/GitStore/data/catalog.json` returns HTTP `200 OK`.
 3. **Authentication Verification:** Click **[ CONNECT GITHUB ]** and verify that the GitHub OAuth consent screen opens and returns an authenticated user state.
-4. **Submission Ingestion Test:** Submit a test open-source repository and verify that a document appears in Firestore `/submissions` with `status: 'queued'`.
+4. **Submission Ingestion Test:** Submit a test open-source repository and verify that a document appears in Firestore `/submissions` with `status: 'queued'`. Verify that the client is prevented by security rules from setting any worker-managed fields (`validationResults`, `ownershipProof`, `processingLease`, `adminNotes`, `reviewedBy`, `reviewedAt`, `publishedProductId`).
 5. **Batch Worker Execution:** Manually trigger `GitStore Batch Processor` under the GitHub Actions tab and confirm the submission transitions to `needs_review` or `approved`.
-6. **Step-Up Moderation Execution:** Enqueue an approval from `admin.html` with interactive step-up reauthentication, and verify the worker verifies the token, purges it, confirms collaborator rights on `Rohitpvt/GitStore`, updates Firestore, and deploys static files.
+6. **Step-Up Moderation Execution:** Enqueue an approval from `admin.html` with interactive step-up reauthentication. Verify that:
+   - The client computes `actionHash` (data-integrity checksum) and generates single-use `actionNonce`.
+   - The worker atomically claims the moderation request AND inserts `/consumed_stepup_nonces/{nonceHash}`.
+   - Any replay of the same nonce is rejected immediately with `NONCE_ALREADY_CONSUMED`.
+   - The worker validates `targetDocumentPath` against canonical action mappings.
+   - The worker validates GitHub collaborator rights on `Rohitpvt/GitStore` (`role_name === 'admin' || role_name === 'maintain'`).
+   - The durable catalog revision transaction executes atomically and aborts if `capturedRevision < currentPublishedRevision`.
+   - The static catalog compiles, stages to `site/`, commits, uploads Pages artifact, passes the pre-deploy ordering guard, and deploys via `actions/deploy-pages@v4`.

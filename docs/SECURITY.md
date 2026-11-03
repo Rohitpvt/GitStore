@@ -1,7 +1,7 @@
 # GitStore — Security Architecture & Threat Model
 
-**Document Version:** 1.7.0  
-**Phase:** Phase 0.1.6 — Step-Up Proof Integrity, Firestore Rules & Deployment Reconciliation  
+**Document Version:** 1.8.0  
+**Phase:** Phase 0.1.7 — Replay Protection, Firestore Field Integrity & Deployment State Consistency  
 **Status:** IN_REVIEW — Awaiting Explicit User Approval  
 
 ---
@@ -13,7 +13,7 @@ GitStore operates under a zero-trust model regarding client browsers. Because th
 All authorization gates, role escalations, state transitions, and file verifications are governed either at the database layer (Cloud Firestore Security Rules) or within an authenticated, isolated server environment (GitHub Actions Runners).
 
 > [!IMPORTANT]
-> **Evidence Classification Standard:** To preserve rigorous engineering integrity, security controls are classified strictly by their verified evidence state (`DESIGNED`, `DOCUMENTATION_VERIFIED`, `CONFIGURATION_VERIFIED`, `IMPLEMENTED`, `INTEGRATION_TESTED`, or `PENDING_INTEGRATION_TEST`). Controls are never described as "enforced" at runtime until live deployed verification has occurred.
+> **Evidence Classification Standard:** To preserve rigorous engineering integrity, security controls are classified strictly by their verified evidence state (`DESIGNED`, `DOCUMENTATION_VERIFIED`, `CONFIGURATION_VERIFIED`, `IMPLEMENTED`, `INTEGRATION_TESTED`, or `PENDING_INTEGRATION_TEST`). Controls are never described as "enforced" or "tested" at runtime until live deployed verification has occurred.
 
 ---
 
@@ -25,7 +25,7 @@ All authorization gates, role escalations, state transitions, and file verificat
 | **Read Active Products** | Public read (Firestore) | Public read (Firestore) | Public read (Firestore) | Superuser Read/Write |
 | **Read User Documents (`/users`)** | ❌ Forbidden | ✅ Own document only | ❌ Forbidden (client) | Superuser Read/Write |
 | **Read Public Profiles (`/public_profiles`)** | Public read | Public read | Public read | Superuser Read/Write |
-| **Submit New Application** | ❌ Forbidden | ✅ Create `/submissions` (`status: queued`) | ✅ Create `/submissions` | Ingests from GitHub Issues |
+| **Submit New Application** | ❌ Forbidden | ✅ Create `/submissions` (`status: queued`, payload only) | ✅ Create `/submissions` | Ingests from GitHub Issues |
 | **Edit Existing Submission** | ❌ Forbidden | ✅ Own submissions only (if `queued`/`rejected`) | ❌ Enqueues via `moderation_requests` | Superuser Read/Write |
 | **Submit Claim Request** | ❌ Forbidden | ✅ Create `/claim_requests` (`status: pending`) | ✅ Create `/claim_requests` | Superuser Read/Write |
 | **Execute Ownership Claim** | ❌ Forbidden | ❌ Forbidden | ❌ Forbidden | ✅ Authoritative Admin SDK transaction |
@@ -34,6 +34,7 @@ All authorization gates, role escalations, state transitions, and file verificat
 | **Verify Repository & Asset**| ❌ Forbidden | ❌ Client assertion only | ❌ Client assertion only | ✅ Authoritative GitHub REST API checks |
 | **Approve / Publish Product** | ❌ Forbidden | ❌ Forbidden | ❌ Enqueues with Action-Bound Proof | ✅ Authoritative state transition |
 | **Grant Developer Verification** | ❌ Forbidden | ❌ Forbidden | ❌ Enqueues with Action-Bound Proof | ✅ Sets `isVerifiedDeveloper: true` |
+| **Consume Step-Up Nonce** | ❌ Forbidden | ❌ Forbidden | ❌ Forbidden | ✅ Transactional write to `/consumed_stepup_nonces` |
 | **Write to `admin_logs`** | ❌ Forbidden | ❌ Forbidden | ❌ Forbidden | ✅ Immutable append-only write |
 | **Delist Live Product** | ❌ Forbidden | ❌ Forbidden | ❌ Enqueues with Action-Bound Proof | ✅ Transitions product to `delisted` |
 | **Read Internal Collections** | ❌ Forbidden | ❌ Forbidden | ❌ Forbidden (client) | Superuser Read/Write |
@@ -52,8 +53,8 @@ if (process.env.GITHUB_REPOSITORY !== 'Rohitpvt/GitStore') {
 ```
 Repository environment strings alone are not sufficient protection against untrusted workflow execution. Privileged workflows are strictly isolated to trusted default-branch events, and fork PR code execution is completely prohibited (Section 4).
 
-### 3.2 Action-Bound Step-Up Authentication Proof Integrity (Option A)
-To eliminate vulnerabilities stemming from long-lived browser sessions, session hijacking, credential theft, or unauthorized actions performed via linked passwordless email accounts, GitStore enforces **Mandatory Fresh GitHub Step-Up Reauthentication with Action-Bound Proofs (Option A)** for all privileged operations (`APPROVE_SUBMISSION`, `REJECT_SUBMISSION`, `VERIFY_DEVELOPER`, `REVOKE_DEVELOPER`, `DELIST_PRODUCT`, `FEATURE_PRODUCT`):
+### 3.2 Action-Bound Step-Up Proof, Nonce Ledger & ActionHash Classification (Option A)
+To eliminate vulnerabilities stemming from long-lived browser sessions, session hijacking, credential theft, or unauthorized actions performed via linked passwordless email accounts, GitStore enforces **Mandatory Fresh GitHub Step-Up Reauthentication with Action-Bound Proofs and Nonce Replay Protection (Option A)**:
 
 1. **Interactive Step-Up Challenge:**
    When an administrative action is triggered in `admin.html`, the client initiates an interactive reauthentication popup:
@@ -69,9 +70,9 @@ To eliminate vulnerabilities stemming from long-lived browser sessions, session 
    const tokenResult = await auth.currentUser.getIdTokenResult(true);
    ```
 
-2. **Elimination of Raw Token Storage & Cryptographic Proof Binding:**
+2. **Elimination of Raw Token Storage & ActionHash Classification:**
    **Zero raw OAuth access tokens are written to or stored in Cloud Firestore.**
-   Instead, the client binds the user's freshly authenticated token claims to the specific action and target document:
+   The client constructs an action-bound proof:
    ```javascript
    const actionNonce = crypto.randomUUID().replace(/-/g, '') + crypto.randomUUID().replace(/-/g, '');
    const authTime = tokenResult.claims.auth_time;
@@ -90,9 +91,27 @@ To eliminate vulnerabilities stemming from long-lived browser sessions, session 
      actionHash: actionHash
    };
    ```
+   > [!IMPORTANT]
+   > **Truthful Cryptographic Classification:** The client-generated SHA-256 `actionHash` contains no server secret, private signing key, or HMAC key. It is **not** an independent digital signature or authentication proof. It functions strictly as a **client data-integrity checksum** ensuring that the tuple `(action, targetDocumentPath, actionNonce, authTime)` was not corrupted or modified in transit. The true authorization foundation relies upon the verified Firebase token claims, GitHub identity matching, collaborator permissions on `Rohitpvt/GitStore`, and atomic worker-side nonce consumption.
 
-3. **Security Rules Freshness Gate:**
-   Firestore Security Rules evaluate the `auth_time` claim and verify identity parameters:
+3. **Atomic Nonce Reservation in `/consumed_stepup_nonces`:**
+   To prevent an attacker or malicious script from reusing an unexpired nonce across *different* request documents, the worker consumes nonces in an atomic Firestore transaction:
+   - When leasing a request, the worker computes `nonceHash = SHA256(actionNonce)`.
+   - The worker reads `/consumed_stepup_nonces/{nonceHash}` inside the transaction.
+   - If the nonce document exists, the transaction fails closed: the request is rejected with `NONCE_ALREADY_CONSUMED` and logged to `/admin_logs`.
+   - If it does not exist, the worker writes the document: `{ nonceHash, requestId, requestedByUid, action, targetDocumentPath, workerRunId, consumedAt }` and transitions the request to `status: 'processing'`.
+   - **Recovery Policy:** If worker processing fails post-consumption (e.g. GitHub API 500), the nonce remains permanently burned. The administrator must initiate a fresh interactive reauthentication in the UI, generating a new nonce.
+   - **Client Lockout:** Security Rules enforce `allow read, write: if false;` on `/consumed_stepup_nonces`.
+
+4. **Target Document Path Mapping & Validation:**
+   The worker derives the expected canonical path from an explicit action-to-collection mapping:
+   - `APPROVE_SUBMISSION`, `REJECT_SUBMISSION` -> Must match `submissions/{id}`.
+   - `VERIFY_DEVELOPER`, `REVOKE_DEVELOPER` -> Must match `users/{id}` or `public_profiles/{id}`.
+   - `DELIST_PRODUCT`, `FEATURE_PRODUCT` -> Must match `products/{id}`.
+   The worker asserts `docData.targetDocumentPath === expectedPath`. Any attempt to target internal collections (`system_deployments`, `system_config`, `admin_logs`, `consumed_stepup_nonces`) is rejected immediately.
+
+5. **Security Rules Freshness Gate:**
+   Firestore Security Rules evaluate the `auth_time` claim within the Firebase ID token:
    ```javascript
    function isFreshlyAuthenticated() {
      return request.auth != null 
@@ -129,16 +148,9 @@ To eliminate vulnerabilities stemming from long-lived browser sessions, session 
    }
    ```
 
-4. **Dual Timing Model (Creation Gate vs. Worker Execution):**
+6. **Dual Timing Model (Creation Gate vs. Worker Execution):**
    - **5-Minute Creation Window:** The freshness constraint `request.time - auth_time < 300` is enforced **only at document creation time**. This ensures the administrator authenticated within 5 minutes when placing the command in the queue.
    - **30-Minute Queue Execution Window:** Once accepted, the document cannot be modified by clients. The Actions worker processes requests within a 30-minute queue TTL (`now - doc.createdAt.toMillis() < 30 * 60 * 1000`). If older than 30 minutes, it is marked `expired`.
-
-5. **Authoritative Worker Validation & Anti-Replay Guarantees:**
-   - Worker retrieves `requestedByUid` and queries Firebase Admin SDK `getUser()`.
-   - Worker verifies linked GitHub provider UID matches `docData.githubUserId`.
-   - Worker verifies `docData.stepUpProof.actionHash === sha256(`${action}:${targetDocumentPath}:${actionNonce}:${authTime}`)`.
-   - Worker verifies canonical repository collaborator permissions (`Rohitpvt/GitStore`).
-   - Worker atomically updates request status to `processing` with `workerRunId`. Because clients cannot update or delete documents in `/moderation_requests`, replay attacks are mathematically prevented.
 
 ### 3.3 Root Administrator Bootstrap Verification Flow
 1. Retrieve canonical repository owner's immutable numeric GitHub ID via `GET https://api.github.com/repos/Rohitpvt/GitStore` -> `response.data.owner.id`.
@@ -168,14 +180,13 @@ if (!isAuthorizedAdmin && !isAuthorizedMaintainer) {
 
 | Workflow Trigger Event | Authorization Status | Secrets Access | Allowed Context & Ref Restrictions | Security Controls & Rationale | Evidence Classification |
 |---|---|---|---|---|---|
-| **`schedule`** | **ALLOWED** | Yes (`FIREBASE_SERVICE_ACCOUNT`, `GITHUB_TOKEN`) | Default branch (`refs/heads/main`) only | Runs the scheduled batch worker. Executes strictly on the canonical repository default branch. Completely isolated from external PR code. | `DOCUMENTATION_VERIFIED` (Workflow syntax); live execution is `PENDING_INTEGRATION_TEST` |
+| **`schedule`** | **ALLOWED** | Yes (`FIREBASE_SERVICE_ACCOUNT`, `GITHUB_TOKEN`) | Default branch (`refs/heads/main`) only | Runs scheduled batch worker on canonical repository default branch. Completely isolated from external PR code. | `DOCUMENTATION_VERIFIED` (Workflow syntax); live execution is `PENDING_INTEGRATION_TEST` |
 | **`workflow_dispatch`** | **ALLOWED** | Yes (`FIREBASE_SERVICE_ACCOUNT`, `ADMIN_VERIFY_TOKEN`) | Canonical repo collaborators with `write`/`admin` | Allows on-demand batch runs or manual catalog re-compilation. Gated to verified repository collaborators by GitHub Actions permissions. | `DOCUMENTATION_VERIFIED` (GitHub API permissions); live check is `PENDING_INTEGRATION_TEST` |
-| **`issues: opened, edited`** | **RESTRICTED INGEST** | Scoped / None | Ingestion workflow only | Ingests Issue Form submissions. Runs with minimal permissions (`issues: read`, `contents: read`). Runs parser in strict isolation; never executes user-supplied code or shell commands. | `DESIGNED` |
+| **`issues: opened, edited`** | **RESTRICTED INGEST** | Scoped / None | Ingestion workflow only | Ingests Issue Form submissions. Minimal permissions (`issues: read`, `contents: read`). Runs parser in strict isolation; never executes user-supplied code or shell commands. | `DESIGNED` |
 | **`pull_request`** | **RESTRICTED** | **NO SECRETS** | Pull requests targeting `main` | Read-only static linting and validation of docs/schema. GitHub Actions automatically withholds repository secrets from fork-originated PRs. | `DOCUMENTATION_VERIFIED` (Actions runner security boundary) |
 | **`pull_request_target`** | ❌ **FORBIDDEN** | **NONE (BANNED)** | Not permitted in GitStore repository | **CRITICAL:** `pull_request_target` executes in the context of the base repository with full access to secrets, but can check out and run untrusted code from the fork PR. Strictly prohibited. | `DESIGNED` (Repository policy ban) |
 | **`workflow_run`** | ❌ **FORBIDDEN** | **NONE (BANNED)** | Not permitted for untrusted triggers | Avoids untrusted artifact injection and cross-workflow privilege escalation. | `DESIGNED` |
-| **`repository_dispatch`** | ❌ **RESTRICTED** | Restricted | Not used in MVP | Not needed under single-workflow Option A architecture. | `DESIGNED` |
-| **`push`** | **RESTRICTED** | No Privileged Pipeline | Protected `main` branch only | Pushes to `main` are restricted by branch protection rules (require review/checks). Ordinary pushes do NOT trigger the privileged publisher to avoid push-suppression conflicts and deployment thrashing. | `DOCUMENTATION_VERIFIED` (Token push suppression behavior) |
+| **`push`** | **RESTRICTED** | No Privileged Pipeline | Protected `main` branch only | Pushes to `main` are restricted by branch protection rules. Ordinary pushes do NOT trigger the privileged publisher to avoid push-suppression conflicts. | `DOCUMENTATION_VERIFIED` (Token push suppression behavior) |
 
 ---
 
@@ -230,10 +241,10 @@ To enforce least privilege, the GitHub Pages workflow is split into two sequenti
 2. **`deploy-to-pages`:** Granted `pages: write`, `id-token: write`, `contents: read`, `metadata: read`. Runs pre-deployment 4-case ordering guard, packages the `site/` staging directory, dispatches deployment to `environment: github-pages`, verifies public manifest, and finalizes Firestore. Has **zero** repository write permissions.
 
 ### 7.2 Action Versioning & Pinning
-- Repository Checkout: `actions/checkout@v4` (Pinned commit SHA: `11bd71901bbe5b1630ceea73d27597364c9af683`).
-- Runtime Setup: `actions/setup-node@v4` (Node 24 LTS runtime).
-- Pages Artifact Packaging: `actions/upload-pages-artifact@v3` (Pinned commit SHA: `56afc609e74202658d3ffba0e8f6dda462b719fa`).
-- Pages Deployment Dispatch: `actions/deploy-pages@v4` (Pinned commit SHA: `d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e`).
+- Repository Checkout: `actions/checkout@v4` (Pinned commit SHA: `11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2`).
+- Runtime Setup: `actions/setup-node@v4` (Pinned commit SHA: `39370e3970a6d050c480ffad4ff0ed4d3fdee5a1 # v4.1.0`).
+- Pages Artifact Packaging: `actions/upload-pages-artifact@v3` (Pinned commit SHA: `56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1`).
+- Pages Deployment Dispatch: `actions/deploy-pages@v4` (Pinned commit SHA: `d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5`).
 
 ---
 
@@ -244,27 +255,26 @@ GitStore operates under an absolute non-execution invariant:
 
 ---
 
-## 9. Comprehensive 18-Row Verification Matrix
+## 9. Comprehensive 17-Row Verification Matrix
 
-In accordance with Phase 0.1.6 audit requirements, all 18 critical security, recovery, and architecture controls are classified across the 5 standard verification columns:
+In accordance with Phase 0.1.7 audit requirements, all 17 critical architecture, security, and deployment controls are classified with truthful design, evidence, and runtime statuses across 5 standard columns:
 
-| Control Name | Category | Classification | Phase Verified | Evidence Reference / Artifact |
+| Area | Design status | Evidence | Runtime status | Remaining work |
 |---|---|---|---|---|
-| **Administrator Canonical Repository Check** | Access Control | `DOCUMENTATION_VERIFIED` | Phase 0.1.6 | `docs/ARCHITECTURE.md` Section 3.1 & GitHub API Collaborators Endpoint |
-| **Root Administrator Bootstrap Comparison** | Identity & Auth | `DOCUMENTATION_VERIFIED` | Phase 0.1.6 | `docs/ARCHITECTURE.md` Section 3.3 (`owner.id` numeric comparison) |
-| **Mandatory Fresh GitHub Step-Up Reauthentication** | Step-Up Auth | `DOCUMENTATION_VERIFIED` | Phase 0.1.6 | Firebase Auth `reauthenticateWithPopup` & `auth_time < 300s` Rules Gate |
-| **Action-Bound Proof Integrity without Raw Tokens** | Cryptographic Proof | `DOCUMENTATION_VERIFIED` | Phase 0.1.6 | `docs/DATABASE_SCHEMA.md` Section 2.5 (`stepUpProof` SHA-256 action hash) |
-| **Numeric ID Normalization (`normalizeGithubId`)** | Input Sanitization | `DOCUMENTATION_VERIFIED` | Phase 0.1.6 | `docs/AUTHENTICATION.md` Section 2.1 (ECMAScript `/^\d+$/` validation) |
-| **Private User Document Read/Update Lockout** | Data Privacy | `DOCUMENTATION_VERIFIED` | Phase 0.1.6 | `docs/DATABASE_SCHEMA.md` Section 4 (`users/{userId}` `diff().affectedKeys()`) |
-| **Public Profile Projection & Worker-Only Badges** | Data Privacy & Integrity | `DOCUMENTATION_VERIFIED` | Phase 0.1.6 | `docs/DATABASE_SCHEMA.md` Section 4 (`public_profiles` badge protection) |
-| **Exhaustive Submission & Claim Request Schema** | Schema Hardening | `DOCUMENTATION_VERIFIED` | Phase 0.1.6 | `docs/DATABASE_SCHEMA.md` Section 4 (`keys().hasOnly()` whitelisting) |
-| **Moderation Request Immutability & Client Lockout** | Access Control | `DOCUMENTATION_VERIFIED` | Phase 0.1.6 | `docs/DATABASE_SCHEMA.md` Section 4 (`allow update, delete: if false;`) |
-| **Abuse Report Authentication & Rate Guard** | Spam Protection | `DOCUMENTATION_VERIFIED` | Phase 0.1.6 | `docs/DATABASE_SCHEMA.md` Section 4 (`reports` authenticated, 2000-char limit) |
-| **Internal Collections Client Default-Deny** | Authorization | `DOCUMENTATION_VERIFIED` | Phase 0.1.6 | `docs/DATABASE_SCHEMA.md` Section 4 (`system_deployments`, `admin_logs` deny) |
-| **Actions Trigger Event Allowlist & Fork Ban** | Workflow Security | `DOCUMENTATION_VERIFIED` | Phase 0.1.6 | `docs/SECURITY.md` Section 4 (Ban on `pull_request_target` & fork secrets) |
-| **Split-Job Pages Permissions & OIDC Isolation** | Least Privilege | `DOCUMENTATION_VERIFIED` | Phase 0.1.6 | `docs/DEPLOYMENT_GUIDE.md` Section 6 (`contents: write` vs `pages: write`) |
-| **Isolated `site/` Staging Packaging** | Data Leakage Prevention | `DOCUMENTATION_VERIFIED` | Phase 0.1.6 | `docs/ARCHITECTURE.md` Section 3.6 (`upload-pages-artifact` packaging `site/`) |
-| **Full-History Git Discovery & Ancestry Proof** | Deployment Integrity | `DOCUMENTATION_VERIFIED` | Phase 0.1.6 | `docs/DATABASE_SCHEMA.md` Section 3 (`merge-base --is-ancestor` assertion) |
-| **Recursive Canonical Catalog Digest (`sha256:v1`)** | Catalog Integrity | `DOCUMENTATION_VERIFIED` | Phase 0.1.6 | `docs/DATABASE_SCHEMA.md` Section 3.1 (`canonicalizeJson` & null framing) |
-| **Pre-Deploy 4-Case Monotonic Sequence Guard** | Deployment Concurrency | `DOCUMENTATION_VERIFIED` | Phase 0.1.6 | `docs/ARCHITECTURE.md` Section 3.6 (Pre-deploy 4-case matrix evaluation) |
-| **Durable Catalog Revision Transactions** | State Consistency | `DOCUMENTATION_VERIFIED` | Phase 0.1.6 | `docs/DATABASE_SCHEMA.md` Section 3.2 (`catalog_state` transactional update) |
+| **Pages API success status** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Official Pages deployment endpoint status `succeed`) | `PENDING_INTEGRATION_TEST` | Validate live response parsing on canonical repository in Phase 4. |
+| **Pages deployment reference schema** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Schema supports numeric deployment ID or string commit SHA) | `PENDING_INTEGRATION_TEST` | Verify schema storage in `/system_deployments` in Phase 4. |
+| **Case B recovery handoff** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Reconciler returns `deployNeeded=true` on 404 Pages response) | `PENDING_INTEGRATION_TEST` | Simulate missing Pages deployment and test artifact packaging in Phase 4. |
+| **Artifact upload and deployment** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (`upload-pages-artifact@v3` and `deploy-pages@v4` workflow handoff) | `PENDING_INTEGRATION_TEST` | Test cross-job output consumption in GitHub Actions runner in Phase 4. |
+| **Submission field restrictions** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Worker-managed fields excluded from client create allowlist) | `PENDING_INTEGRATION_TEST` | Run automated security rules test suite on Firebase Emulator in Phase 2. |
+| **Nested product-data restrictions** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Strict nested map `keys().hasOnly()` and string size limits) | `PENDING_INTEGRATION_TEST` | Test denial of oversized payloads and invalid nested keys in Phase 2. |
+| **Action nonce uniqueness** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (64-character random hex / UUIDv4 client generation) | `PENDING_INTEGRATION_TEST` | Verify uniqueness across client sessions in Phase 5. |
+| **Nonce consumption transaction** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Atomic reservation in `/consumed_stepup_nonces/{nonceHash}`) | `PENDING_INTEGRATION_TEST` | Simulate concurrent nonce reuse across different requests in Phase 5. |
+| **Target document mapping** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Worker derives canonical path from action-to-collection mapping) | `PENDING_INTEGRATION_TEST` | Test rejection of path mismatches and internal collection targets in Phase 5. |
+| **Mixed-provider reauthentication** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (`reauthenticateWithPopup` updates `auth_time` and claims) | `PENDING_INTEGRATION_TEST` | Execute full 9-step mixed-provider test in Firebase Emulator in Phase 2. |
+| **Step-up freshness** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Security Rules gate `auth_time < 300s` at creation time) | `PENDING_INTEGRATION_TEST` | Test rejection of requests with `auth_time >= 300s` in Phase 2. |
+| **Catalog revision transaction** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Explicit `capturedRevision` read and monotonic advance inside transaction) | `PENDING_INTEGRATION_TEST` | Simulate simultaneous approvals and test `isDirty` calculation in Phase 4. |
+| **Stale-generation finalization** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Transaction aborts on `capturedRev < currentPublishedRev`, marking `stale_aborted`) | `PENDING_INTEGRATION_TEST` | Test stale generation abort and work preservation in Phase 4. |
+| **Four-case ordering** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Shared `evaluateGenerationOrdering` function applied in guard and DB) | `PENDING_INTEGRATION_TEST` | Test all 4 cases in pre-deploy guard in Phase 4. |
+| **Complete commit pagination** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Traverses `Link: rel="next"` without arbitrary 5-page depth limits) | `PENDING_INTEGRATION_TEST` | Test pagination traversal beyond 500 commits in Phase 4. |
+| **Recovery error classification** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Distinguishes empty search from incomplete search -> `pending_retry`) | `PENDING_INTEGRATION_TEST` | Test transient network errors during recovery in Phase 4. |
+| **Documentation consistency** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Reconciled `succeed` status, `v4` actions, schemas across all 14 files) | `DOCUMENTATION_VERIFIED` | Full Git diff audit and working tree verification in Phase 0.1.7. |

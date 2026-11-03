@@ -1,7 +1,7 @@
 # GitStore — Cost Analysis & Operational Limits Specification
 
-**Document Version:** 1.7.0  
-**Phase:** Phase 0.1.6 — Step-Up Proof Integrity, Firestore Rules & Deployment Reconciliation  
+**Document Version:** 1.8.0  
+**Phase:** Phase 0.1.7 — Replay Protection, Firestore Field Integrity & Deployment State Consistency  
 **Status:** IN_REVIEW — Awaiting Explicit User Approval  
 **Budget Objective:** Target $0.00 / Month under Strict Free Quotas (Architectural Estimates; Spark Plan without Linked Billing)
 
@@ -43,6 +43,11 @@ Firebase’s **Spark Plan** is a strict no-cost tier with no credit card require
 | **Stored Firestore Data** | **1 GiB total storage** | ~5 MB for 2,000 products | Further writes fail with storage quota errors. |
 | **Firebase Authentication** | **50,000 MAUs / month** | ~500 – 2,000 active developers | Further user creations/logins fail until monthly reset. |
 | **Firebase App Check (reCAPTCHA Enterprise)** | **10,000 assessments / month**| ~200 – 1,000 assessments / month | Returns HTTP 429; token acquisition fails; Firestore requests rejected. |
+
+### Storage Overhead for Step-Up Replay Prevention:
+- Each administrative moderation action records one document in `/consumed_stepup_nonces/{nonceHash}` (~200 bytes).
+- At projected administrative volumes (~10–50 moderation actions per week), annual consumption is < 1 MB and < 2,600 writes/year, representing < 0.05% of Spark Plan storage and daily write quotas.
+- Worker-managed fields on submissions (`validationResults`, `processingLease`, etc.) are written directly by the trusted batch worker via Firebase Admin SDK, bypassing security rules and incurring zero client-side rule evaluation cost.
 
 ---
 
