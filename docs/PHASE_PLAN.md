@@ -1,8 +1,8 @@
 # GitStore — Master Phase Plan & Development Control System
 
-**Document Version:** 1.5.0  
+**Document Version:** 1.6.0  
 **Last Updated:** 2026-11-03  
-**Current Project State:** Phase 0.1.5 (Final Security Rules, Administrator Step-Up Authentication & Deployment Recovery Audit) — `IN_REVIEW` ⏳ | Awaiting User `APPROVED` Gate for Phase 1  
+**Current Project State:** Phase 0.1.6 (Step-Up Proof Integrity, Firestore Rules & Deployment Reconciliation) — `IN_REVIEW` ⏳ | Awaiting User `APPROVED` Gate for Phase 1  
 **Project Lead:** Technical Project Manager, Software Architect, & QA Lead  
 **Governing Standard:** Strict Dual-Platform Confinement (**GitHub** & **Firebase** ONLY)
 
@@ -31,7 +31,8 @@ To ensure strict quality control and eliminate premature execution:
 | **Phase 0** | Architecture and Documentation | `APPROVED` ✅ | 100% (Baseline docs created) | User Approved |
 | **Phase 0.1** | Architecture Hardening & Final Validation | `IN_REVIEW` ⏳ | 100% (Audited & Hardened) | User Review Pending |
 | **Phase 0.1.4**| Evidence Alignment, Deployment Recovery & Governance Consistency | `COMPLETED` ✅ | 100% (All 8 core objectives closed) | Reconciled Baseline |
-| **Phase 0.1.5**| Final Security Rules, Administrator Step-Up Authentication & Deployment Recovery Audit | `IN_REVIEW` ⏳ | 100% (All 9 core objectives closed) | User Review Pending |
+| **Phase 0.1.5**| Final Security Rules, Administrator Step-Up Authentication & Deployment Recovery Audit | `COMPLETED` ✅ | 100% (All 9 core objectives closed) | Hardened Baseline |
+| **Phase 0.1.6**| Step-Up Proof Integrity, Firestore Rules & Deployment Reconciliation | `IN_REVIEW` ⏳ | 100% (All 8 core objectives closed) | User Review Pending |
 | **Phase 1** | Frontend Core Foundation (Mock Storefront) | `NOT_STARTED` 🛑 | 0 / 5 Subphases | Requires Phase 0.1 Approval |
 | **Phase 2** | Firebase Foundation and Authentication | `NOT_STARTED` 🛑 | 0 / 4 Subphases | Requires Phase 1 Approval |
 | **Phase 3** | Developer Dashboard and Submission System | `NOT_STARTED` 🛑 | 0 / 4 Subphases | Requires Phase 2 Approval |
@@ -61,25 +62,40 @@ To ensure strict quality control and eliminate premature execution:
 ---
 
 ### Phase 0.1.4: Evidence Alignment, Deployment Recovery & Governance Consistency
-- **Status:** `COMPLETED` ✅ (Superseded and Hardened by Phase 0.1.5)
+- **Status:** `COMPLETED` ✅ (Superseded and Hardened by Phase 0.1.5 & Phase 0.1.6)
 - **Objective:** Reconcile design claims with verified evidence, design deterministic deployment failure recovery, strengthen generation ordering, and synchronize governance documentation.
 
 ---
 
 ### Phase 0.1.5: Final Security Rules, Administrator Step-Up Authentication & Deployment Recovery Audit
-- **Status:** `IN_REVIEW` ⏳ (All 9 Core Objectives Closed; Awaiting User Gate)
-- **Objective:** Execute exhaustive audit and hardening of Firestore Security Rules, administrator authentication, deployment recovery, concurrency, split-job workflows, pricing terms, and architecture decision records:
-  1. *Firestore Data Privacy & Rules Lockout:* Fully locked down `/users/{userId}` against public reads and client manipulation of privileged fields (`isAdmin`, `isVerifiedDeveloper`, `reputationScore`, etc.). Designed and specified separate public projection `/public_profiles/{userId}` with strict field whitelisting. Enforced default-deny on internal collections (`/system_deployments`, `/system_config/deployment_state`, `/system_config/catalog_state`, `/admin_logs`).
-  2. *Mandatory Fresh GitHub Step-Up Reauthentication (Option A):* Specified step-up authentication for all privileged actions (`APPROVE_SUBMISSION`, `REJECT_SUBMISSION`, `DELIST_PRODUCT`, `VERIFY_DEVELOPER`, etc.). Interactive `reauthenticateWithPopup(auth.currentUser, new GithubAuthProvider())` updates `auth_time` (enforced `< 300s` in Security Rules) and attaches ephemeral, single-use, action-bound step-up proof to `/moderation_requests`. The batch worker validates the token via GitHub REST API `GET /user`, verifies canonical repo permissions (`Rohitpvt/GitStore`), and **immediately purges** `ephemeralGithubToken` (`FieldValue.delete()`), recording `consumedAt` and worker run ID.
-  3. *12-State Deployment Recovery State Machine:* Formalized 12 deployment states. Replaced 10-commit limit with unshallow full-history search (`git log origin/main`) and paginated GitHub Commits API fallback. Enforced branch ancestry cryptographic verification (`git merge-base --is-ancestor`). Implemented deterministic SHA-256 `catalogDigest` (sorted catalog files, stable JSON, excluding manifest). Resolved missing Pages deployment IDs across Cases A, B, C, and D.
-  4. *Generation Ordering & Concurrency Boundaries:* Enforced 4-case monotonic sequence matrix. Bound Pages deployments to repository concurrency group `github-pages` (`cancel-in-progress: false`).
-  5. *Durable Catalog Revisions (`catalog_state`):* Established `/system_config/catalog_state` tracking monotonic integer counters `latestRequestedRevision` and `latestPublishedRevision`. Guarantees work preservation for submissions arriving during active compilation or deployment.
-  6. *Least-Privilege Split-Job Pages Workflow:* Split `.github/workflows/batch-processor.yml` into `build-and-commit` (`contents: write`, `metadata: read`) and `deploy-to-pages` (`pages: write`, `id-token: write`, `contents: read`, `metadata: read` targeting `environment: github-pages`). Staging public files strictly into `site/` (excluding `.git`, `.github`, `docs/`, `scripts/`, internal tests). Updated action versions to verified official releases: `actions/checkout@v7`, `actions/setup-node@v7`, `actions/upload-pages-artifact@v5`, `actions/deploy-pages@v5`.
-  7. *Pricing & Policy Clarification:* Audited all documentation to remove unconditional "$0.00/month" claims; clarified that GitStore targets operation within published free limits under the Firebase Spark Plan without an attached billing account. Retained GitHub Pages non-commercial clarification as mandatory Phase 4 launch gate.
-  8. *ADR Updates:* Refined ADR-05, ADR-07, ADR-10, ADR-11, ADR-12, ADR-13; added ADR-14 (Profile Separation), ADR-15 (Step-Up Reauth), ADR-16 (12-State Recovery & Digest), ADR-17 (Durable Revisions), ADR-18 (Split-Job Permissions & Site Staging) in `docs/ARCHITECTURE.md` Section 4.
-  9. *Comprehensive 20-Row Verification Matrix:* Delivered complete 20-row verification matrix with 6 columns and truthful evidence/test statuses (`DESIGNED`, `DOCUMENTATION_VERIFIED`, `PENDING_INTEGRATION_TEST`).
+- **Status:** `COMPLETED` ✅ (Superseded and Hardened by Phase 0.1.6)
+- **Objective:** Execute exhaustive audit and hardening of Firestore Security Rules, administrator authentication, deployment recovery, concurrency, split-job workflows, pricing terms, and architecture decision records.
+
+---
+
+### Phase 0.1.6: Step-Up Proof Integrity, Firestore Rules & Deployment Reconciliation
+- **Status:** `IN_REVIEW` ⏳ (All 8 Core Objectives Closed; Awaiting User Gate)
+- **Objective:** Resolve remaining architectural weaknesses in step-up authentication proof integrity, exhaustive Firestore schema restrictions, deployment reconciliation query and execution paths, catalog digest generation, durable revision tracking, and pre-deployment ordering guards:
+  1. *Action-Bound Step-Up Authentication Proof Integrity (Option A):* Completely eliminated raw `ephemeralGithubToken` storage in Firestore. Designed and specified action-bound proof structure `{ providerId: 'github.com', authTime, actionNonce, targetDocumentPath, actionHash }` where `actionHash = SHA256(action:target:nonce:authTime)`. Binding verified caller UID, immutable numeric GitHub ID (`identities['github.com'][0]`), `auth_time`, action, target document, and action nonce. Clarified the 5-minute creation gate in Security Rules (`auth_time < 300s`) versus the 30-minute queue execution TTL in the Actions worker.
+  2. *Exhaustive Firestore Security Rules Schema Enforcement:*
+     - `/users/{userId}`: create check, update protected via `diff().affectedKeys().hasOnly(['displayName', 'avatarUrl', 'bio', 'settings', 'updatedAt'])`, blocking modification of `uid`, `email`, `createdAt`, `isAdmin`, `isVerifiedDeveloper`, `reputationScore`, `githubNumericId`.
+     - `/public_profiles/{userId}`: create check, update protected via `diff().affectedKeys().hasOnly(['displayName', 'avatarUrl', 'bio', 'updatedAt'])`, protecting worker-managed badges `isVerifiedDeveloper` and `publishedProductIds`.
+     - `/submissions/{submissionId}`: exhaustive create whitelist, update protected via `diff().affectedKeys().hasOnly(['productData', 'status', 'updatedAt'])`, owner and status locked.
+     - `/moderation_requests/{requestId}`: top-level and nested `stepUpProof` whitelist via `keys().hasOnly(...)`, complete client immutability (`allow update, delete: if false;`).
+     - `/reports/{reportId}`: authenticated creation only (`request.auth != null`), strict schema whitelist, 2000-character details limit, client default-deny on read/update/delete.
+     - Internal collections default-deny (`/system_deployments`, `/system_config/deployment_state`, `/system_config/catalog_state`, `/admin_logs`).
+  3. *Permanent Deployment Reconciliation Fixes:*
+     - *Query Bug Fix:* Expanded discovery query to include all non-terminal reconciliation states: `where('reconciliationStatus', 'in', ['none', 'sha_recovered', 'pages_dispatched', 'pending_retry'])`.
+     - *Case B Recovery Implementation:* Replaced dummy `continue` with real executable recovery path: restores tree at `gen.catalogCommitSha`, validates digest against `gen.catalogDigest`, reconstructs `site/`, triggers artifact packaging and sets `deploy_needed = true`, updates `reconciliationStatus = 'pages_dispatched'`.
+     - *Pages API Usage:* Removed undocumented list endpoint. Specified official endpoint `GET /repos/{owner}/{repo}/pages/deployments/{catalogCommitSha}` with documented error handling (200 built, 200 in_progress/queued, 200 errored, 404 Case B trigger, 401/403 permissions abort, 5xx retry).
+     - *Full-History Discovery & Commits API Pagination:* Unshallow fetch, branch ancestry verification (`git merge-base --is-ancestor`), and a true pagination loop for GitHub Commits API fallback (`Link: rel="next"`).
+  4. *Deterministic Recursive Canonical Catalog Digest:* Implemented `canonicalizeJson` with recursive Unicode key sorting, array order preservation, stable primitive formatting (rejecting `NaN`/`Infinity`), and length-prefixed null-byte framed boundaries (`FILE\0${relPath}\0${byteLength}\0`). Prefix `sha256:v1:...`. Provided test vectors for all 6 core properties.
+  5. *Durable Catalog Revision Transactions:* Managed `/system_config/catalog_state` inside atomic `db.runTransaction`, reading current revisions inside transaction, enforcing monotonic advance, computing transactional `isDirty = (currentRequested > capturedRevision)`, and re-evaluating the 9 concurrency race conditions.
+  6. *Pre-Deployment Generation Ordering Guard:* Enforced 4-case matrix evaluation immediately prior to `actions/deploy-pages@v4` in `deploy-to-pages` job.
+  7. *Workflow & Cross-Job Handoff:* Explicitly declared cross-job outputs in `build-and-commit` consumed by `deploy-to-pages`. Recommended full 40-character commit SHA action pinning.
+  8. *Governance & Documentation Synchronization:* Updated document headers across all 14 files to `IN_REVIEW — Awaiting Explicit User Approval`. Updated ADRs 14–18. Delivered exact 18-row verification matrix across 5 columns in `docs/SECURITY.md`.
 - **Files Modified:** All 14 architecture, schema, security, and governance files across `docs/` and root repository.
-- **Definition of Done (DoD):** All 9 problem areas formally closed, ADR-14 through ADR-18 added, documentation synchronized, zero application code written, working tree verified clean.
+- **Definition of Done (DoD):** All 8 problem areas formally closed, ADR-14 through ADR-18 refined, documentation synchronized, zero application code written, working tree verified clean.
 
 ---
 
@@ -156,4 +172,9 @@ To ensure strict quality control and eliminate premature execution:
 | 2026-11-03 | 0.1.5 | Mandatory Fresh GitHub Step-Up Reauthentication | Enforced interactive `reauthenticateWithPopup`, `auth_time < 300s`, ephemeral token verification and immediate destruction. | Approved (ADR-15) |
 | 2026-11-03 | 0.1.5 | 12-State Recovery State Machine & Deterministic Digest | Replaced 10-commit limit with full-history search, branch ancestry check, `catalogDigest` SHA-256, Cases A-D recovery. | Approved (ADR-16) |
 | 2026-11-03 | 0.1.5 | Durable Catalog Revisions (`catalog_state`) | Monotonic revision tracking guaranteeing work preservation for submissions arriving during deployment. | Approved (ADR-17) |
-| 2026-11-03 | 0.1.5 | Split-Job Workflow & Isolated `site/` Staging | Split `build-and-commit` and `deploy-to-pages` jobs; isolated public assets into `site/`; updated to `@v7` and `@v5` actions. | Approved (ADR-18) |
+| 2026-11-03 | 0.1.5 | Split-Job Workflow & Isolated `site/` Staging | Split `build-and-commit` and `deploy-to-pages` jobs; isolated public assets into `site/`. | Approved (ADR-18) |
+| 2026-11-03 | 0.1.6 | Action-Bound Step-Up Proof Integrity (Zero Tokens) | Eliminated raw OAuth token storage in Firestore; cryptographically bound action proof `{ providerId, authTime, actionNonce, targetDocumentPath, actionHash }`; clarified 5-min creation gate vs 30-min queue TTL. | In Review (ADR-15) |
+| 2026-11-03 | 0.1.6 | Exhaustive Security Rules Schema Whitelisting | Enforced `diff().affectedKeys().hasOnly()` on `/users` and `/public_profiles`; whitelisted `/submissions` and `/moderation_requests`; secured `/reports` with authenticated-only creation and 2000-char bounds. | In Review (ADR-14) |
+| 2026-11-03 | 0.1.6 | Permanent Reconciliation Query & Case B Recovery | Fixed query to include all non-terminal reconciliation states; implemented real Case B recovery path; used official endpoint `GET .../pages/deployments/{catalogCommitSha}`; added Commits API pagination loop. | In Review (ADR-16) |
+| 2026-11-03 | 0.1.6 | Recursive Canonical Catalog Digest & Vectors | Implemented recursive canonical JSON serializer (`canonicalizeJson`), null-byte length-prefixed framing, and defined test vectors for 6 core properties. | In Review (ADR-16) |
+| 2026-11-03 | 0.1.6 | Durable Revision Transactions & Pre-Deploy Guard | Read and advance catalog revisions inside atomic `db.runTransaction`; implemented pre-deployment 4-case generation ordering guard before `deploy-pages`. | In Review (ADR-17, 18) |

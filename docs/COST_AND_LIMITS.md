@@ -1,8 +1,8 @@
 # GitStore — Cost Analysis & Operational Limits Specification
 
-**Document Version:** 1.6.0  
-**Phase:** Phase 0.1.5 — Final Security Rules, Administrator Step-Up Authentication & Deployment Recovery Audit  
-**Status:** Approved Operational Cost Baseline (Hardened & Reconciled)  
+**Document Version:** 1.7.0  
+**Phase:** Phase 0.1.6 — Step-Up Proof Integrity, Firestore Rules & Deployment Reconciliation  
+**Status:** IN_REVIEW — Awaiting Explicit User Approval  
 **Budget Objective:** Target $0.00 / Month under Strict Free Quotas (Architectural Estimates; Spark Plan without Linked Billing)
 
 ---
@@ -48,47 +48,6 @@ Firebase’s **Spark Plan** is a strict no-cost tier with no credit card require
 
 ## 4. Why Storefront Visitors Do Not Exhaust Firestore Quotas
 
-### The Static Cache Leverage
-If 100,000 visitors per month queried Cloud Firestore directly for products, catalog browsing would consume millions of document reads, instantly triggering `RESOURCE_EXHAUSTED` within hours and breaking the site.
-
-**GitStore isolates visitor traffic entirely from Firestore:**
-- **Storefront Browsing:** Visitors download pre-compiled `data/catalog.json` and `data/products/*.json` served directly by GitHub Pages. **Firestore read consumption: Exactly 0 reads.**
-- **Batch Worker Operations:** The worker runs every 10 minutes (144 times/day). Querying 3 queued submissions and checking moderation requests consumes:
-  $$\text{Worker Daily Reads} = 144 \text{ runs} \times (3 \text{ submissions} + 1 \text{ config} + 2 \text{ moderation}) \approx 864 \text{ reads/day}$$
-- **Developer Submissions:** 50 new submissions a day generate ~150 writes and ~300 reads.
-- **Total Estimated Utilization:** ~1,200 reads/day out of **50,000 available** (~2.4% capacity).
-
----
-
-## 5. Failure Recovery & Contingency Triggers
-
-### 5.1 What Happens if Spark Quota is Exceeded? & The Billing Condition
-> [!IMPORTANT]
-> **The Exact "Zero Surprise Bills" Condition:** The guarantee of zero surprise charges holds **strictly and only when NO Google Cloud / Firebase billing account (Blaze plan) is linked to the project.**
-- Under the Spark Plan with **no billing account attached**, the platform enforces hard stops. If a Denial of Service attack or viral submission wave exhausts the 50,000 daily read limit, Cloud Firestore halts with `RESOURCE_EXHAUSTED` (HTTP 429). Zero financial debt or unexpected invoices can be created.
-- If a billing account is attached, usage exceeding free quotas is automatically billed to the linked credit card. GitStore requires the project to remain strictly unlinked from any billing account to preserve zero financial liability.
-- **Storefront Remains Online:** Visitors continue browsing, searching, and downloading software because `data/catalog.json` is served directly by GitHub Pages, completely independent of Firebase.
-- **Submissions Gracefully Pause:** Developers attempting to submit receive a clean error: *"GitStore submission processing is temporarily paused due to daily capacity limits. Please try again after 00:00 PST."*
-- **Batch Worker Pauses:** The Actions worker detects `RESOURCE_EXHAUSTED`, logs a warning, and exits cleanly without failing GitHub Actions.
-
-### 5.2 App Check Assessment Quota Mitigation (reCAPTCHA Enterprise)
-- **Organization-Level Free Tier:** Google Cloud provides **10,000 free assessments per month** for reCAPTCHA Enterprise under Fraud Defense. This quota is enforced at the **Google Cloud Organization / Billing Account level** (shared across all projects in that organization).
-- **Token Caching & Request Decoupling:** An assessment occurs **only** when an App Check token is created or refreshed (`isTokenAutoRefreshEnabled: true`, 1-hour TTL), not on every individual Firestore read/write. Document queries attach the cached token in the `X-Firebase-AppCheck` header without making extra reCAPTCHA assessment calls.
-- **Lazy-Loading Enforcement:** App Check is **never** loaded on public browsing pages (`index.html`, `explore.html`, `product.html`). It is initialized **only** when an authenticated developer accesses `submit.html`, `dashboard.html`, or `admin.html`.
-- **Architectural Usage Projections (Unmeasured Engineering Estimates):**
-  - Assumes 10–50 submission and claim operations per month.
-  - Assumes 5–10 active developer visits per day (150–300 sessions/month).
-  - Assumes average session duration of 30 minutes with token caching (1 assessment per session).
-  - Projected Monthly Assessments: $\approx 200 - 1,000$ assessments/month (2% to 10% of the 10,000 free monthly quota).
-  - *These figures are engineering estimates based on initial activity assumptions, not measured production telemetry.*
-- **Quota Exceeded Behavior:** If assessments exceed 10,000 in a month on the Spark plan without a billing account, reCAPTCHA Enterprise returns HTTP 429 (`RESOURCE_EXHAUSTED`). Token acquisition fails, causing backend App Check enforcement to reject subsequent Firestore writes until the monthly billing cycle resets.
-
----
-
-## 6. Strictly Prohibited Cost Triggers
-
-To prevent inadvertent tier upgrades or surprise bills:
-- ❌ **No Cloud Functions for Firebase:** Cloud Functions requires transitioning the Firebase project to the paid Blaze Plan.
-- ❌ **No Direct Binary Uploads to Firebase Storage:** Desktop binaries (`.exe`, `.dmg`, `.apk`) remain exclusively on GitHub Releases.
-- ❌ **No SMS Authentication:** Phone number verification incurs per-SMS telecom costs and is strictly excluded.
-- ❌ **No Paid reCAPTCHA Enterprise Assessments:** Operates strictly within Google Cloud's 10,000 free monthly assessments without linked billing to eliminate financial liability.
+1. **Pre-Compiled Static JSON Catalogs:** Storefront visits never trigger Firestore document reads. All application discovery, search indexing, and category filtering consume static files (`data/catalog.json`) served by GitHub Pages CDN.
+2. **Decoupled Binary Downloads:** Download buttons link directly to verified assets on `github.com/<owner>/<repo>/releases/download/...`. GitStore serves 0 binary bytes.
+3. **Lazy-Loaded App Check:** Public visitors never initialize reCAPTCHA Enterprise. Assessments are consumed solely when developers or administrators log in or submit forms.

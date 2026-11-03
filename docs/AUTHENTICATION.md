@@ -1,8 +1,8 @@
 # GitStore — Authentication Architecture & Identity Specification
 
-**Document Version:** 1.6.0  
-**Phase:** Phase 0.1.5 — Final Security Rules, Administrator Step-Up Authentication & Deployment Recovery Audit  
-**Status:** Approved Authentication Specification (Hardened & Reconciled)  
+**Document Version:** 1.7.0  
+**Phase:** Phase 0.1.6 — Step-Up Proof Integrity, Firestore Rules & Deployment Reconciliation  
+**Status:** IN_REVIEW — Awaiting Explicit User Approval  
 **Provider:** Firebase Authentication (v10 Modular SDK)  
 **Host Environment:** GitHub Pages (`https://<org>.github.io/<repo>/`)
 
@@ -147,22 +147,17 @@ In GitHub (`Settings -> Developer settings -> OAuth Apps -> GitStore`):
 ### 5.1 Provider Selection: reCAPTCHA Enterprise
 - **Recommended Provider:** **reCAPTCHA Enterprise** (`ReCaptchaEnterpriseProvider`).
 - **Organization-Level Allowance:** Google Cloud provides a no-cost tier of **10,000 assessments per month** for reCAPTCHA Enterprise under Fraud Defense. This quota is calculated at the **Google Cloud Organization / Billing Account level** (shared across all projects within the organization).
-- **Provider Distinction:** Standard reCAPTCHA v3 is part of legacy reCAPTCHA admin terms; reCAPTCHA Enterprise is the modern cloud-native provider recommended by Firebase for all new web integrations.
 
 ### 5.2 Token Acquisition, Token Refresh & Request Decoupling
-The architecture distinguishes three discrete operations:
-1. **Token Acquisition:** An assessment occurs **only** when acquiring an initial token via `getToken()` on page load or user action.
-2. **Token Refresh:** Handled automatically in background by the Firebase SDK. The client configuration **must explicitly set `isTokenAutoRefreshEnabled: true`**:
-   ```javascript
-   import { initializeAppCheck, ReCaptchaEnterpriseProvider } from 'firebase/app-check';
+```javascript
+import { initializeAppCheck, ReCaptchaEnterpriseProvider } from 'firebase/app-check';
 
-   const appCheck = initializeAppCheck(app, {
-     provider: new ReCaptchaEnterpriseProvider(RECAPTCHA_ENTERPRISE_SITE_KEY),
-     isTokenAutoRefreshEnabled: true // Must be explicitly configured; not assumed default
-   });
-   ```
-   *(Evidence: DOCUMENTATION_VERIFIED via official Firebase App Check v10 SDK documentation; browser runtime auto-refresh behavior is PENDING_INTEGRATION_TEST).*
-3. **Firestore Service Requests:** All queries and mutations attach the cached token in the `X-Firebase-AppCheck` header. The Firestore backend validates the token signature locally. **Firestore queries consume 0 additional reCAPTCHA assessments.**
+const appCheck = initializeAppCheck(app, {
+  provider: new ReCaptchaEnterpriseProvider(RECAPTCHA_ENTERPRISE_SITE_KEY),
+  isTokenAutoRefreshEnabled: true // Must be explicitly configured; not assumed default
+});
+```
+Firestore queries consume 0 additional reCAPTCHA assessments because the App Check token is verified cryptographically by the Firestore backend.
 
 ### 5.3 Billing Configuration & Free-Tier Operating Target
 > [!IMPORTANT]
@@ -172,54 +167,24 @@ The architecture distinguishes three discrete operations:
 
 ### 5.4 The Lazy-Loading Architecture & Usage Estimates
 - **Storefront Visitors:** Browse static catalogs (`data/catalog.json`) served directly by GitHub Pages. They make **0 Firestore requests** and **do NOT initialize App Check**.
-- **Authenticated Developers:** App Check is lazy-loaded **only on pages that interact with Cloud Firestore**:
-  - `submit.html` (Submissions wizard)
-  - `dashboard.html` (Developer dashboard)
-  - `admin.html` (Admin dashboard)
-- **Architectural Usage Projections (Unmeasured Engineering Estimates):**
-  - Assumes 10–50 submission and claim operations per month.
-  - Assumes 5–10 active developer visits per day (150–300 sessions/month).
-  - Assumes average session duration of 30 minutes with token caching (1 token acquisition per session).
-  - Projected Monthly Assessments: $\approx 200 - 1,000$ assessments/month (2% to 10% of the 10,000 free monthly quota).
-  - *All estimates are engineering projections, not measured production telemetry.*
+- **Authenticated Developers:** App Check is lazy-loaded **only on pages that interact with Cloud Firestore**: `submit.html`, `dashboard.html`, `admin.html`.
 
 ---
 
 ## 6. Administrator Bootstrap & Identity Verification
 
 ### 6.1 Root Administrator Verification Flow
-Repository ownership of `Rohitpvt/GitStore` alone does not authenticate the person making an administrative request. The batch worker enforces an authoritative identity verification flow:
-
-1. **Owner Account Resolution:** The worker retrieves the canonical repository owner's immutable numeric GitHub account ID from trusted GitHub repository metadata (`GET /repos/Rohitpvt/GitStore` -> `response.data.owner.id`) or verified worker environment configuration (`BOOTSTRAP_ROOT_ADMIN_GITHUB_ID`).
-2. **Firebase Token Verification:** The caller submits their Firebase ID token. The worker executes:
-   ```javascript
-   const decodedToken = await admin.auth().verifyIdToken(idToken, true);
-   const userRecord = await admin.auth().getUser(decodedToken.uid);
-   ```
-3. **Linked Provider Match & Normalization:** The worker locates `userRecord.providerData.find(p => p.providerId === 'github.com')`. If absent, ambiguous, or unlinked, the caller is rejected with `403 FORBIDDEN`.
-4. **Immutable ID Assertion with Fail-Closed Normalization:**
-   ```javascript
-   const callerGithubId = normalizeGithubId(githubProvider.uid);
-   const canonicalOwnerGithubId = normalizeGithubId(repoMetadata.owner.id);
-   if (!callerGithubId || !canonicalOwnerGithubId) {
-     throw new Error("UNAUTHORIZED: Invalid or non-numeric GitHub user identifier");
-   }
-   const isRootAdmin = (callerGithubId === canonicalOwnerGithubId);
-   ```
-   *(Evidence: DOCUMENTATION_VERIFIED via GitHub and Firebase API specifications; live comparison is PENDING_INTEGRATION_TEST).*
-5. **Account Linking / Unlinking Rules:**
-   - The worker never assumes `userRecord.uid === githubId`.
-   - If an account unlinks its GitHub provider, `providerData.find(p => p.providerId === 'github.com')` returns `undefined`, immediately terminating administrative authority.
-6. **Fail-Closed Principle:** Never trust client-supplied usernames, UIDs, or roles. If identity data is unavailable, all privileged operations fail closed.
-7. **Recovery & Emergency Revocation:**
-   - If an administrator account is compromised, the repository owner revokes repository collaborator privileges on GitHub and calls `admin.auth().revokeRefreshTokens(uid)` via the Admin SDK.
-   - Dynamic real-time collaborator checks on each batch run ensure immediate revocation without waiting for cached credentials to expire.
+Repository ownership of `Rohitpvt/GitStore` alone does not authenticate the person making an administrative request:
+1. Retrieve canonical repository owner's immutable numeric GitHub account ID from trusted GitHub repository metadata (`GET /repos/Rohitpvt/GitStore` -> `response.data.owner.id`).
+2. Verify caller's Firebase ID token: `admin.auth().verifyIdToken(idToken, true)`.
+3. Locate `userRecord.providerData.find(p => p.providerId === 'github.com')`. If absent, reject with `403 FORBIDDEN`.
+4. Normalize and compare IDs: `normalizeGithubId(githubProvider.uid) === normalizeGithubId(repoMetadata.owner.id)`. If true, caller is authenticated as root administrator.
 
 ---
 
-## 7. Mandatory Fresh GitHub Step-Up Reauthentication (Option A)
+## 7. Action-Bound Step-Up Authentication Proof Integrity (Option A)
 
-To eliminate the risks of stolen session tokens, cross-tab session hijacking, or unauthorized administrative actions performed through linked email accounts, GitStore enforces **Mandatory Fresh GitHub Step-Up Reauthentication (Option A)** for all privileged operations (`APPROVE_SUBMISSION`, `REJECT_SUBMISSION`, `VERIFY_DEVELOPER`, `REVOKE_DEVELOPER`, `DELIST_PRODUCT`, `FEATURE_PRODUCT`):
+To eliminate the risks of stolen session tokens, cross-tab session hijacking, or unauthorized administrative actions performed through linked email accounts, GitStore enforces **Mandatory Fresh GitHub Step-Up Reauthentication with Action-Bound Proofs (Option A)** for all privileged operations (`APPROVE_SUBMISSION`, `REJECT_SUBMISSION`, `VERIFY_DEVELOPER`, `REVOKE_DEVELOPER`, `DELIST_PRODUCT`, `FEATURE_PRODUCT`):
 
 ### 7.1 Interactive Step-Up Challenge Flow
 1. When an administrator initiates a moderation action on `admin.html`, the client triggers:
@@ -232,58 +197,72 @@ To eliminate the risks of stolen session tokens, cross-tab session hijacking, or
 
    // Forces interactive GitHub authentication popup
    const result = await reauthenticateWithPopup(auth.currentUser, provider);
-   const credential = GithubAuthProvider.credentialFromResult(result);
-   const ephemeralGithubToken = credential.accessToken;
-   const issuedAt = new Date();
-   const expiresAt = new Date(issuedAt.getTime() + 300 * 1000); // 300 seconds (5 min) window
-   const actionNonce = crypto.randomUUID().replace(/-/g, '') + crypto.randomUUID().replace(/-/g, '');
+   const tokenResult = await auth.currentUser.getIdTokenResult(true);
    ```
 
-2. **Security Rules Freshness Gate:**
+2. **Elimination of Raw Token Storage & Action Hash Binding:**
+   **Zero raw OAuth access tokens are written to or stored in Cloud Firestore.**
+   Instead, the client binds the user's freshly authenticated token claims to the specific action and target document:
+   ```javascript
+   const actionNonce = crypto.randomUUID().replace(/-/g, '') + crypto.randomUUID().replace(/-/g, '');
+   const authTime = tokenResult.claims.auth_time;
+   const targetDocumentPath = `submissions/${targetSubmissionId}`;
+   
+   // Compute SHA-256 over action, target path, nonce, and auth_time
+   const rawMessage = `${action}:${targetDocumentPath}:${actionNonce}:${authTime}`;
+   const actionHash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(rawMessage))
+     .then(b => Array.from(new Uint8Array(b)).map(x => x.toString(16).padStart(2, '0')).join(''));
+
+   const stepUpProof = {
+     providerId: 'github.com',
+     authTime: authTime,
+     actionNonce: actionNonce,
+     targetDocumentPath: targetDocumentPath,
+     actionHash: actionHash
+   };
+   ```
+
+3. **Security Rules Freshness Gate:**
    Firestore Security Rules evaluate the `auth_time` claim within the Firebase ID token:
    ```javascript
    function isFreshlyAuthenticated() {
      return request.auth != null 
+       && request.auth.token.firebase.sign_in_provider == 'github.com'
+       && ('github.com' in request.auth.token.firebase.identities)
        && request.auth.token.auth_time != null
-       && ((request.time.toMillis() / 1000) - request.auth.token.auth_time < 300);
+       && ((request.time.toMillis() / 1000) - request.auth.token.auth_time < 300)
+       && (request.auth.token.auth_time <= (request.time.toMillis() / 1000) + 5);
    }
 
    match /moderation_requests/{requestId} {
      allow create: if isFreshlyAuthenticated()
-       && request.resource.data.keys().hasOnly(['requestId', 'action', 'targetId', 'payload', 'requestedByUid', 'stepUpProof', 'status', 'createdAt'])
-       && request.resource.data.requestId == requestId
+       && request.resource.data.keys().hasOnly([
+         'id', 'action', 'targetId', 'targetDocumentPath', 'payload',
+         'requestedByUid', 'githubUserId', 'stepUpProof', 'status', 'createdAt'
+       ])
+       && request.resource.data.id == requestId
        && request.resource.data.requestedByUid == request.auth.uid
+       && request.resource.data.githubUserId == request.auth.token.firebase.identities['github.com'][0]
+       && request.resource.data.stepUpProof.keys().hasOnly([
+         'providerId', 'authTime', 'actionNonce', 'targetDocumentPath', 'actionHash'
+       ])
        && request.resource.data.stepUpProof.providerId == 'github.com'
-       && request.resource.data.stepUpProof.ephemeralGithubToken is string
-       && request.resource.data.stepUpProof.ephemeralGithubToken.size() > 0
+       && request.resource.data.stepUpProof.authTime == request.auth.token.auth_time
+       && request.resource.data.stepUpProof.targetDocumentPath == request.resource.data.targetDocumentPath
+       && request.resource.data.stepUpProof.actionHash.size() == 64
        && request.resource.data.status == 'pending'
        && request.resource.data.createdAt == request.time;
-     allow update, delete: if false;
+     allow update, delete: if false; // Immutability prevents tampering
    }
    ```
 
-3. **Ephemeral Step-Up Proof Verification in Batch Worker:**
-   - Worker retrieves `stepUpProof` from `/moderation_requests/{requestId}`.
-   - Worker checks expiration: `Date.now() <= Date.parse(stepUpProof.expiresAt)`.
-   - Worker queries GitHub's authoritative API using the ephemeral token:
-     `GET https://api.github.com/user` with `Authorization: Bearer ${stepUpProof.ephemeralGithubToken}`.
-   - Worker verifies that the returned numeric user ID (`ghUser.id`) matches `verifiedCallerNumericId`.
+4. **Dual Timing Model (Creation Gate vs Queue Retention):**
+   - **5-Minute Creation Window:** The freshness constraint `request.time - auth_time < 300` is enforced **only at document creation time**. This ensures the administrator authenticated within 5 minutes when placing the command in the queue.
+   - **30-Minute Queue Execution Window:** Once accepted, the document cannot be modified by clients. The Actions worker processes requests within a 30-minute queue TTL (`now - doc.createdAt.toMillis() < 30 * 60 * 1000`). If older than 30 minutes, it is marked `expired`.
+
+5. **Authoritative Worker Validation & Anti-Replay Guarantees:**
+   - Worker retrieves `requestedByUid` and queries Firebase Admin SDK `getUser()`.
+   - Worker verifies linked GitHub provider UID matches `docData.githubUserId`.
+   - Worker verifies `docData.stepUpProof.actionHash === sha256(`${action}:${targetDocumentPath}:${actionNonce}:${authTime}`)`.
    - Worker verifies canonical repository collaborator permissions (`Rohitpvt/GitStore`).
-
-4. **Immediate Token Destruction & Anti-Replay Invariant:**
-   - In the same atomic Firestore update transitioning the request to `processing`, the worker **immediately deletes `ephemeralGithubToken`**:
-     ```javascript
-     await db.collection('moderation_requests').doc(requestId).update({
-       'stepUpProof.ephemeralGithubToken': admin.firestore.FieldValue.delete(),
-       'stepUpProof.consumedAt': new Date().toISOString(),
-       'stepUpProof.workerRunId': String(process.env.GITHUB_RUN_ID),
-       status: 'processing'
-     });
-     ```
-   - Zero raw tokens are retained in persistent database records.
-   - Any replay attempt lacking the token or with an existing `consumedAt` timestamp fails closed immediately.
-
-5. **Technical Boundaries & Limitations:**
-   - Firebase Auth ID tokens carry Firebase cryptographic signatures asserting claims, but do not contain arbitrary third-party cryptographic signatures from GitHub.
-   - Client browsers cannot sign arbitrary payloads with GitHub credentials without an interactive OAuth flow.
-   - Option A cleanly bridges this by combining Firebase Auth's built-in `auth_time` freshness claim with an ephemeral, single-use GitHub OAuth access token verified directly via GitHub REST API by the worker and destroyed immediately upon consumption.
+   - Worker atomically updates request status to `processing` with `workerRunId`. Because clients cannot update or delete documents in `/moderation_requests`, replay attacks are mathematically prevented.

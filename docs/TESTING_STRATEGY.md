@@ -1,8 +1,8 @@
 # GitStore — Comprehensive Testing Strategy
 
-**Document Version:** 1.6.0  
-**Phase:** Phase 0.1.5 — Final Security Rules, Administrator Step-Up Authentication & Deployment Recovery Audit  
-**Status:** Approved Quality Assurance & Testing Framework (Hardened & Reconciled)  
+**Document Version:** 1.7.0  
+**Phase:** Phase 0.1.6 — Step-Up Proof Integrity, Firestore Rules & Deployment Reconciliation  
+**Status:** IN_REVIEW — Awaiting Explicit User Approval  
 
 ---
 
@@ -25,7 +25,7 @@ flowchart TD
         E2E["E2E Lifecycle Tests\n(Submission -> Verification -> Two-Phase Deploy -> UI Render)"]
         SecRules["Firestore Security Rules Tests\n(Firebase Local Emulator Suite + @firebase/rules-unit-testing)"]
         WorkerInteg["Batch Worker Integration Tests\n(Mocked GitHub REST API, Full-History Reconciler, Step-Up Verification, Digest Validation)"]
-        Unit["Frontend & Utility Unit Tests\n(Sanitizers, Formatters, Semver, URL Parsers, Digest Hasher)"]
+        Unit["Frontend & Utility Unit Tests\n(Sanitizers, Formatters, Semver, URL Parsers, Recursive Canonical Digest)"]
     end
 
     Unit --> WorkerInteg
@@ -42,7 +42,56 @@ flowchart TD
   - `sanitizers.js`: Verify that malicious SVG tags, `<script>` tags, and `javascript:` URIs are completely stripped via DOMPurify.
   - `formatters.js`: Validate byte size formatting (`1024 B -> 1.0 KB`, `1048576 B -> 1.0 MB`), date formatting, and semver comparison.
   - `url-validator.js`: Confirm regex correctly matches valid GitHub repository URLs (`https://github.com/owner/repo`) and rejects phishing or spoofed domains.
-  - `catalog-digest.js`: Assert deterministic SHA-256 digest computation over canonicalized sorted JSON files.
+  - `catalog-digest.js`: Assert deterministic SHA-256 digest computation (`sha256:v1:...`) over canonicalized JSON files.
+
+### 3.1 Recursive Canonical Digest Unit Tests (The 6 Invariant Properties)
+```javascript
+import { test, describe } from 'node:test';
+import assert from 'node:assert';
+import { canonicalizeJson, computeCatalogDigest } from './catalog-digest.js';
+
+describe('Deterministic Recursive Canonical Digest Tests', () => {
+  test('Property 1: Key Ordering Invariance', () => {
+    const objA = { b: 1, a: { y: 2, x: 3 } };
+    const objB = { a: { x: 3, y: 2 }, b: 1 };
+    assert.strictEqual(canonicalizeJson(objA), '{"a":{"x":3,"y":2},"b":1}');
+    assert.strictEqual(canonicalizeJson(objA), canonicalizeJson(objB));
+  });
+
+  test('Property 2: Array Element Order Sensitivity', () => {
+    const arrA = [1, 2, 3];
+    const arrB = [3, 2, 1];
+    assert.notStrictEqual(canonicalizeJson(arrA), canonicalizeJson(arrB));
+  });
+
+  test('Property 3: Type Distinction', () => {
+    const strObj = { v: "123" };
+    const numObj = { v: 123 };
+    assert.notStrictEqual(canonicalizeJson(strObj), canonicalizeJson(numObj));
+  });
+
+  test('Property 4: Unicode Normalization & UTF-8 Encoding Stability', () => {
+    const obj = { name: "café", icon: "🚀" };
+    const canonical = canonicalizeJson(obj);
+    assert.strictEqual(canonical, '{"icon":"🚀","name":"café"}');
+  });
+
+  test('Property 5: Path Framing Collision Resistance', () => {
+    // Unambiguous null-byte framing prevents concatenation ambiguity
+    const frameA = Buffer.from('FILE\0a/b\01\0c', 'utf8');
+    const frameB = Buffer.from('FILE\0a\03\0/bc', 'utf8');
+    assert.notDeepStrictEqual(frameA, frameB);
+  });
+
+  test('Property 6: Manifest Exclusion Invariant', () => {
+    // Proves data/deployment-manifest.json is never fed into digest calculation
+    const files = ['data/catalog.json', 'data/categories.json', 'data/deployment-manifest.json'];
+    const filtered = files.filter(f => !f.endsWith('deployment-manifest.json'));
+    assert.strictEqual(filtered.length, 2);
+    assert.ok(!filtered.includes('data/deployment-manifest.json'));
+  });
+});
+```
 
 ---
 
@@ -56,7 +105,7 @@ flowchart TD
      - Anonymous client CANNOT read `/users/{uid}`.
      - Authenticated developer CANNOT read another developer's `/users/{otherUid}` document.
      - Authenticated developer CAN read their own `/users/{uid}` document.
-     - Authenticated developer CANNOT modify privileged fields (`isAdmin`, `isVerifiedDeveloper`, `reputationScore`, `githubNumericId`, `email`, `emailVerified`).
+     - Update with `diff().affectedKeys()`: Owner CAN update `displayName`, `avatarUrl`, `bio`, `settings`. Attempting to modify `isAdmin`, `isVerifiedDeveloper`, `reputationScore`, `githubNumericId`, or `email` is rejected.
   3. **Public Profile Separation (`/public_profiles/{uid}`):**
      - Any user CAN read `/public_profiles/{uid}`.
      - Owner CAN update safe fields (`displayName`, `avatarUrl`, `bio`).
@@ -68,11 +117,17 @@ flowchart TD
      - Client CANNOT read or write `/admin_logs/{logId}`.
      - Client CAN read `/system_config/global_settings`, but CANNOT write.
   5. **Submission Tampering Protection:** Authenticated developer CANNOT update a submission that is already in `processing`, `approved`, or `published` status, and CANNOT alter ownership fields (`developerUid`, `claimStatus`, `ownershipProof`).
-  6. **Claim Request Protection & Whitelist:** Authenticated user CAN create a `claim_requests` doc with their own `auth.uid` and `status: 'pending'`, but CANNOT inject privileged or worker fields (`developerUid`, `verifiedGithubId`, `claimStatus`, `isAdmin`, `workerLease`, `workerId`).
-  7. **Moderation Queue Security & Mandatory Step-Up Freshness:**
+  6. **Claim Request Whitelist:** Authenticated user CAN create a `claim_requests` doc with their own `auth.uid` and `status: 'pending'`, but CANNOT inject privileged or worker fields (`developerUid`, `verifiedGithubId`, `claimStatus`, `isAdmin`, `workerLease`, `workerId`).
+  7. **Moderation Queue Security & Action-Bound Step-Up Proof:**
      - Request write FAILS if token `auth_time` is older than 300 seconds (`(request.time - auth_time) >= 300`).
-     - Request write SUCCEEDS if `auth_time` is fresh (< 300s), fields match strict whitelist, and `stepUpProof` carries valid schema.
-     - Client CANNOT update or delete moderation requests once written.
+     - Request write FAILS if `sign_in_provider != 'github.com'`.
+     - Request write FAILS if `stepUpProof` schema contains unapproved keys or missing fields.
+     - Request write SUCCEEDS if `auth_time` is fresh (< 300s), fields match strict whitelist, and action-bound proof matches schema.
+     - Client CANNOT update or delete moderation requests once written (`allow update, delete: if false;`).
+  8. **Abuse Reports Protection:**
+     - Unauthenticated client CANNOT create report.
+     - Authenticated client CAN create report with `status == 'open'` and `details.size() <= 2000`.
+     - Authenticated client CANNOT read, update, or delete existing reports.
 
 ---
 
@@ -113,17 +168,18 @@ flowchart TD
    ];
    ```
 
-### 5.2 Mandatory Step-Up Reauthentication & Token Destruction Tests
+### 5.2 Action-Bound Step-Up Reauthentication & Zero-Token Tests
 - **Valid Step-Up Flow:**
-  - Mock GitHub API `GET /user` with ephemeral token returning `id: 12345678`.
-  - Caller linked GitHub ID is `12345678`.
-  - Assert: Worker marks request `processing`, deletes `ephemeralGithubToken` (`FieldValue.delete()`), records `consumedAt`, and authorizes execution.
+  - Request contains action-bound proof `{ providerId: 'github.com', authTime, actionNonce, targetDocumentPath, actionHash }`.
+  - Worker computes `expectedHash = sha256(`${action}:${targetDocumentPath}:${actionNonce}:${authTime}`)`.
+  - Worker asserts hash matches, checks collaborator rights, and updates status to `processing`.
+  - Assert: Zero raw OAuth access tokens existed in document.
 - **Identity Mismatch Rejection:**
-  - Ephemeral token belongs to GitHub ID `99999999`, but caller linked ID is `12345678`.
-  - Assert: Worker aborts with security alarm, marks request `rejected`, and purges token.
-- **Replay Protection Test:**
-  - Second worker cycle attempts to process a request already containing `consumedAt`.
-  - Assert: Worker fails closed and rejects request as replayed attempt.
+  - Caller linked GitHub ID does not match `githubUserId`.
+  - Assert: Worker aborts with security alarm and marks request `rejected`.
+- **Anti-Replay Protection Test:**
+  - Attempting to re-execute a request already in `processing` or `completed`.
+  - Assert: Worker fails closed and ignores replayed request.
 
 ### 5.3 Full-History Commit Discovery & Branch Ancestry Tests
 - **Discovery Beyond 10-Commit Window:**
@@ -133,25 +189,25 @@ flowchart TD
 - **Branch Ancestry Assertion (`git merge-base --is-ancestor`):**
   - Simulate candidate commit from an unmerged feature branch or fork.
   - Assert `git merge-base --is-ancestor ${candidateSha} origin/main` exits non-zero; reconciler rejects candidate commit.
-- **Deterministic Disambiguation via Catalog Digest:**
-  - Two candidate commits match `generationId` and `generationSequence`.
-  - Worker computes `catalogDigest` on both commits.
-  - Assert: Worker selects the latest commit on `origin/main` whose `catalogDigest` matches `gen.catalogDigest`.
+- **Commits API Full Pagination Loop Test:**
+  - Simulate multi-page response with `Link: <...page=2>; rel="next"`.
+  - Assert: Worker iterates through pages to locate commit when local git log is unavailable.
 
 ### 5.4 Missing Pages Deployment ID Handling (Cases A, B, C, D)
-- **Case A Test:** Pages deployment exists and succeeded on GitHub Pages API -> capture ID, verify CDN, finalize Firestore.
-- **Case B Test:** No remote Pages deployment found for the commit -> worker packages `site/` and dispatches deployment.
-- **Case C Test:** Remote Pages deployment failed -> retry same commit up to 3 times before preserving in `deployment_retained`.
+- **Case A Test:** Pages deployment exists and `status === 'built'` on GitHub Pages API -> capture ID, verify CDN, finalize Firestore.
+- **Case B Test:** GitHub Pages API returns 404 (no deployment for commit) -> worker restores git tree at `gen.catalogCommitSha`, validates digest against `gen.catalogDigest`, rebuilds artifact into `site/`, sets `deploy_needed = true`, and sets `reconciliationStatus = 'pages_dispatched'`.
+- **Case C Test:** Remote Pages deployment failed (`errored`) -> retry same commit up to 3 times before preserving in `deployment_retained`.
 - **Case D Test:** Remote deploy succeeded, DB finalization interrupted -> idempotent finalization without re-deploying.
 
-### 5.5 Durable Catalog Revisions & Work Preservation Tests
-- Increment `latestRequestedRevision` in `/system_config/catalog_state` while compilation worker is running.
-- Post-deployment, assert worker detects `latestRequestedRevision > activeCapturedRevision` (`isDirty: true`) and triggers follow-up compilation.
+### 5.5 Pre-Deployment Generation Ordering Guard Tests
+- Test Case 1: `artifact.sequence < state.latestPublishedSequence` -> Abort deploy with exit code 1.
+- Test Case 2: `artifact.sequence === state.latestPublishedSequence && artifact.id === state.latestPublishedGenerationId` -> Allow deploy.
+- Test Case 3: `artifact.sequence === state.latestPublishedSequence && artifact.id !== state.latestPublishedGenerationId` -> Critical alarm; fail closed.
+- Test Case 4: `artifact.sequence > state.latestPublishedSequence` -> Allow deploy.
 
-### 5.6 Split-Job Workflow & Isolated Staging Tests
-- Verify `build-and-commit` job has `contents: write` but zero Pages permissions.
-- Verify `deploy-to-pages` job has `pages: write`, `id-token: write` but zero `contents: write` permissions.
-- Verify `actions/upload-pages-artifact@v5` packages exclusively from `site/` and that internal files (`.git`, `.github`, `docs/`, `scripts/`) are excluded.
+### 5.6 Durable Catalog Revisions & Work Preservation Tests
+- Increment `latestRequestedRevision` in `/system_config/catalog_state` while compilation worker is running.
+- Post-deployment inside atomic transaction, assert worker detects `latestRequestedRevision > activeCapturedRevision` (`isDirty: true`) and triggers follow-up compilation.
 
 ---
 

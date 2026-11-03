@@ -1,8 +1,8 @@
 # GitStore — Comprehensive Deployment & Operations Guide
 
-**Document Version:** 1.6.0  
-**Phase:** Phase 0.1.5 — Final Security Rules, Administrator Step-Up Authentication & Deployment Recovery Audit  
-**Status:** Approved Operations Manual (Hardened & Reconciled)  
+**Document Version:** 1.7.0  
+**Phase:** Phase 0.1.6 — Step-Up Proof Integrity, Firestore Rules & Deployment Reconciliation  
+**Status:** IN_REVIEW — Awaiting Explicit User Approval  
 **Target Environments:** GitHub (Pages & Actions) and Firebase (Auth, Firestore, App Check)
 
 ---
@@ -90,7 +90,7 @@ Before initiating deployment, ensure you possess:
 3. Add designated platform administrators as collaborators with role **Admin** or **Maintain**.
 4. The GitHub Actions batch worker uses the GitHub REST API (`GET /repos/Rohitpvt/GitStore/collaborators/{username}/permission`) to verify collaborator permissions before executing privileged moderation requests from `/moderation_requests`.
 5. Note that GitHub maps the `maintain` role to `write` in its legacy `permission` field; the worker checks `role_name === 'admin' || role_name === 'maintain'`.
-6. For every administrative action, the frontend requires interactive **fresh GitHub reauthentication (Option A)**, producing an ephemeral token verified and immediately purged by the worker.
+6. For every administrative action, the frontend requires interactive **fresh GitHub reauthentication with action-bound proof (Option A)**, producing a cryptographic proof verified by the worker without raw OAuth token storage.
 
 ---
 
@@ -102,9 +102,9 @@ Before initiating deployment, ensure you possess:
 3. Ensure HTTPS is enforced by checking **Enforce HTTPS**.
 4. Publication Verification Architecture:
    - Deployments use the **least-privilege split-job architecture** (`build-and-commit` and `deploy-to-pages`) targeting the `github-pages` environment within the same trusted workflow run (Option A).
-   - The batch worker generates `data/deployment-manifest.json` containing `{ generationId, generationSequence, generatedAt, catalogDigest, productCount, schemaVersion: "1.6.0", environment: "github-pages" }`.
-   - The worker commits to `main`, captures `catalogCommitSha` via `git rev-parse HEAD`, records the generation in Firestore `/system_deployments/{generationId}`, and queries the dedicated GitHub Pages deployment endpoint `GET /repos/Rohitpvt/GitStore/pages/deployments/{pages_deployment_id}` for status `"succeed"`.
-   - In case of a worker crash post-push before Firestore update, the startup reconciler recovers the SHA via full-history search on `origin/main` (`git log` and GitHub Commits API), proves branch ancestry via `git merge-base --is-ancestor`, and matches the deterministic `catalogDigest`.
+   - The batch worker generates `data/deployment-manifest.json` containing `{ generationId, generationSequence, generatedAt, catalogDigest, productCount, schemaVersion: "1.7.0", environment: "github-pages" }`.
+   - The worker commits to `main`, captures `catalogCommitSha` via `git rev-parse HEAD`, records the generation in Firestore `/system_deployments/{generationId}`, and queries the official GitHub Pages deployment endpoint `GET /repos/Rohitpvt/GitStore/pages/deployments/{catalogCommitSha}` for status `"built"`.
+   - In case of a worker crash post-push before Firestore update, the startup reconciler recovers the SHA via full-history search on `origin/main` (`git log` and GitHub Commits API loop), proves branch ancestry via `git merge-base --is-ancestor`, and matches the recursive canonical `catalogDigest`.
    - Missing Pages deployment IDs are deterministically resolved across Cases A, B, C, and D.
    - Public HTTP checks on `https://rohitpvt.github.io/GitStore/data/deployment-manifest.json` confirm `generationId`, `generationSequence`, and `catalogDigest` before finalizing database status to `published` and advancing durable revisions in `/system_config/catalog_state`.
 
@@ -132,7 +132,7 @@ firebase deploy --only firestore:indexes
 
 ## 6. Step 5: Automating Least-Privilege Split-Job GitHub Actions Batch Processor
 
-Verify that `.github/workflows/batch-processor.yml` is enabled with least-privilege job permissions, environment concurrency, and isolated staging into `site/`:
+Verify that `.github/workflows/batch-processor.yml` is enabled with least-privilege job permissions, explicit cross-job outputs, isolated staging into `site/`, and the pre-deployment 4-case ordering guard:
 
 ```yaml
 name: GitStore Batch Processor
@@ -157,19 +157,26 @@ jobs:
     permissions:
       contents: write        # Required for git push of compiled static catalog and manifest
       metadata: read         # Required for inspecting repository metadata and permissions
+    outputs:
+      generation_id: ${{ steps.catalog.outputs.generation_id }}
+      generation_sequence: ${{ steps.catalog.outputs.generation_sequence }}
+      catalog_commit_sha: ${{ steps.commit.outputs.commit_sha }}
+      catalog_digest: ${{ steps.catalog.outputs.catalog_digest }}
+      deploy_needed: ${{ steps.catalog.outputs.deploy_needed }}
     steps:
       - name: Checkout Repository (Unshallow)
-        uses: actions/checkout@v7
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
       - name: Setup Node.js Runtime
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5a1 # v4.1.0
         with:
           node-version: 24
 
       - name: Reconcile, Validate Submissions & Compile Catalog
+        id: catalog
         env:
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -179,6 +186,7 @@ jobs:
           node scripts/processor/index.js
 
       - name: Stage Public Files into Isolated site/ Directory
+        if: steps.catalog.outputs.deploy_needed == 'true'
         run: |
           mkdir -p site/data site/assets
           cp index.html admin.html dashboard.html submit.html product.html site/
@@ -186,16 +194,19 @@ jobs:
           cp -r data/* site/data/
 
       - name: Commit & Push Catalog to Main
+        id: commit
+        if: steps.catalog.outputs.deploy_needed == 'true'
         run: |
           git config user.name "gitstore-bot"
           git config user.email "bot@gitstore.dev"
           git add data/
           git diff-index --quiet HEAD || git commit -m "chore(catalog): publish static catalog [skip ci]"
           git push origin main
-          echo "CATALOG_SHA=$(git rev-parse HEAD)" >> $GITHUB_ENV
+          echo "commit_sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
 
       - name: Upload Pages Staging Artifact
-        uses: actions/upload-pages-artifact@v5
+        if: steps.catalog.outputs.deploy_needed == 'true'
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
         with:
           path: site/
 
@@ -205,7 +216,7 @@ jobs:
   deploy-to-pages:
     needs: build-and-commit
     runs-on: ubuntu-latest
-    if: github.repository == 'Rohitpvt/GitStore' && github.ref == 'refs/heads/main'
+    if: github.repository == 'Rohitpvt/GitStore' && github.ref == 'refs/heads/main' && needs.build-and-commit.outputs.deploy_needed == 'true'
     permissions:
       pages: write           # Required for GitHub Pages deployment
       id-token: write        # Required for OpenID Connect (OIDC) token minting
@@ -215,26 +226,37 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - name: Checkout Repository for Reconciler Scripts
-        uses: actions/checkout@v7
+      - name: Checkout Repository for Guard Scripts
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 1
 
       - name: Setup Node.js Runtime
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5a1 # v4.1.0
         with:
           node-version: 24
 
+      - name: Pre-Deployment Generation Ordering Guard (4-Case Matrix)
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+          GENERATION_SEQUENCE: ${{ needs.build-and-commit.outputs.generation_sequence }}
+          GENERATION_ID: ${{ needs.build-and-commit.outputs.generation_id }}
+        run: |
+          node scripts/processor/pre-deploy-guard.js
+
       - name: Deploy Artifact to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v5
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5
 
       - name: Reconcile & Finalize Firestore Status
         if: steps.deployment.outcome == 'success'
         env:
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GENERATION_ID: ${{ needs.build-and-commit.outputs.generation_id }}
+          CATALOG_COMMIT_SHA: ${{ needs.build-and-commit.outputs.catalog_commit_sha }}
+          CATALOG_DIGEST: ${{ needs.build-and-commit.outputs.catalog_digest }}
         run: |
           node scripts/processor/finalize-publishing.js
 ```
