@@ -1,8 +1,8 @@
 # GitStore — Master Phase Plan & Development Control System
 
-**Document Version:** 1.4.0  
-**Last Updated:** 2026-10-30  
-**Current Project State:** Phase 0.1.4 (Evidence Alignment, Deployment Recovery & Governance Consistency) — `IN_REVIEW` ⏳ | Awaiting User `APPROVED` Gate for Phase 1  
+**Document Version:** 1.5.0  
+**Last Updated:** 2026-11-03  
+**Current Project State:** Phase 0.1.5 (Final Security Rules, Administrator Step-Up Authentication & Deployment Recovery Audit) — `IN_REVIEW` ⏳ | Awaiting User `APPROVED` Gate for Phase 1  
 **Project Lead:** Technical Project Manager, Software Architect, & QA Lead  
 **Governing Standard:** Strict Dual-Platform Confinement (**GitHub** & **Firebase** ONLY)
 
@@ -30,7 +30,8 @@ To ensure strict quality control and eliminate premature execution:
 |---|---|---|---|---|
 | **Phase 0** | Architecture and Documentation | `APPROVED` ✅ | 100% (Baseline docs created) | User Approved |
 | **Phase 0.1** | Architecture Hardening & Final Validation | `IN_REVIEW` ⏳ | 100% (Audited & Hardened) | User Review Pending |
-| **Phase 0.1.4**| Evidence Alignment, Deployment Recovery & Governance Consistency | `IN_REVIEW` ⏳ | 100% (All 8 core objectives closed) | User Review Pending |
+| **Phase 0.1.4**| Evidence Alignment, Deployment Recovery & Governance Consistency | `COMPLETED` ✅ | 100% (All 8 core objectives closed) | Reconciled Baseline |
+| **Phase 0.1.5**| Final Security Rules, Administrator Step-Up Authentication & Deployment Recovery Audit | `IN_REVIEW` ⏳ | 100% (All 9 core objectives closed) | User Review Pending |
 | **Phase 1** | Frontend Core Foundation (Mock Storefront) | `NOT_STARTED` 🛑 | 0 / 5 Subphases | Requires Phase 0.1 Approval |
 | **Phase 2** | Firebase Foundation and Authentication | `NOT_STARTED` 🛑 | 0 / 4 Subphases | Requires Phase 1 Approval |
 | **Phase 3** | Developer Dashboard and Submission System | `NOT_STARTED` 🛑 | 0 / 4 Subphases | Requires Phase 2 Approval |
@@ -49,36 +50,36 @@ To ensure strict quality control and eliminate premature execution:
 ### Phase 0: Architecture and Documentation
 - **Status:** `APPROVED` ✅ (Completed & Audited)
 - **Objective:** Establish core product requirements, dual-platform architecture, database schemas, security models, and foundational documentation without writing application code.
-- **Deliverables:** Complete 13 foundational documentation files.
-- **Definition of Done (DoD):** All 13 documents authored, synchronized, zero application code written, verified against two-platform constraints.
+- **Deliverables:** Complete foundational documentation files.
 
 ---
 
 ### Phase 0.1: Architecture Hardening & Final Validation
 - **Status:** `IN_REVIEW` ⏳ (Audited, Hardened, and Validated)
-- **Objective:** Audit Phase 0 architecture for structural, security, and operational gaps; correct trust boundaries; establish canonical repository collaborator checks; eliminate placeholder accounts; implement multi-product repository hierarchy; design self-healing publication loop; remove unapproved platform assumptions (Fastly); correct reCAPTCHA quotas.
-
----
-
-### Phase 0.1.3: Deployment Integrity, Administrator Bootstrap & Workflow Security
-- **Status:** `COMPLETED` ✅ (Superseded by Phase 0.1.4)
-- **Objective:** Execute independent hardening across 11 critical architecture pillars (non-circular manifest, Pages status `succeed`, Option A single-run deployment, root admin bootstrap, workflow event security matrix, claim whitelisting, monotonic sequencing).
+- **Objective:** Audit Phase 0 architecture for structural, security, and operational gaps; correct trust boundaries; establish canonical repository collaborator checks; eliminate placeholder accounts; implement multi-product repository hierarchy; design self-healing publication loop; remove unapproved platform assumptions; correct reCAPTCHA quotas.
 
 ---
 
 ### Phase 0.1.4: Evidence Alignment, Deployment Recovery & Governance Consistency
-- **Status:** `IN_REVIEW` ⏳ (All 8 Core Objectives Closed; Awaiting User Gate)
-- **Objective:** Reconcile design claims with verified evidence, design deterministic deployment failure recovery, strengthen generation ordering, and synchronize governance documentation:
-  1. *Reconcile Design Claims with Actual Evidence:* Classified every security control as one of: `DESIGNED`, `DOCUMENTATION_VERIFIED`, `CONFIGURATION_VERIFIED`, `IMPLEMENTED`, `INTEGRATION_TESTED`, or `PENDING_INTEGRATION_TEST`. Stripped all unverified runtime claims of "enforced".
-  2. *Deterministic Post-Commit Firestore Failure Recovery:* Designed and specified the algorithm recovering missing `catalogCommitSha` via `git log -n 10 --format="%H" origin/main -- data/deployment-manifest.json` and `git show ${sha}:data/deployment-manifest.json` blob inspection with disambiguation, atomically persisting the matched SHA to Firestore and resuming deployment idempotently.
-  3. *Strengthened Generation Ordering & Idempotency (4-Case Matrix):* Specified exact handling for: (1) Stale generation (`seq < latestPublishedSequence` -> reject); (2) Idempotent retry (`seq === latestPublishedSequence && id === latestPublishedGenerationId` -> verify/retry); (3) Duplicate sequence conflict (`seq === latestPublishedSequence && id !== latestPublishedGenerationId` -> critical fail-closed alarm); (4) Valid new generation (`seq > latestPublishedSequence` -> advance). Documented GitHub Environment Concurrency (`group: 'github-pages'`, `cancel-in-progress: false`) and work preservation guarantee via Firestore coalescing.
-  4. *Corrected Deployment-Manifest Timestamps:* Replaced `deployedAt` with `generatedAt` in `data/deployment-manifest.json`. Established that actual deployment timestamps are recorded post-verification in Firestore (`verifiedAt`, `finalizedAt`, `lastPublishedAt`).
-  5. *Complete Pages Deployment Configuration Requirements:* Documented exact permissions (`contents: write`, `pages: write`, `id-token: write`, `metadata: read`), environment `github-pages`, default branch check, action versions (`checkout@v4`, `setup-node@v4`, `upload-pages-artifact@v3`, `deploy-pages@v4`), and job separation.
-  6. *GitHub-to-Firebase Identity Normalization:* Specified `normalizeGithubId(val)` function, string vs integer representation handling, account unlinking/linking impact, and formally classified live identity comparison as `PENDING_INTEGRATION_TEST`.
-  7. *Governance & ADR Locations Reconciled:* Documented that ADR-01 through ADR-13 reside inside `docs/ARCHITECTURE.md` Section 4; added ADR-13; verified no loose duplicate planning files exist at root.
-  8. *Revised 5-Column Verification Matrix:* Formatted and published comprehensive security verification matrix across all areas.
+- **Status:** `COMPLETED` ✅ (Superseded and Hardened by Phase 0.1.5)
+- **Objective:** Reconcile design claims with verified evidence, design deterministic deployment failure recovery, strengthen generation ordering, and synchronize governance documentation.
+
+---
+
+### Phase 0.1.5: Final Security Rules, Administrator Step-Up Authentication & Deployment Recovery Audit
+- **Status:** `IN_REVIEW` ⏳ (All 9 Core Objectives Closed; Awaiting User Gate)
+- **Objective:** Execute exhaustive audit and hardening of Firestore Security Rules, administrator authentication, deployment recovery, concurrency, split-job workflows, pricing terms, and architecture decision records:
+  1. *Firestore Data Privacy & Rules Lockout:* Fully locked down `/users/{userId}` against public reads and client manipulation of privileged fields (`isAdmin`, `isVerifiedDeveloper`, `reputationScore`, etc.). Designed and specified separate public projection `/public_profiles/{userId}` with strict field whitelisting. Enforced default-deny on internal collections (`/system_deployments`, `/system_config/deployment_state`, `/system_config/catalog_state`, `/admin_logs`).
+  2. *Mandatory Fresh GitHub Step-Up Reauthentication (Option A):* Specified step-up authentication for all privileged actions (`APPROVE_SUBMISSION`, `REJECT_SUBMISSION`, `DELIST_PRODUCT`, `VERIFY_DEVELOPER`, etc.). Interactive `reauthenticateWithPopup(auth.currentUser, new GithubAuthProvider())` updates `auth_time` (enforced `< 300s` in Security Rules) and attaches ephemeral, single-use, action-bound step-up proof to `/moderation_requests`. The batch worker validates the token via GitHub REST API `GET /user`, verifies canonical repo permissions (`Rohitpvt/GitStore`), and **immediately purges** `ephemeralGithubToken` (`FieldValue.delete()`), recording `consumedAt` and worker run ID.
+  3. *12-State Deployment Recovery State Machine:* Formalized 12 deployment states. Replaced 10-commit limit with unshallow full-history search (`git log origin/main`) and paginated GitHub Commits API fallback. Enforced branch ancestry cryptographic verification (`git merge-base --is-ancestor`). Implemented deterministic SHA-256 `catalogDigest` (sorted catalog files, stable JSON, excluding manifest). Resolved missing Pages deployment IDs across Cases A, B, C, and D.
+  4. *Generation Ordering & Concurrency Boundaries:* Enforced 4-case monotonic sequence matrix. Bound Pages deployments to repository concurrency group `github-pages` (`cancel-in-progress: false`).
+  5. *Durable Catalog Revisions (`catalog_state`):* Established `/system_config/catalog_state` tracking monotonic integer counters `latestRequestedRevision` and `latestPublishedRevision`. Guarantees work preservation for submissions arriving during active compilation or deployment.
+  6. *Least-Privilege Split-Job Pages Workflow:* Split `.github/workflows/batch-processor.yml` into `build-and-commit` (`contents: write`, `metadata: read`) and `deploy-to-pages` (`pages: write`, `id-token: write`, `contents: read`, `metadata: read` targeting `environment: github-pages`). Staging public files strictly into `site/` (excluding `.git`, `.github`, `docs/`, `scripts/`, internal tests). Updated action versions to verified official releases: `actions/checkout@v7`, `actions/setup-node@v7`, `actions/upload-pages-artifact@v5`, `actions/deploy-pages@v5`.
+  7. *Pricing & Policy Clarification:* Audited all documentation to remove unconditional "$0.00/month" claims; clarified that GitStore targets operation within published free limits under the Firebase Spark Plan without an attached billing account. Retained GitHub Pages non-commercial clarification as mandatory Phase 4 launch gate.
+  8. *ADR Updates:* Refined ADR-05, ADR-07, ADR-10, ADR-11, ADR-12, ADR-13; added ADR-14 (Profile Separation), ADR-15 (Step-Up Reauth), ADR-16 (12-State Recovery & Digest), ADR-17 (Durable Revisions), ADR-18 (Split-Job Permissions & Site Staging) in `docs/ARCHITECTURE.md` Section 4.
+  9. *Comprehensive 20-Row Verification Matrix:* Delivered complete 20-row verification matrix with 6 columns and truthful evidence/test statuses (`DESIGNED`, `DOCUMENTATION_VERIFIED`, `PENDING_INTEGRATION_TEST`).
 - **Files Modified:** All 14 architecture, schema, security, and governance files across `docs/` and root repository.
-- **Definition of Done (DoD):** All 8 problem areas formally closed, ADR-13 added, documentation synchronized, zero application code written, working tree verified clean.
+- **Definition of Done (DoD):** All 9 problem areas formally closed, ADR-14 through ADR-18 added, documentation synchronized, zero application code written, working tree verified clean.
 
 ---
 
@@ -99,67 +100,36 @@ To ensure strict quality control and eliminate premature execution:
 ### Phase 2: Firebase Foundation and Authentication
 - **Status:** `NOT_STARTED` 🛑
 - **Objective:** Integrate Firebase Authentication, Cloud Firestore, and Firebase App Check without altering the static storefront CDN architecture.
-- **Subphases:**
-  - **2.1 — Firebase Project Integration:** Public client config, local emulator suite setup.
-  - **2.2 — Authentication:** GitHub OAuth popup flow, Passwordless Email Magic Link flow, multi-provider account linking, session persistence, auth state listeners.
-  - **2.3 — Firestore Foundation:** Document models, client profile synchronization, deploying hardened Security Rules and composite indexes.
-  - **2.4 — App Check:** Web reCAPTCHA v3 provider configuration, local `DebugProvider` setup, lazy-loading on authenticated pages only.
-- **Definition of Done (DoD):** Auth and DB foundations active and verified; emulator rules tests 100% pass.
 
 ---
 
 ### Phase 3: Developer Dashboard and Submission System
 - **Status:** `NOT_STARTED` 🛑
 - **Objective:** Enable developers to submit software applications, inspect submission states, and manage their listings.
-- **Subphases:**
-  - **3.1 — Developer Dashboard (`dashboard.html`):** Profile summary, verified status badge, submission history table.
-  - **3.2 — Product Submission Form (`submit.html`):** Multi-step wizard validating repo URL, release tag, asset dropdown, metadata, and license.
-  - **3.3 — Firestore Submission Integration:** Client creation of `/submissions/{id}` documents with enforced `status: 'queued'`.
-  - **3.4 — Submission Management:** Edit eligible draft/rejected submissions, display validation error details, prevent duplicate submissions.
-- **Definition of Done (DoD):** Submissions write cleanly to Firestore with status `queued`; dashboard reflects real-time status.
 
 ---
 
 ### Phase 4: GitHub Integration and Batch Processing
 - **Status:** `NOT_STARTED` 🛑
 - **Objective:** Build the automated verification, leasing, and static JSON compilation engine using GitHub Actions.
-- **Subphases:**
-  - **4.1 — GitHub API Integration:** REST API v3 verifier checking repo public status, release tags, asset existence, and sizes.
-  - **4.2 — GitHub Issue Form Integration:** Issue template, issue ingestion parser, 4-tier ownership verification, submission claiming flow.
-  - **4.3 — GitHub Actions Batch Worker:** Scheduled cron workflow, concurrency lock, 15-minute distributed leases, retry recovery.
-  - **4.4 — Automated Moderation & Publication Decisions:** Multi-product key generation (`prod_{owner}_{slug}`), direct owner checks, routing unverified creators to `needs_review`.
-- **Definition of Done (DoD):** End-to-end automated worker run successfully processes queued submissions.
 
 ---
 
 ### Phase 5: Admin Moderation and Public Catalog Publishing
 - **Status:** `NOT_STARTED` 🛑
 - **Objective:** Implement the decoupled administrative moderation queue, developer verification, and Two-Phase catalog compilation.
-- **Subphases:**
-  - **5.1 — Administrator Dashboard (`admin.html`):** Pending review queue view, submission detail inspector, delist controls.
-  - **5.2 — Secure Admin Operations:** Client enqueues commands into `/moderation_requests`; worker verifies repository collaborator permission on `Rohitpvt/GitStore` and applies updates via `firebase-admin`.
-  - **5.3 — Catalog Generator:** Worker compiles active listings into `data/catalog.json`, `data/categories.json`, and `data/products/*.json`.
-  - **5.4 — Two-Phase GitHub Pages Deployment:** Git commit & push with rebase, dispatch `actions/deploy-pages`, verify deployment success, finalize Firestore status to `published`.
-- **Definition of Done (DoD):** Admin approval workflow live; catalog compiles and deploys to Pages automatically.
 
 ---
 
 ### Phase 6: Security, Integration & Quality Assurance
 - **Status:** `NOT_STARTED` 🛑
 - **Objective:** Perform end-to-end integration testing, full security auditing, stress testing, and address the pre-launch policy gate.
-- **Subphases:**
-  - **6.1 — Security Audit:** Full penetration review of Security Rules, App Check, XSS vectors, and secret boundaries.
-  - **6.2 — End-to-End Testing:** Complete automated test matrix from submission to public download.
-  - **6.3 — Reliability & Failure Testing:** Self-healing reconciliation testing, simulated rate limits, lease contention.
-  - **6.4 — Pre-Launch Policy Gate:** Submit formal request to GitHub Support to confirm compliance of GitStore's open software directory on GitHub Pages.
-- **Definition of Done (DoD):** System certified secure, resilient, and policy-compliant.
 
 ---
 
 ### Phase 7: Controlled Beta Launch
 - **Status:** `NOT_STARTED` 🛑
 - **Objective:** Deploy production environment and onboard initial cohort of open-source developers under live monitoring.
-- **Definition of Done (DoD):** Live public operation under stable free quotas; user gives final launch sign-off.
 
 ---
 
@@ -174,10 +144,16 @@ To ensure strict quality control and eliminate premature execution:
 | Date | Phase | Deviation / Change | Architectural Justification | Approval Authority |
 |---|---|---|---|---|
 | 2026-10-30 | 0.1 | Added `/moderation_requests` command queue | Eliminates browser-held Admin SDK keys; routes admin authorization through GitHub repository collaborator checks. | Approved (ADR-05) |
-| 2026-10-30 | 0.1.1 | Canonical GitStore Repository Trust Boundary | Fixes flaw in ADR-05: Collaborator checks verify admin permissions against `Rohitpvt/GitStore`, not the submitted product repo. Extracts verified GitHub numeric ID from Firebase Auth Admin SDK. | Approved (ADR-05) |
+| 2026-10-30 | 0.1.1 | Canonical GitStore Repository Trust Boundary | Collaborator checks verify admin permissions against `Rohitpvt/GitStore`. Extracts verified GitHub numeric ID from Firebase Auth Admin SDK. | Approved (ADR-05) |
 | 2026-10-30 | 0.1.1 | Removal of Fake Placeholder Firebase Accounts | Issue submissions record `submitterGithubId` and `claimStatus: 'unclaimed'`. Real claiming occurs upon OAuth login. Prevents auth DB pollution. | Approved (ADR-06) |
 | 2026-10-30 | 0.1.1 | Strict Ownership Tiers (Direct Personal Owner Only) | Only personal repo owners qualify for auto-publication. Org members and committers forced to `needs_review` due to lack of release proof. | Approved (ADR-06) |
-| 2026-10-30 | 0.1.1 | Self-Healing Reverse Failure Reconciliation | `reconcilePublishedState()` runs at start of worker cycle to heal unconfirmed Firestore documents if Pages deploy succeeded but DB update failed. | Approved (ADR-07) |
+| 2026-10-30 | 0.1.1 | Self-Healing Reverse Failure Reconciliation | `reconcilePublishedState()` runs at start of worker cycle to heal unconfirmed Firestore documents. | Approved (ADR-07) |
 | 2026-10-30 | 0.1 | Pre-Launch Policy Gate for Pages | Replaces premature policy clearance with formal confirmation requirement before public launch. | Approved (ADR-08) |
 | 2026-10-30 | 0.1.1 | Multi-Product Repository Decoupling | Decouples repos (`gh_repo_{owner}_{repo}`) from products (`prod_{owner}_{slug}`). Enables monorepos to offer multiple distinct tools. | Approved (ADR-09) |
 | 2026-10-30 | 0.1.1 | Removal of Fastly Assumption & App Check Lazy-Loading | Removes Fastly references; relies strictly on GitHub Pages. Lazy-loads App Check on auth pages only to stay under 10k/month quota. | Approved (ADR-10) |
+| 2026-10-30 | 0.1.4 | Evidence Alignment & Verification Matrix | Formalized 6 evidence classifications; stripped unverified runtime "enforced" claims. | Approved (ADR-05-13) |
+| 2026-11-03 | 0.1.5 | Public Profile Separation & Private Data Privacy | Locked `/users/{uid}` private; added `/public_profiles/{uid}` projection; enforced default-deny on internal collections. | Approved (ADR-14) |
+| 2026-11-03 | 0.1.5 | Mandatory Fresh GitHub Step-Up Reauthentication | Enforced interactive `reauthenticateWithPopup`, `auth_time < 300s`, ephemeral token verification and immediate destruction. | Approved (ADR-15) |
+| 2026-11-03 | 0.1.5 | 12-State Recovery State Machine & Deterministic Digest | Replaced 10-commit limit with full-history search, branch ancestry check, `catalogDigest` SHA-256, Cases A-D recovery. | Approved (ADR-16) |
+| 2026-11-03 | 0.1.5 | Durable Catalog Revisions (`catalog_state`) | Monotonic revision tracking guaranteeing work preservation for submissions arriving during deployment. | Approved (ADR-17) |
+| 2026-11-03 | 0.1.5 | Split-Job Workflow & Isolated `site/` Staging | Split `build-and-commit` and `deploy-to-pages` jobs; isolated public assets into `site/`; updated to `@v7` and `@v5` actions. | Approved (ADR-18) |

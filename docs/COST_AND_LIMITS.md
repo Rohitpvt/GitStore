@@ -1,9 +1,9 @@
 # GitStore — Cost Analysis & Operational Limits Specification
 
-**Document Version:** 1.5.0  
-**Phase:** Phase 0.1.4 — Evidence Alignment, Deployment Recovery & Governance Consistency  
+**Document Version:** 1.6.0  
+**Phase:** Phase 0.1.5 — Final Security Rules, Administrator Step-Up Authentication & Deployment Recovery Audit  
 **Status:** Approved Operational Cost Baseline (Hardened & Reconciled)  
-**Budget Objective:** Target $0.00 / Month under Strict Free Quotas (Architectural Estimates; No Unrealistic "Free Forever" Guarantees)
+**Budget Objective:** Target $0.00 / Month under Strict Free Quotas (Architectural Estimates; Spark Plan without Linked Billing)
 
 ---
 

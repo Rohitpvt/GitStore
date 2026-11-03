@@ -1,7 +1,7 @@
 # GitStore — Comprehensive Deployment & Operations Guide
 
-**Document Version:** 1.5.0  
-**Phase:** Phase 0.1.4 — Evidence Alignment, Deployment Recovery & Governance Consistency  
+**Document Version:** 1.6.0  
+**Phase:** Phase 0.1.5 — Final Security Rules, Administrator Step-Up Authentication & Deployment Recovery Audit  
 **Status:** Approved Operations Manual (Hardened & Reconciled)  
 **Target Environments:** GitHub (Pages & Actions) and Firebase (Auth, Firestore, App Check)
 
@@ -11,7 +11,7 @@
 
 Before initiating deployment, ensure you possess:
 1. A **GitHub Account / Organization** with administrative permissions to create a public repository.
-2. A **Google Firebase Account** on the zero-cost **Spark Plan**.
+2. A **Google Firebase Account** configured to operate on the zero-cost **Spark Plan** without an attached billing account.
 3. Git and Node.js (v20+) installed locally for initial repository cloning and branch setup.
 
 ---
@@ -28,7 +28,7 @@ Before initiating deployment, ensure you possess:
 2. Click **Create Database**.
 3. Select **Firestore Native Mode**.
 4. Choose a region close to your primary audience (e.g., `us-central1` or `europe-west1`). Note: Region selection is permanent.
-5. Choose **Start in test mode** for initial setup, which will be immediately overwritten by deploying GitStore’s verified security rules.
+5. Deploy GitStore’s verified security rules from `docs/DATABASE_SCHEMA.md` to ensure private user documents and internal collections are locked down immediately.
 
 ### 2.3 Configure Firebase Authentication
 1. Go to **Build -> Authentication** and click **Get Started**.
@@ -90,6 +90,7 @@ Before initiating deployment, ensure you possess:
 3. Add designated platform administrators as collaborators with role **Admin** or **Maintain**.
 4. The GitHub Actions batch worker uses the GitHub REST API (`GET /repos/Rohitpvt/GitStore/collaborators/{username}/permission`) to verify collaborator permissions before executing privileged moderation requests from `/moderation_requests`.
 5. Note that GitHub maps the `maintain` role to `write` in its legacy `permission` field; the worker checks `role_name === 'admin' || role_name === 'maintain'`.
+6. For every administrative action, the frontend requires interactive **fresh GitHub reauthentication (Option A)**, producing an ephemeral token verified and immediately purged by the worker.
 
 ---
 
@@ -100,11 +101,12 @@ Before initiating deployment, ensure you possess:
    - **Source:** Select **GitHub Actions**.
 3. Ensure HTTPS is enforced by checking **Enforce HTTPS**.
 4. Publication Verification Architecture:
-   - Modern deployments use `actions/upload-pages-artifact@v3` and `actions/deploy-pages@v4` targeting the `github-pages` environment within the same trusted workflow run (Option A).
-   - The batch worker generates `data/deployment-manifest.json` containing `{ generationId, generationSequence, generatedAt, productCount, schemaVersion: "1.5.0", environment: "github-pages" }` (omitting the Git commit SHA, and accurately recording generation time; deployment timestamps are recorded in Firestore).
+   - Deployments use the **least-privilege split-job architecture** (`build-and-commit` and `deploy-to-pages`) targeting the `github-pages` environment within the same trusted workflow run (Option A).
+   - The batch worker generates `data/deployment-manifest.json` containing `{ generationId, generationSequence, generatedAt, catalogDigest, productCount, schemaVersion: "1.6.0", environment: "github-pages" }`.
    - The worker commits to `main`, captures `catalogCommitSha` via `git rev-parse HEAD`, records the generation in Firestore `/system_deployments/{generationId}`, and queries the dedicated GitHub Pages deployment endpoint `GET /repos/Rohitpvt/GitStore/pages/deployments/{pages_deployment_id}` for status `"succeed"`.
-   - In case of a worker crash post-push before Firestore update, the startup reconciler recovers the SHA via `git log -n 10` and `git show` blob inspection with disambiguation.
-   - Finally, the worker performs a public HTTP check on `https://rohitpvt.github.io/GitStore/data/deployment-manifest.json` confirming `generationId` and monotonic `generationSequence` before finalizing database status to `published`.
+   - In case of a worker crash post-push before Firestore update, the startup reconciler recovers the SHA via full-history search on `origin/main` (`git log` and GitHub Commits API), proves branch ancestry via `git merge-base --is-ancestor`, and matches the deterministic `catalogDigest`.
+   - Missing Pages deployment IDs are deterministically resolved across Cases A, B, C, and D.
+   - Public HTTP checks on `https://rohitpvt.github.io/GitStore/data/deployment-manifest.json` confirm `generationId`, `generationSequence`, and `catalogDigest` before finalizing database status to `published` and advancing durable revisions in `/system_config/catalog_state`.
 
 ---
 
@@ -128,9 +130,9 @@ firebase deploy --only firestore:indexes
 
 ---
 
-## 6. Step 5: Automating GitHub Actions Batch Processor
+## 6. Step 5: Automating Least-Privilege Split-Job GitHub Actions Batch Processor
 
-Verify that `.github/workflows/batch-processor.yml` is enabled with least privilege permissions and environment concurrency:
+Verify that `.github/workflows/batch-processor.yml` is enabled with least-privilege job permissions, environment concurrency, and isolated staging into `site/`:
 
 ```yaml
 name: GitStore Batch Processor
@@ -141,36 +143,33 @@ on:
     - cron: '*/10 * * * *'
   workflow_dispatch: # Allows manual trigger from Actions tab by collaborators
 
-permissions:
-  contents: write        # Required for committing static catalog and manifest
-  pages: write           # Required for minting GitHub Pages deployment artifacts
-  id-token: write        # Required for OpenID Connect (OIDC) token minting
-  metadata: read         # Required for inspecting collaborator permissions
-
 concurrency:
   group: 'github-pages'
   cancel-in-progress: false
 
 jobs:
-  build-commit-and-deploy:
+  # ---------------------------------------------------------------------------
+  # Job 1: Build, Validate, Compile & Commit Static Catalog Assets
+  # ---------------------------------------------------------------------------
+  build-and-commit:
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
+    if: github.repository == 'Rohitpvt/GitStore' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write        # Required for git push of compiled static catalog and manifest
+      metadata: read         # Required for inspecting repository metadata and permissions
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      - name: Checkout Repository (Unshallow)
+        uses: actions/checkout@v7
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Setup Node.js Runtime
+        uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 24
 
-      - name: Run Reconciliation, Verification & Static Catalog Compilation
+      - name: Reconcile, Validate Submissions & Compile Catalog
         env:
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -178,6 +177,13 @@ jobs:
           CANONICAL_REPOSITORY: ${{ github.repository }}
         run: |
           node scripts/processor/index.js
+
+      - name: Stage Public Files into Isolated site/ Directory
+        run: |
+          mkdir -p site/data site/assets
+          cp index.html admin.html dashboard.html submit.html product.html site/
+          cp -r assets/* site/assets/
+          cp -r data/* site/data/
 
       - name: Commit & Push Catalog to Main
         run: |
@@ -188,20 +194,47 @@ jobs:
           git push origin main
           echo "CATALOG_SHA=$(git rev-parse HEAD)" >> $GITHUB_ENV
 
-      - name: Package Pages Artifact
-        uses: actions/upload-pages-artifact@v3
+      - name: Upload Pages Staging Artifact
+        uses: actions/upload-pages-artifact@v5
         with:
-          path: .
+          path: site/
 
-      - name: Deploy to GitHub Pages (Option A: Same Trusted Run)
-        id: deploy
-        uses: actions/deploy-pages@v4
+  # ---------------------------------------------------------------------------
+  # Job 2: Deploy to GitHub Pages & Reconcile Firestore Database
+  # ---------------------------------------------------------------------------
+  deploy-to-pages:
+    needs: build-and-commit
+    runs-on: ubuntu-latest
+    if: github.repository == 'Rohitpvt/GitStore' && github.ref == 'refs/heads/main'
+    permissions:
+      pages: write           # Required for GitHub Pages deployment
+      id-token: write        # Required for OpenID Connect (OIDC) token minting
+      contents: read         # Read-only repository access
+      metadata: read         # Repository metadata access
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout Repository for Reconciler Scripts
+        uses: actions/checkout@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
 
-      - name: Finalize Published Status in Firestore
-        if: steps.deploy.outcome == 'success'
+      - name: Setup Node.js Runtime
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Deploy Artifact to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
+
+      - name: Reconcile & Finalize Firestore Status
+        if: steps.deployment.outcome == 'success'
         env:
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
-          CATALOG_SHA: ${{ env.CATALOG_SHA }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           node scripts/processor/finalize-publishing.js
 ```
@@ -218,4 +251,4 @@ Execute these checks after initial deployment:
 3. **Authentication Verification:** Click **[ CONNECT GITHUB ]** and verify that the GitHub OAuth consent screen opens and returns an authenticated user state.
 4. **Submission Ingestion Test:** Submit a test open-source repository and verify that a document appears in Firestore `/submissions` with `status: 'queued'`.
 5. **Batch Worker Execution:** Manually trigger `GitStore Batch Processor` under the GitHub Actions tab and confirm the submission transitions to `needs_review` or `approved`.
-6. **Moderation Queue Execution:** Enqueue an approval from `admin.html` and verify the worker confirms collaborator rights on `Rohitpvt/GitStore`, updates Firestore, and deploys static files.
+6. **Step-Up Moderation Execution:** Enqueue an approval from `admin.html` with interactive step-up reauthentication, and verify the worker verifies the token, purges it, confirms collaborator rights on `Rohitpvt/GitStore`, updates Firestore, and deploys static files.

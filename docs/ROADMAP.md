@@ -1,7 +1,7 @@
 # GitStore — Strategic Implementation Roadmap
 
-**Document Version:** 1.5.0  
-**Phase:** Phase 0.1.4 — Evidence Alignment, Deployment Recovery & Governance Consistency  
+**Document Version:** 1.6.0  
+**Phase:** Phase 0.1.5 — Final Security Rules, Administrator Step-Up Authentication & Deployment Recovery Audit  
 **Status:** Approved Master Roadmap (Synchronized with `PHASE_PLAN.md`)  
 **Single Source of Execution Truth:** [`PHASE_PLAN.md`](./PHASE_PLAN.md)
 
@@ -20,8 +20,9 @@ gantt
     Phase 0.1: Architecture Hardening & Plan:done, p0_1, 2026-10-30, 1d
     Phase 0.1.3: Deployment & Admin Security :done, p0_1_3, 2026-10-30, 1d
     Phase 0.1.4: Evidence & Deployment Recovery :done, p0_1_4, 2026-10-30, 1d
+    Phase 0.1.5: Security Rules, Step-Up & Recovery :done, p0_1_5, 2026-11-03, 1d
     section Phase 1 & 2
-    Phase 1: Frontend Core Foundation (Mock):active, p1, 2026-11-01, 7d
+    Phase 1: Frontend Core Foundation (Mock):active, p1, 2026-11-04, 7d
     Phase 2: Firebase Foundation & Auth     :p2, after p1, 6d
     section Phase 3 & 4
     Phase 3: Dev Dashboard & Submission     :p3, after p2, 6d
@@ -43,7 +44,8 @@ gantt
 | **Phase 0** | Architecture and Documentation | Core product requirements, dual-platform architecture, 13 baseline docs. | `APPROVED` ✅ |
 | **Phase 0.1** | Architecture Hardening & Validation | Audited admin workflow, issue ownership framework, security rules, `PHASE_PLAN.md`. | `IN_REVIEW` ⏳ |
 | **Phase 0.1.3**| Deployment Integrity, Admin Bootstrap & Workflow Security | Non-circular manifest, Pages status `succeed`, Option A single workflow, admin bootstrap, event security matrix, claim whitelisting, monotonic sequencing. | `COMPLETED` ✅ |
-| **Phase 0.1.4**| Evidence Alignment, Deployment Recovery & Governance Consistency | Evidence classification matrix, deterministic post-commit SHA recovery, 4-case monotonic sequence matrix, generatedAt manifest, Pages deploy requirements, ID normalization. | `IN_REVIEW` ⏳ (Awaiting Gate) |
+| **Phase 0.1.4**| Evidence Alignment, Deployment Recovery & Governance Consistency | Evidence classification matrix, deterministic post-commit SHA recovery, 4-case monotonic sequence matrix, generatedAt manifest, Pages deploy requirements, ID normalization. | `COMPLETED` ✅ |
+| **Phase 0.1.5**| Final Security Rules, Administrator Step-Up Authentication & Deployment Recovery Audit | Profile separation, private user data lockout, mandatory fresh step-up reauthentication (Option A), 12-state recovery machine, unshallow full-history search, digest verification, Cases A-D recovery, split-job workflow with `@v7`/`@v5` actions, 20-row matrix. | `IN_REVIEW` ⏳ (Awaiting Gate) |
 | **Phase 1** | Frontend Core Foundation | Responsive Vanilla HTML5/CSS3/ES6 static storefront using mock catalogs. | `NOT_STARTED` 🛑 |
 | **Phase 2** | Firebase Foundation and Auth | GitHub OAuth, Passwordless Magic Links, App Check (reCAPTCHA Enterprise), security rules. | `NOT_STARTED` 🛑 |
 | **Phase 3** | Developer Dashboard & Submissions | Submission form wizard, developer management portal, rate limiting. | `NOT_STARTED` 🛑 |
@@ -60,5 +62,5 @@ gantt
 Execution is strictly governed by the rules set forth in [`PHASE_PLAN.md`](./PHASE_PLAN.md):
 1. **One Phase at a Time:** Active implementation occurs strictly on the currently authorized phase.
 2. **Definition of Done (DoD):** Every phase has explicit technical acceptance criteria that must be verified and reported.
-3. **Approval Gates:** A phase being marked `COMPLETED` by Antigravity does **not** grant authorization to begin implementation on the next phase. Explicit user authorization (`APPROVED`) is mandatory.
+3. **Approval Gates:** A phase being marked `COMPLETED` or `IN_REVIEW` by Antigravity does **not** grant authorization to begin implementation on the next phase. Explicit user authorization (`APPROVED`) is mandatory.
 4. **Platform Boundary Enforcement:** No third-party hosting, servers, or frameworks may be introduced at any point.

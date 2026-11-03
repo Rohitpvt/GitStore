@@ -1,7 +1,7 @@
 # GitStore — Authentication Architecture & Identity Specification
 
-**Document Version:** 1.5.0  
-**Phase:** Phase 0.1.4 — Evidence Alignment, Deployment Recovery & Governance Consistency  
+**Document Version:** 1.6.0  
+**Phase:** Phase 0.1.5 — Final Security Rules, Administrator Step-Up Authentication & Deployment Recovery Audit  
 **Status:** Approved Authentication Specification (Hardened & Reconciled)  
 **Provider:** Firebase Authentication (v10 Modular SDK)  
 **Host Environment:** GitHub Pages (`https://<org>.github.io/<repo>/`)
@@ -164,11 +164,11 @@ The architecture distinguishes three discrete operations:
    *(Evidence: DOCUMENTATION_VERIFIED via official Firebase App Check v10 SDK documentation; browser runtime auto-refresh behavior is PENDING_INTEGRATION_TEST).*
 3. **Firestore Service Requests:** All queries and mutations attach the cached token in the `X-Firebase-AppCheck` header. The Firestore backend validates the token signature locally. **Firestore queries consume 0 additional reCAPTCHA assessments.**
 
-### 5.3 Billing Configuration & "Zero Surprise Bills" Conditions
+### 5.3 Billing Configuration & Free-Tier Operating Target
 > [!IMPORTANT]
-> The guarantee of "Zero surprise bills" holds **strictly and only when NO Google Cloud / Firebase billing account (Blaze plan) is attached to the project.**
+> GitStore targets operation within published free limits under the Firebase Spark Plan **strictly without an attached billing account.**
 - Under the no-cost **Spark Plan** without an attached billing account, exceeding the 10,000 monthly assessments causes reCAPTCHA Enterprise to return HTTP 429 (`RESOURCE_EXHAUSTED`). Token acquisition fails and subsequent unverified Firestore writes are rejected, but zero financial charges are incurred.
-- If a billing account is linked, assessments beyond 10,000 automatically incur charges ($1 per 1,000). GitStore strictly enforces the Spark no-billing configuration.
+- If a billing account is linked, assessments beyond 10,000 automatically incur charges ($1 per 1,000). GitStore strictly operates under the Spark no-billing configuration.
 
 ### 5.4 The Lazy-Loading Architecture & Usage Estimates
 - **Storefront Visitors:** Browse static catalogs (`data/catalog.json`) served directly by GitHub Pages. They make **0 Firestore requests** and **do NOT initialize App Check**.
@@ -182,10 +182,6 @@ The architecture distinguishes three discrete operations:
   - Assumes average session duration of 30 minutes with token caching (1 token acquisition per session).
   - Projected Monthly Assessments: $\approx 200 - 1,000$ assessments/month (2% to 10% of the 10,000 free monthly quota).
   - *All estimates are engineering projections, not measured production telemetry.*
-
-### 5.5 Phased Enforcement Strategy
-- **Phase 2 (Integration):** App Check initialized in **metrics/monitoring mode** (tokens validated, but unverified requests are not dropped).
-- **Phase 6 (Pre-Launch QA):** App Check switched to **strict enforcement** only after verifying zero false-positive dropouts.
 
 ---
 
@@ -218,3 +214,76 @@ Repository ownership of `Rohitpvt/GitStore` alone does not authenticate the pers
 7. **Recovery & Emergency Revocation:**
    - If an administrator account is compromised, the repository owner revokes repository collaborator privileges on GitHub and calls `admin.auth().revokeRefreshTokens(uid)` via the Admin SDK.
    - Dynamic real-time collaborator checks on each batch run ensure immediate revocation without waiting for cached credentials to expire.
+
+---
+
+## 7. Mandatory Fresh GitHub Step-Up Reauthentication (Option A)
+
+To eliminate the risks of stolen session tokens, cross-tab session hijacking, or unauthorized administrative actions performed through linked email accounts, GitStore enforces **Mandatory Fresh GitHub Step-Up Reauthentication (Option A)** for all privileged operations (`APPROVE_SUBMISSION`, `REJECT_SUBMISSION`, `VERIFY_DEVELOPER`, `REVOKE_DEVELOPER`, `DELIST_PRODUCT`, `FEATURE_PRODUCT`):
+
+### 7.1 Interactive Step-Up Challenge Flow
+1. When an administrator initiates a moderation action on `admin.html`, the client triggers:
+   ```javascript
+   import { getAuth, GithubAuthProvider, reauthenticateWithPopup } from 'firebase/auth';
+
+   const auth = getAuth();
+   const provider = new GithubAuthProvider();
+   provider.addScope('read:user');
+
+   // Forces interactive GitHub authentication popup
+   const result = await reauthenticateWithPopup(auth.currentUser, provider);
+   const credential = GithubAuthProvider.credentialFromResult(result);
+   const ephemeralGithubToken = credential.accessToken;
+   const issuedAt = new Date();
+   const expiresAt = new Date(issuedAt.getTime() + 300 * 1000); // 300 seconds (5 min) window
+   const actionNonce = crypto.randomUUID().replace(/-/g, '') + crypto.randomUUID().replace(/-/g, '');
+   ```
+
+2. **Security Rules Freshness Gate:**
+   Firestore Security Rules evaluate the `auth_time` claim within the Firebase ID token:
+   ```javascript
+   function isFreshlyAuthenticated() {
+     return request.auth != null 
+       && request.auth.token.auth_time != null
+       && ((request.time.toMillis() / 1000) - request.auth.token.auth_time < 300);
+   }
+
+   match /moderation_requests/{requestId} {
+     allow create: if isFreshlyAuthenticated()
+       && request.resource.data.keys().hasOnly(['requestId', 'action', 'targetId', 'payload', 'requestedByUid', 'stepUpProof', 'status', 'createdAt'])
+       && request.resource.data.requestId == requestId
+       && request.resource.data.requestedByUid == request.auth.uid
+       && request.resource.data.stepUpProof.providerId == 'github.com'
+       && request.resource.data.stepUpProof.ephemeralGithubToken is string
+       && request.resource.data.stepUpProof.ephemeralGithubToken.size() > 0
+       && request.resource.data.status == 'pending'
+       && request.resource.data.createdAt == request.time;
+     allow update, delete: if false;
+   }
+   ```
+
+3. **Ephemeral Step-Up Proof Verification in Batch Worker:**
+   - Worker retrieves `stepUpProof` from `/moderation_requests/{requestId}`.
+   - Worker checks expiration: `Date.now() <= Date.parse(stepUpProof.expiresAt)`.
+   - Worker queries GitHub's authoritative API using the ephemeral token:
+     `GET https://api.github.com/user` with `Authorization: Bearer ${stepUpProof.ephemeralGithubToken}`.
+   - Worker verifies that the returned numeric user ID (`ghUser.id`) matches `verifiedCallerNumericId`.
+   - Worker verifies canonical repository collaborator permissions (`Rohitpvt/GitStore`).
+
+4. **Immediate Token Destruction & Anti-Replay Invariant:**
+   - In the same atomic Firestore update transitioning the request to `processing`, the worker **immediately deletes `ephemeralGithubToken`**:
+     ```javascript
+     await db.collection('moderation_requests').doc(requestId).update({
+       'stepUpProof.ephemeralGithubToken': admin.firestore.FieldValue.delete(),
+       'stepUpProof.consumedAt': new Date().toISOString(),
+       'stepUpProof.workerRunId': String(process.env.GITHUB_RUN_ID),
+       status: 'processing'
+     });
+     ```
+   - Zero raw tokens are retained in persistent database records.
+   - Any replay attempt lacking the token or with an existing `consumedAt` timestamp fails closed immediately.
+
+5. **Technical Boundaries & Limitations:**
+   - Firebase Auth ID tokens carry Firebase cryptographic signatures asserting claims, but do not contain arbitrary third-party cryptographic signatures from GitHub.
+   - Client browsers cannot sign arbitrary payloads with GitHub credentials without an interactive OAuth flow.
+   - Option A cleanly bridges this by combining Firebase Auth's built-in `auth_time` freshness claim with an ephemeral, single-use GitHub OAuth access token verified directly via GitHub REST API by the worker and destroyed immediately upon consumption.
