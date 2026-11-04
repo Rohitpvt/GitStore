@@ -1,7 +1,7 @@
 # GitStore — Comprehensive Testing Strategy
 
 **Document Version:** 1.9.0  
-**Phase:** Phase 0.1.8 — Node 24 Workflow Compatibility, Artifact Provenance & Transactional Deployment Integrity  
+**Phase:** Phase 0.1.9 — Workflow Validation, Recovery SHA Preservation & Durable Finalization Recovery  
 **Status:** IN_REVIEW — Awaiting Explicit User Approval  
 
 ---
@@ -150,29 +150,36 @@ describe('Deterministic Recursive Canonical Digest Tests', () => {
 - **EMPTY_SEARCH Assertion:** Mock all commit pages returning 0 matches with zero API errors. Assert worker marks generation `failed` with `commit_not_found_on_remote`.
 
 ### 5.4 Single Authoritative Staging & Case B Provenance Tests
-- **Case B Recovery Staging:**
+- **Case B Recovery Staging & SHA Preservation:**
   - Mock Pages returning 404. Worker extracts files from `gen.catalogCommitSha` directly into `site/`.
-  - Recomputes `stagedDigest = computeCatalogDigest('site')`.
+  - Recomputes `stagedDigest = computeCatalogDigest('site/data')`.
   - Assert: `stagedDigest === gen.catalogDigest`.
+  - Output assertion: Worker exports `commit_needed = 'false'`, `deploy_needed = 'true'`, and exports the exact recovered `catalog_commit_sha` unchanged (never replaced by workspace `git rev-parse HEAD`).
 - **Staged Digest Mismatch Abort:**
   - Corrupt a file in `site/data/catalog.json`.
   - Assert: Worker detects mismatch, deletes `site/`, and aborts deployment.
 - **Zero Post-Staging Copies:** Assert workflow executes zero copy commands from workspace root into `site/` after staging completes.
 
 ### 5.5 Explicit `$GITHUB_OUTPUT` Bridge Tests
-- **Output Export:** Execute `emitStepOutput('deploy_needed', 'true')` with mock `GITHUB_OUTPUT` file. Read file; assert content equals `deploy_needed=true\n`.
+- **Output Export:** Execute `emitStepOutput('deploy_needed', 'true')` and `emitStepOutput('commit_needed', 'false')` with mock `GITHUB_OUTPUT` file. Read file; assert content matches expected lines.
 - **Newline Injection Defense:** Call `emitStepOutput('key', 'val\nattack=true')`. Assert throws security error.
 
-### 5.6 2-Tier Transactional Finalization & Write Limit Tests
+### 5.6 2-Tier Transactional Finalization & Durable Fan-Out Recovery Tests
 - **Tier 1 (Atomic Anchor):**
   - Transaction reads `catalog_state`, `deployment_state`, and `system_deployments/{id}` before any writes.
   - Evaluates `evaluateGenerationOrdering`.
-  - Assert: Exactly 3 writes committed in transaction.
+  - Assert: Exactly 3 writes committed in transaction; marks `status: 'published'`, `reconciliationStatus: 'fanout_pending'`, `submissionFanoutStatus: 'pending'`.
 - **Stale Abort:** If candidate `capturedRevision < catalogState.latestPublishedRevision`, transaction throws immediately. Generation marked `stale_aborted`.
-- **Tier 2 (Batched Status Fan-Out):**
-  - Mock generation with 550 expected products.
-  - Assert: Worker splits updates into 2 batches (batch 1: 400 docs, batch 2: 150 docs), strictly respecting the Firestore 500-write limit.
-  - Idempotent Retry: Re-running status fan-out for already published submissions completes without re-advancing published sequence.
+- **Tier 2 (Independently Recoverable Fan-Out Tests across 8 Failure Modes):**
+  1. *Crash before first batch:* Initial state `submissionFanoutStatus: 'pending'`, cursor 0. Reconciler discovers via Query 2, processes batch 1 (0..399), advances cursor to 400.
+  2. *Crash after first successful batch commit:* Batch 1 commits in Firestore, but crash occurs before cursor update. Next run reads cursor 0, re-executes batch 1 idempotently (`status: 'published'`), and updates cursor to 400 without data corruption.
+  3. *Crash after cursor update:* Cursor recorded as 400. Next run skips 0..399 entirely and processes chunk 400..799.
+  4. *Crash after intermediate batch:* Resumes from last committed cursor.
+  5. *Failure in later batch:* Transient Firestore error stops loop; cursor preserved at last committed batch; retried next cycle.
+  6. *Duplicate worker execution:* Concurrency group prevents overlap; idempotent batch writes ensure duplicate runs produce identical state.
+  7. *Generation superseded:* Older approved submissions still marked `published` without corrupting newer generation sequences.
+  8. *Max Retries & Manual Review Fallback:* After 5 consecutive failed fan-out attempts, generation transitions to `submissionFanoutStatus: 'manual_review'`, `reconciliationStatus: 'manual_review'`, and writes alert entry to `/admin_logs`.
+- **Firestore 500-Write Limit Adherence:** Mock generation with 550 expected submissions (`expectedSubmissionIds`). Assert: Worker splits updates into 2 batches (batch 1: 400 docs, batch 2: 150 docs), strictly respecting the Firestore 500-write limit.
 
 ---
 

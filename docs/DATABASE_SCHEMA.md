@@ -1,7 +1,7 @@
 # GitStore — Cloud Firestore Database Schema & Data Architecture
 
 **Document Version:** 1.9.0  
-**Phase:** Phase 0.1.8 — Node 24 Workflow Compatibility, Artifact Provenance & Transactional Deployment Integrity  
+**Phase:** Phase 0.1.9 — Workflow Validation, Recovery SHA Preservation & Durable Finalization Recovery  
 **Status:** IN_REVIEW — Awaiting Explicit User Approval  
 **Database:** Google Cloud Firestore (Native Mode)
 
@@ -345,7 +345,7 @@ interface ProductDocument {
 ### 2.8 Collection: `system_deployments` (Internal Tracking)
 - **Path:** `/system_deployments/{generationId}`
 - **Document ID:** `generationId` (e.g., `gen_1730635200000_a1b2c3d4`).
-- **Description:** Tracks compilation generations, commit provenance, staged digest validation, and deployment verification.
+- **Description:** Tracks compilation generations, commit provenance, staged digest validation, deployment verification, and independently recoverable submission fan-out.
 - **Client Access:** `allow read, write: if false;` (Internal collection; Admin SDK only).
 
 ```typescript
@@ -356,12 +356,21 @@ interface SystemDeploymentDocument {
   finalizedRevision?: number | null; // Revision confirmed at publication finalization
   catalogCommitSha: string | null;   // 40-char git commit SHA on origin/main
   catalogDigest: string;             // Expected canonical digest (sha256:v1:...)
-  stagedDigest?: string | null;      // Digest recomputed from staged site/ files
+  stagedDigest?: string | null;      // Digest recomputed from staged site/data files
   pagesDeploymentReference: string | number | null; // Numeric ID or commit SHA reference
-  status: 'pending' | 'catalog_committed' | 'deploying' | 'published' | 'failed' | 'stale_aborted' | 'deployment_retained';
-  reconciliationStatus: 'none' | 'sha_recovered' | 'pages_dispatched' | 'pending_retry' | 'reconciled' | 'abandoned';
+  status: 'pending' | 'catalog_committed' | 'deploying' | 'published' | 'finalized' | 'failed' | 'stale_aborted' | 'deployment_retained';
+  reconciliationStatus: 'none' | 'sha_recovered' | 'pages_dispatched' | 'pending_retry' | 'fanout_pending' | 'reconciled' | 'manual_review' | 'abandoned';
   lastObservedPagesStatus: 'succeed' | 'queued' | 'in_progress' | 'errored' | null;
-  expectedProductIds: string[];
+
+  // Independently Recoverable Submission Fan-Out State
+  submissionFanoutStatus: 'pending' | 'in_progress' | 'completed' | 'manual_review';
+  expectedSubmissionIds: string[];   // Renamed from expectedProductIds; array of /submissions/{id} document IDs
+  completedSubmissionCount: number;  // Number of submissions confirmed updated
+  submissionFanoutCursor: number;    // Array index for resumption across batch boundaries
+  fanoutAttempts: number;            // Number of fan-out execution attempts
+  lastFanoutAttemptAt?: FirebaseFirestore.Timestamp | null;
+  lastFanoutError?: string | null;
+
   attemptCount: number;
   createdAt: FirebaseFirestore.Timestamp;
   publishedAt?: FirebaseFirestore.Timestamp | null;
@@ -628,7 +637,7 @@ async function reconcilePublishedState(db, octokit, pagesUrl) {
           execSync(`rm -rf site/ && mkdir -p site/data site/assets`);
           execSync(`git archive ${gen.catalogCommitSha} index.html admin.html dashboard.html submit.html product.html explore.html assets data | tar -x -C site/`);
           
-          const stagedDigest = computeCatalogDigest('site');
+          const stagedDigest = computeCatalogDigest('site/data');
           if (stagedDigest !== gen.catalogDigest) {
             throw new Error(`STAGED_DIGEST_MISMATCH: staged ${stagedDigest} !== expected ${gen.catalogDigest}`);
           }
@@ -640,6 +649,7 @@ async function reconcilePublishedState(db, octokit, pagesUrl) {
           });
 
           handoffResult = {
+            commitNeeded: false,
             deployNeeded: true,
             generationId: gen.generationId,
             generationSequence: gen.generationSequence,
@@ -647,6 +657,13 @@ async function reconcilePublishedState(db, octokit, pagesUrl) {
             catalogDigest: gen.catalogDigest,
             capturedRevision: gen.capturedRevision
           };
+          emitStepOutput('commit_needed', 'false');
+          emitStepOutput('deploy_needed', 'true');
+          emitStepOutput('generation_id', gen.generationId);
+          emitStepOutput('generation_sequence', gen.generationSequence);
+          emitStepOutput('catalog_commit_sha', gen.catalogCommitSha);
+          emitStepOutput('catalog_digest', gen.catalogDigest);
+          emitStepOutput('captured_revision', gen.capturedRevision);
           return handoffResult;
         } catch (recoverErr) {
           console.error(`[Reconciler] Case B recovery failed: ${recoverErr.message}`);
@@ -740,33 +757,22 @@ async function reconcilePublishedState(db, octokit, pagesUrl) {
             updatedAt: new Date()
           }, { merge: true });
 
-          // WRITE 3: Finalize system_deployments record
+          // WRITE 3: Advance system_deployments record to published (with fan-out pending)
           transaction.update(genRef, {
             status: 'published',
-            reconciliationStatus: 'reconciled',
+            reconciliationStatus: 'fanout_pending',
+            submissionFanoutStatus: 'pending',
+            submissionFanoutCursor: 0,
+            completedSubmissionCount: 0,
+            fanoutAttempts: 0,
             finalizedRevision: nextPublishedRev,
             verifiedAt: new Date(),
-            finalizedAt: new Date(),
             updatedAt: new Date()
           });
         });
 
-        // TIER 2: Idempotent Submission Status Fan-Out (Batched writes, max 400 docs/batch)
-        const CHUNK_SIZE = 400;
-        for (let i = 0; i < gen.expectedProductIds.length; i += CHUNK_SIZE) {
-          const chunk = gen.expectedProductIds.slice(i, i + CHUNK_SIZE);
-          const batch = db.batch();
-          for (const subId of chunk) {
-            const subRef = db.collection('submissions').doc(subId);
-            batch.update(subRef, {
-              status: 'published',
-              publishedGenerationId: gen.generationId,
-              'processingLease.leaseHolder': null,
-              updatedAt: new Date()
-            });
-          }
-          await batch.commit();
-        }
+        // TIER 2: Execute Independently Recoverable Submission Status Fan-Out
+        await executeSubmissionFanout(db, genDoc.ref, gen);
 
       } catch (err) {
         if (err.message && (err.message.includes('STALE_GENERATION_ABORT') || err.message.includes('STALE_REVISION_ABORT'))) {
@@ -778,6 +784,117 @@ async function reconcilePublishedState(db, octokit, pagesUrl) {
       }
     }
   }
+
+  // 5. Query published generations with incomplete submission fan-out (Durable Fan-Out Recovery)
+  const pendingFanoutGenerations = await db.collection('system_deployments')
+    .where('status', '==', 'published')
+    .where('submissionFanoutStatus', 'in', ['pending', 'in_progress'])
+    .get();
+
+  for (const fanoutDoc of pendingFanoutGenerations.docs) {
+    const fanoutGen = fanoutDoc.data();
+    console.log(`[Reconciler] Resuming incomplete submission fan-out for generation ${fanoutGen.generationId} from cursor ${fanoutGen.submissionFanoutCursor || 0}`);
+    await executeSubmissionFanout(db, fanoutDoc.ref, fanoutGen);
+  }
+
+  return handoffResult;
+}
+
+/**
+ * Executes or resumes submission status fan-out in idempotent batches of 400 documents.
+ * Guarantees progress persistence and safe resumption across worker crashes.
+ */
+async function executeSubmissionFanout(db, genDocRef, genData) {
+  const CHUNK_SIZE = 400;
+  const submissionIds = genData.expectedSubmissionIds || [];
+  let cursor = genData.submissionFanoutCursor || 0;
+  let completed = genData.completedSubmissionCount || 0;
+  let attempts = (genData.fanoutAttempts || 0) + 1;
+
+  if (cursor >= submissionIds.length) {
+    await genDocRef.update({
+      submissionFanoutStatus: 'completed',
+      reconciliationStatus: 'reconciled',
+      status: 'finalized',
+      finalizedAt: new Date(),
+      updatedAt: new Date()
+    });
+    return;
+  }
+
+  await genDocRef.update({
+    submissionFanoutStatus: 'in_progress',
+    fanoutAttempts: attempts,
+    lastFanoutAttemptAt: new Date(),
+    updatedAt: new Date()
+  });
+
+  try {
+    while (cursor < submissionIds.length) {
+      const chunk = submissionIds.slice(cursor, cursor + CHUNK_SIZE);
+      const batch = db.batch();
+
+      for (const subId of chunk) {
+        const subRef = db.collection('submissions').doc(subId);
+        batch.update(subRef, {
+          status: 'published',
+          publishedGenerationId: genData.generationId,
+          'processingLease.leaseHolder': null,
+          updatedAt: new Date()
+        });
+      }
+
+      // 1. Commit submission batch
+      await batch.commit();
+
+      // 2. Advance cursor atomically after batch success
+      cursor += chunk.length;
+      completed = cursor;
+
+      await genDocRef.update({
+        submissionFanoutCursor: cursor,
+        completedSubmissionCount: completed,
+        updatedAt: new Date()
+      });
+    }
+
+    // 3. Mark generation fully finalized and reconciled
+    await genDocRef.update({
+      submissionFanoutStatus: 'completed',
+      reconciliationStatus: 'reconciled',
+      status: 'finalized',
+      finalizedAt: new Date(),
+      updatedAt: new Date()
+    });
+    console.log(`[Fanout] Submission fan-out successfully completed for generation ${genData.generationId} (${completed} submissions).`);
+
+  } catch (err) {
+    console.error(`[Fanout] Submission fan-out error on generation ${genData.generationId} at cursor ${cursor}: ${err.message}`);
+    if (attempts >= 5) {
+      console.error(`[Fanout] Max retries (5) exceeded. Transitioning generation ${genData.generationId} to manual_review.`);
+      await genDocRef.update({
+        submissionFanoutStatus: 'manual_review',
+        reconciliationStatus: 'manual_review',
+        lastFanoutError: err.message,
+        updatedAt: new Date()
+      });
+      await db.collection('admin_logs').add({
+        action: 'SUBMISSION_FANOUT_FAILED',
+        generationId: genData.generationId,
+        cursor: cursor,
+        attempts: attempts,
+        error: err.message,
+        createdAt: new Date()
+      });
+    } else {
+      await genDocRef.update({
+        lastFanoutError: err.message,
+        updatedAt: new Date()
+      });
+    }
+    throw err;
+  }
+}
 
   return handoffResult;
 }

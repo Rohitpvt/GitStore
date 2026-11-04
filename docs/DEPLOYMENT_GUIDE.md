@@ -1,7 +1,7 @@
 # GitStore — Comprehensive Deployment & Operations Guide
 
 **Document Version:** 1.9.0  
-**Phase:** Phase 0.1.8 — Node 24 Workflow Compatibility, Artifact Provenance & Transactional Deployment Integrity  
+**Phase:** Phase 0.1.9 — Workflow Validation, Recovery SHA Preservation & Durable Finalization Recovery  
 **Status:** IN_REVIEW — Awaiting Explicit User Approval  
 **Target Environments:** GitHub (Pages & Actions) and Firebase (Auth, Firestore, App Check)
 
@@ -159,14 +159,14 @@ jobs:
     if: github.repository == 'Rohitpvt/GitStore' && github.ref == 'refs/heads/main'
     permissions:
       contents: write        # Required for git push of compiled static catalog and manifest
-      metadata: read         # Required for inspecting repository metadata and permissions
     outputs:
       generation_id: ${{ steps.catalog.outputs.generation_id }}
       generation_sequence: ${{ steps.catalog.outputs.generation_sequence }}
-      catalog_commit_sha: ${{ steps.commit.outputs.commit_sha || steps.catalog.outputs.catalog_commit_sha }}
+      catalog_commit_sha: ${{ steps.resolve-sha.outputs.deploy_commit_sha }}
       catalog_digest: ${{ steps.catalog.outputs.catalog_digest }}
       captured_revision: ${{ steps.catalog.outputs.captured_revision }}
       deploy_needed: ${{ steps.catalog.outputs.deploy_needed }}
+      commit_needed: ${{ steps.catalog.outputs.commit_needed }}
     steps:
       - name: Checkout Repository (Unshallow)
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0 (Node 24)
@@ -191,14 +191,35 @@ jobs:
 
       - name: Commit & Push Catalog to Main
         id: commit
-        if: steps.catalog.outputs.deploy_needed == 'true'
+        if: steps.catalog.outputs.commit_needed == 'true'
         run: |
           git config user.name "gitstore-bot"
           git config user.email "bot@gitstore.dev"
           git add data/
           git diff-index --quiet HEAD || git commit -m "chore(catalog): publish static catalog [skip ci]"
           git push origin main
-          echo "commit_sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+          NEW_SHA=$(git rev-parse HEAD)
+          echo "new_commit_sha=${NEW_SHA}" >> $GITHUB_OUTPUT
+
+      - name: Resolve Deployment Commit SHA
+        id: resolve-sha
+        if: steps.catalog.outputs.deploy_needed == 'true'
+        run: |
+          if [ "${{ steps.catalog.outputs.commit_needed }}" = "true" ]; then
+            DEPLOY_SHA="${{ steps.commit.outputs.new_commit_sha }}"
+            if [ -z "$DEPLOY_SHA" ] || [ ${#DEPLOY_SHA} -ne 40 ]; then
+              echo "::error::New generation commit SHA is invalid or empty!"
+              exit 1
+            fi
+            echo "deploy_commit_sha=${DEPLOY_SHA}" >> $GITHUB_OUTPUT
+          else
+            DEPLOY_SHA="${{ steps.catalog.outputs.catalog_commit_sha }}"
+            if [ -z "$DEPLOY_SHA" ] || [ ${#DEPLOY_SHA} -ne 40 ]; then
+              echo "::error::Case B recovered commit SHA is invalid or empty!"
+              exit 1
+            fi
+            echo "deploy_commit_sha=${DEPLOY_SHA}" >> $GITHUB_OUTPUT
+          fi
 
       - name: Upload Pages Staging Artifact
         if: steps.catalog.outputs.deploy_needed == 'true'
@@ -217,7 +238,6 @@ jobs:
       pages: write           # Required for GitHub Pages deployment
       id-token: write        # Required for OpenID Connect (OIDC) token minting
       contents: read         # Read-only repository access
-      metadata: read         # Repository metadata access
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -259,6 +279,61 @@ jobs:
 ```
 
 *(Evidence Classification: Workflow design and action versions are DOCUMENTATION_VERIFIED; live execution on the repository is PENDING_INTEGRATION_TEST).*
+
+### 6.1 Official GitHub Actions Permission Reference
+
+GitHub Actions enforces strict least-privilege token access via the top-level or job-level `permissions:` map. Unsupported permission keys are rejected during workflow schema validation:
+
+| Permission Key | Value | Purpose | Assigned Job | Official Documentation Source |
+|---|---|---|---|---|
+| `contents` | `write` | Pushes compiled catalog JSON and deployment manifest to `main`. | `build-and-commit` | GitHub Docs: Automatic token authentication / Permissions for the GITHUB_TOKEN |
+| `pages` | `write` | Creates and deploys GitHub Pages release packages via Pages API. | `deploy-to-pages` | GitHub Docs: Using environments for deployment / Pages permissions |
+| `id-token` | `write` | Mints OIDC JWT for GitHub Pages deployment service authentication. | `deploy-to-pages` | GitHub Docs: OpenID Connect in GitHub Actions |
+| `contents` | `read` | Read-only repository checkout for guard scripts. | `deploy-to-pages` | GitHub Docs: Permissions for the GITHUB_TOKEN |
+
+> [!IMPORTANT]
+> **Resolution of `metadata: read`:** GitHub's configurable `GITHUB_TOKEN` permission schema does **not** include `metadata` as a configurable key. In GitHub Actions, read access to repository metadata (commits, refs, and repository properties) is implicitly and unconditionally granted to `GITHUB_TOKEN` by default. Attempting to explicitly specify `metadata: read` in the `permissions:` block causes workflow parser failure with `Unexpected value 'metadata'`. It has been completely purged from all workflow definitions.
+>
+> **Distinction from `artifact-metadata`:** `artifact-metadata` is not a configurable workflow permission key in GitHub Actions. Actions artifact APIs operate over internal runner tokens; no `artifact-metadata` permission exists or is required.
+>
+> **Validation Notice:** Permissions syntax conforms to GitHub Actions workflow schema documentation. No live YAML validator was executed against a live GitHub Actions runner since no live workflow file is deployed on disk yet (documentation-only scope).
+
+### 6.2 Verified Action Release Metadata & Dependencies
+
+All actions are pinned to immutable 40-character commit SHAs. Metadata and dependencies have been verified against upstream repositories:
+
+| Action | Tag | Pinned 40-Character Commit SHA | Runtime Type | Nested Dependencies | Minimum Runner | Upstream Status & Version Retention Justification |
+|---|---|---|---|---|---|---|
+| `actions/checkout` | `v5.0.0` | `08c6903cd8c0fde910a37f88322edcfb5dd907a8` | `runs.using: 'node24'` | None (native Node 24) | `>= v2.327.1` | **Retained v5:** While `v6.x` exists, it altered `persist-credentials` storage from `.git/config` to `$RUNNER_TEMP`, required runner `>= v2.329.0`, and migrated to ESM. `v5.0.0` provides stable Node 24 execution while preserving `.git/config` credentials required by native git commands (`git push origin main`) without breaking changes. |
+| `actions/setup-node` | `v7.1.0` | `949feb2413d6458794dcd2491c4babbbce0c15c1` | `runs.using: 'node24'` | None (native Node 24) | `>= v2.327.1` | Configures Node.js 24.x environment for processor and finalization scripts. |
+| `actions/upload-pages-artifact` | `v5.0.0` | `fc324d3547104276b827a68afc52ff2a11cc49c9` | `runs.using: 'composite'` | GNU/BSD tar + `actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1` | `>= v2.327.1` | **Dependency Correction:** Internally delegates to `actions/upload-artifact@v7.0.1` (NOT `v4`). Packages `site/` into `artifact.tar` under `$RUNNER_TEMP`. |
+| `actions/deploy-pages` | `v5.0.1` | `368f82528645a54fb793d4d04e342629a3f51346` | `runs.using: 'node24'` | None (native Node 24) | `>= v2.327.1` | Native Node 24 deployment to GitHub Pages via OpenID Connect (OIDC). |
+
+### 6.3 Canonical Catalog Digest Input Contract (`computeCatalogDigest`)
+
+The catalog digest provides deterministic cryptographic proof of the public store contents. To prevent scope drift and circular dependencies:
+
+```javascript
+/**
+ * Computes canonical SHA-256 digest over authoritative catalog JSON files.
+ * @param {string} catalogDataRoot - Root directory containing catalog data ('data' or 'site/data')
+ * @returns {string} Deterministic digest formatted as 'sha256:v1:{hex}'
+ */
+export function computeCatalogDigest(catalogDataRoot) {
+  // Canonical file inclusion list (relative to catalogDataRoot):
+  // 1. catalog.json
+  // 2. categories.json
+  // 3. products/*.json (sorted lexicographically by filename)
+  //
+  // Explicitly EXCLUDED files:
+  // - deployment-manifest.json (prevents circular hash dependency)
+  // - HTML pages, CSS, JS, images, temporary or metadata files
+}
+```
+
+- **Normal Compilation:** Reconciler invokes `computeCatalogDigest('data')`.
+- **Case B Staging:** Reconciler extracts files to `site/` and invokes `computeCatalogDigest('site/data')`.
+- Because both calls evaluate the exact same relative file paths and apply identical JSON canonicalization, `stagedDigest === catalogDigest` is strictly guaranteed without whole-site hash collisions.
 
 ---
 

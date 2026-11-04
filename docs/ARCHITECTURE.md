@@ -1,7 +1,7 @@
 # GitStore — Architecture Specification
 
 **Document Version:** 1.9.0  
-**Phase:** Phase 0.1.8 — Node 24 Workflow Compatibility, Artifact Provenance & Transactional Deployment Integrity  
+**Phase:** Phase 0.1.9 — Workflow Validation, Recovery SHA Preservation & Durable Finalization Recovery  
 **Status:** IN_REVIEW — Awaiting Explicit User Approval  
 
 ---
@@ -198,8 +198,9 @@ Artifact provenance guarantees that every deployed artifact corresponds exactly 
 
 1. **Clean Staging:** The worker purges any existing staging directory: `rm -rf site/ && mkdir -p site/data site/assets`.
 2. **Exact Commit Extraction:** In Case B recovery, static storefront pages and catalog files are extracted directly from the verified commit using `git archive ${gen.catalogCommitSha} ... | tar -x -C site/`.
-3. **Staged Digest Verification:** The worker recomputes `stagedDigest = computeCatalogDigest('site')` from the staged directory and asserts `stagedDigest === gen.catalogDigest`. Any discrepancy immediately deletes `site/` and aborts.
-4. **No Post-Staging Workspace Copies:** The workflow does **not** execute any copy commands from the workspace root into `site/` after staging. The verified staging directory is preserved untouched until upload.
+3. **Canonical Digest Verification:** The worker recomputes `stagedDigest = computeCatalogDigest('site/data')` and asserts `stagedDigest === gen.catalogDigest`. Any discrepancy immediately deletes `site/` and aborts.
+4. **Canonical Digest Contract (`computeCatalogDigest`):** The catalog digest helper takes `catalogDataRoot` (e.g. `'data'` during normal compilation, or `'site/data'` during staging verification). It processes `catalog.json`, `categories.json`, and `products/*.json` (sorted lexicographically by relative path), and strictly excludes `deployment-manifest.json`, HTML, CSS, JS, images, and non-JSON assets.
+5. **No Post-Staging Workspace Copies:** The workflow does **not** execute any copy commands from the workspace root into `site/` after staging. The verified staging directory is preserved untouched until upload.
 
 ---
 
@@ -209,7 +210,10 @@ Artifact provenance guarantees that every deployed artifact corresponds exactly 
 flowchart LR
     subgraph Job1["Job 1: build-and-commit (Node 24)"]
         P1["reconcilePublishedState()"] -->|emitStepOutput()| GO["$GITHUB_OUTPUT"]
-        GO --> O1["outputs:\n- deploy_needed\n- generation_id\n- generation_sequence\n- catalog_commit_sha\n- catalog_digest\n- captured_revision"]
+        GO --> O1["outputs:\n- commit_needed\n- deploy_needed\n- generation_id\n- generation_sequence\n- catalog_commit_sha (resolved)\n- catalog_digest\n- captured_revision"]
+        O1 --> COND_COMMIT{"if: commit_needed == 'true'"}
+        COND_COMMIT --> COMMIT["git commit data/ & git push origin main"]
+        COMMIT --> RESOLVE["resolve-sha step"]
         O1 --> UP["actions/upload-pages-artifact@v5.0.0\n(path: site/)"]
     end
 
@@ -217,9 +221,18 @@ flowchart LR
         O1 -->|needs.build-and-commit.outputs| COND{"if: deploy_needed == 'true'"}
         COND --> GUARD["scripts/processor/pre-deploy-guard.js\n(evaluateGenerationOrdering)"]
         GUARD --> DP["actions/deploy-pages@v5.0.1\n(environment: github-pages)"]
-        DP --> FIN["2-Tier Finalization Transaction\n(with Stale Abort)"]
+        DP --> FIN["2-Tier Finalization & Fan-Out Recovery\n(with Stale Abort & Cursor Resumption)"]
     end
 ```
+
+#### Decision Separation & SHA Preservation Contract
+
+| Scenario | `commit_needed` | `deploy_needed` | Action in Job 1 | Authoritative `catalog_commit_sha` Exported |
+|---|---|---|---|---|
+| **New Catalog Generation** | `true` | `true` | Commits `data/` to `main`, captures `git rev-parse HEAD`. | Newly generated Git commit SHA from `commit` step. |
+| **Case B Recovery** | `false` | `true` | **No commit created.** Staging built from recovered commit. | Recovered commit SHA preserved unchanged. |
+| **Storefront Up-to-Date** | `false` | `false` | No commit or upload. Job 2 skipped. | N/A (`deploy_needed == 'false'`). |
+| **Stale / Conflicted** | `false` | `false` | Aborted. Job 2 skipped. | N/A (`deploy_needed == 'false'`). |
 
 #### Output Adapter Implementation
 ```javascript
@@ -241,24 +254,34 @@ export function emitStepOutput(name, value) {
 
 ---
 
-### 3.5 Interface Contract: Node 24 Action Runtime Compatibility & Action Pinning
+### 3.5 Interface Contract: Node 24 Action Runtime Compatibility & Permissions
 
-Following GitHub's platform-wide removal of Node 20 from hosted runners, all workflow actions are updated to Node 24-compatible major releases and pinned to verified 40-character commit SHAs:
+#### Official GitHub Actions Permissions Configuration
+All unsupported permission keys (including `metadata: read`) are purged from workflow YAML:
 
-| Action Name | Target Release | Verified 40-Character Commit SHA | Runtime Type (`action.yml`) | Minimum Runner Version | Interoperability Notes |
+| Job | Declared Permissions | Purpose | Official Documentation Source |
+|---|---|---|---|
+| `build-and-commit` | `contents: write` | Pushes compiled catalog JSON and manifest to `main`. Repository metadata read is granted implicitly by default. | GitHub Docs: Automatic token authentication / Permissions for the GITHUB_TOKEN |
+| `deploy-to-pages` | `pages: write`<br>`id-token: write`<br>`contents: read` | Creates Pages deployment via API, mints OIDC JWT for authentication, and reads repository files. | GitHub Docs: Using environments for deployment / Pages permissions |
+
+*(Note: YAML permissions syntax conforms to GitHub Actions workflow schema documentation. No live validator was executed against a live runner since the workflow is currently a design specification).*
+
+#### Verified Action Release Metadata & Version Justification
+
+| Action Name | Target Release | Verified 40-Character Commit SHA | Runtime Type (`action.yml`) | Minimum Runner Version | Interoperability & Version Justification |
 |---|---|---|---|---|---|
-| `actions/checkout` | `v5.0.0` | `08c6903cd8c0fde910a37f88322edcfb5dd907a8` | `runs.using: 'node24'` | `v2.327.1` | Native Node 24 runtime. Unshallow fetch enabled. |
+| `actions/checkout` | `v5.0.0` | `08c6903cd8c0fde910a37f88322edcfb5dd907a8` | `runs.using: 'node24'` | `v2.327.1` | **Retained v5 over v6:** `v6.x` altered `persist-credentials` storage from `.git/config` to `$RUNNER_TEMP`, required runner `>= v2.329.0`, and migrated to ESM. `v5.0.0` provides stable Node 24 execution while preserving `.git/config` credentials required by native git commands (`git push origin main`) without breaking changes. |
 | `actions/setup-node` | `v7.1.0` | `949feb2413d6458794dcd2491c4babbbce0c15c1` | `runs.using: 'node24'` | `v2.327.1` | Executes on Node 24; configures project Node 24. |
-| `actions/upload-pages-artifact` | `v5.0.0` | `fc324d3547104276b827a68afc52ff2a11cc49c9` | `runs.using: 'composite'` | `v2.327.1` | Uses `upload-artifact@v4` under the hood. Packages gzip/tar. |
-| `actions/deploy-pages` | `v5.0.1` | `368f82528645a54fb793d4d04e342629a3f51346` | `runs.using: 'node24'` | `v2.327.1` | Native Node 24 runtime. Fully interoperable with upload artifact v5. |
+| `actions/upload-pages-artifact` | `v5.0.0` | `fc324d3547104276b827a68afc52ff2a11cc49c9` | `runs.using: 'composite'` | `v2.327.1` | **Dependency Correction:** Delegates internally to `actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1` (NOT `v4`). Packages `site/` into `artifact.tar`. |
+| `actions/deploy-pages` | `v5.0.1` | `368f82528645a54fb793d4d04e342629a3f51346` | `runs.using: 'node24'` | `v2.327.1` | Native Node 24 deployment to GitHub Pages via OpenID Connect (OIDC). Fully compatible with upload artifact v5. |
 
 *(Evidence Classification: Action metadata and SHAs are DOCUMENTATION_VERIFIED; live execution on `Rohitpvt/GitStore` is PENDING_INTEGRATION_TEST).*
 
 ---
 
-### 3.6 Interface Contract: Transactional Generation Ordering & 2-Tier Finalization
+### 3.6 Interface Contract: Transactional Generation Ordering, 2-Tier Finalization & Fan-Out Recovery
 
-#### 3.6.1 Transactional Pre-Read & Ordering Verification
+#### 3.6.1 Transactional Pre-Read & Ordering Verification (Tier 1)
 Inside `db.runTransaction`:
 1. Read `/system_config/catalog_state`
 2. Read `/system_config/deployment_state`
@@ -275,12 +298,29 @@ Evaluate:
   - Assert `freshGen.capturedRevision <= catalogState.latestRequestedRevision` (future revision anomaly check).
   - Write 1: Update `/system_config/deployment_state`.
   - Write 2: Update `/system_config/catalog_state`.
-  - Write 3: Update `/system_deployments/{generationId}` (`status: 'published'`).
+  - Write 3: Update `/system_deployments/{generationId}` (`status: 'published'`, `reconciliationStatus: 'fanout_pending'`, `submissionFanoutStatus: 'pending'`, `submissionFanoutCursor: 0`, `completedSubmissionCount: 0`).
 
-#### 3.6.2 Safe Handling of Firestore Write Limits (500 Writes)
-- The core transactional anchor commits in **exactly 3 writes**, well below the Firestore 500-write limit.
-- Submission and product publication statuses are updated in **idempotent batched writes** (`db.batch()`), chunked into blocks of 400 documents.
-- If a runner crashes during status fan-out, the startup reconciler identifies that `deployment_state.latestPublishedGenerationId === generationId` and idempotently completes the status fan-out without touching the global publication sequence.
+#### 3.6.2 Independently Recoverable Submission Status Fan-Out (Tier 2)
+To respect Firestore's 500-write limit and prevent submissions from becoming permanently stuck if a worker stops midway:
+- Submission fan-out is tracked independently on the generation document:
+  ```typescript
+  interface SubmissionFanoutState {
+    submissionFanoutStatus: 'pending' | 'in_progress' | 'completed' | 'manual_review';
+    expectedSubmissionIds: string[];   // Renamed from expectedProductIds; contains /submissions/{id} document IDs
+    completedSubmissionCount: number;
+    submissionFanoutCursor: number;
+    fanoutAttempts: number;
+    lastFanoutAttemptAt?: FirebaseFirestore.Timestamp | null;
+    lastFanoutError?: string | null;
+  }
+  ```
+- **Batching & Cursor Tracking:** The worker processes `expectedSubmissionIds` from `submissionFanoutCursor` in blocks of 400 documents (`db.batch()`). After each batch commits, `submissionFanoutCursor` is updated.
+- **Idempotency:** Updating `/submissions/{id}` to `{ status: 'published', publishedGenerationId: gen.generationId }` is strictly idempotent. A crash before cursor recording re-runs the previous batch safely.
+- **Completion & Finalization:** When all submissions are processed, the generation document is marked `submissionFanoutStatus: 'completed'`, `reconciliationStatus: 'reconciled'`, and `status: 'finalized'`.
+- **Manual Review Fallback:** If fan-out fails 5 consecutive times, the generation transitions to `submissionFanoutStatus: 'manual_review'`, and an alert is recorded in `/admin_logs`.
+- **Startup Discovery Queries:**
+  - Incomplete fan-out: `where('status', '==', 'published').where('submissionFanoutStatus', 'in', ['pending', 'in_progress'])`
+  - Manual review required: `where('submissionFanoutStatus', '==', 'manual_review')`
 
 ---
 
@@ -309,14 +349,14 @@ During startup commit recovery, candidate commit inspections on the GitHub Commi
 - **Status:** Accepted (Phase 0.1.8 Reconciled)
 - **Decision:** Admin step-up authentication enforces fresh GitHub credentials (`auth_time < 300s`, `sign_in_provider == 'github.com'`). Zero raw tokens stored. Requests use `requestedByUid` consistently. Firestore Security Rules enforce action-specific payload schemas and target binding. Worker atomically leases requests and reserves nonces in `/consumed_stepup_nonces/{nonceHash}`. `actionHash` classified as client data-integrity checksum.
 
-### ADR-16: 12-State Recovery Machine, Case B Provenance & Error-Classified Commit Recovery
-- **Status:** Accepted (Phase 0.1.8 Reconciled)
-- **Decision:** Dedicated Pages status endpoint verified for `"status": "succeed"`. Case B staging is constructed cleanly from exact source commit, verified via `stagedDigest === catalogDigest`, and protected from subsequent workspace copies. Commits API search implements granular error classification distinguishing `EMPTY_SEARCH` from `INCOMPLETE_SEARCH`.
+### ADR-16: 12-State Recovery Machine, Case B SHA Preservation & Unified Digest Scope
+- **Status:** Accepted (Phase 0.1.9 Reconciled)
+- **Decision:** Dedicated Pages status endpoint verified for `"status": "succeed"`. Case B staging is constructed cleanly from exact source commit and verified via `computeCatalogDigest('site/data') === gen.catalogDigest`. The catalog digest contract (`computeCatalogDigest(catalogDataRoot)`) evaluates `catalog.json`, `categories.json`, and `products/*.json` while strictly excluding `deployment-manifest.json` and static web assets. Commits API search implements granular error classification distinguishing `EMPTY_SEARCH` from `INCOMPLETE_SEARCH`.
 
-### ADR-17: Transactional Generation Ordering & 2-Tier Finalization
-- **Status:** Accepted (Phase 0.1.8 Reconciled)
-- **Decision:** Database finalization transaction reads `catalog_state`, `deployment_state`, and generation record before any writes, evaluating `evaluateGenerationOrdering` and revision monotonicity. Stale generations abort immediately. 2-tier commitment separates 3-write global state anchor from 400-doc batched submission status fan-out to respect the 500-write Firestore limit.
+### ADR-17: Transactional Generation Ordering, 2-Tier Finalization & Durable Fan-Out Recovery
+- **Status:** Accepted (Phase 0.1.9 Reconciled)
+- **Decision:** Database finalization transaction reads `catalog_state`, `deployment_state`, and generation record before any writes, evaluating `evaluateGenerationOrdering` and revision monotonicity. Stale generations abort immediately. 2-tier commitment separates 3-write global state anchor from 400-doc batched submission status fan-out. Submission fan-out is tracked independently (`submissionFanoutStatus`, `submissionFanoutCursor`, `expectedSubmissionIds`) with automatic resumption across crashes and a 5-attempt fallback to `manual_review`.
 
-### ADR-18: Node 24 Workflow Runtimes, Staging Provenance & $GITHUB_OUTPUT Bridge
-- **Status:** Accepted (Phase 0.1.8 Reconciled)
-- **Decision:** GitHub Actions workflow updated to Node 24 releases (`actions/checkout@v5.0.0`, `actions/setup-node@v7.1.0`, `actions/upload-pages-artifact@v5.0.0`, `actions/deploy-pages@v5.0.1`) pinned to 40-character commit SHAs. Staging into `site/` is single and authoritative. Outputs exported via direct append writes to `$GITHUB_OUTPUT`.
+### ADR-18: Valid Actions Permissions, SHA Preservation, Action Metadata & $GITHUB_OUTPUT Bridge
+- **Status:** Accepted (Phase 0.1.9 Reconciled)
+- **Decision:** GitHub Actions workflow permissions strictly purged of unsupported keys (`metadata: read`). Decision flags `commit_needed` and `deploy_needed` are decoupled, preventing Case B recovery from overwriting its recovered commit SHA. Actions release metadata accurately verified: `upload-pages-artifact@v5.0.0` uses `actions/upload-artifact@v7.0.1` internally, and `checkout@v5.0.0` is retained over `v6.x` to preserve standard `.git/config` credential persistence. Outputs exported via direct append writes to `$GITHUB_OUTPUT`.

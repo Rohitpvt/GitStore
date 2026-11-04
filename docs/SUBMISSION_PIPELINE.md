@@ -1,7 +1,7 @@
 # GitStore — Submission Pipeline & Batch Processing Engine
 
 **Document Version:** 1.9.0  
-**Phase:** Phase 0.1.8 — Node 24 Workflow Compatibility, Artifact Provenance & Transactional Deployment Integrity  
+**Phase:** Phase 0.1.9 — Workflow Validation, Recovery SHA Preservation & Durable Finalization Recovery  
 **Status:** IN_REVIEW — Awaiting Explicit User Approval  
 **Execution Engine:** GitHub Actions (`.github/workflows/batch-processor.yml`)
 
@@ -103,7 +103,7 @@ stateDiagram-v2
 In both normal catalog compilation and Case B recovery:
 1. `site/` is completely purged: `rm -rf site/ && mkdir -p site/data site/assets`.
 2. Static storefront pages (`index.html`, `admin.html`, `dashboard.html`, `product.html`, `explore.html`, `submit.html`), `assets/`, and compiled `data/` are staged directly into `site/`. In Case B recovery, assets are extracted directly from the verified source commit via `git archive ${catalogCommitSha} ... | tar -x -C site/`.
-3. The catalog digest is computed directly over the staged directory: `stagedDigest = computeCatalogDigest('site')`.
+3. The catalog digest is computed directly over the staged directory: `stagedDigest = computeCatalogDigest('site/data')`.
 4. Staged digest is asserted: `stagedDigest === gen.catalogDigest`. Mismatch triggers immediate deletion of `site/` and workflow abort.
 5. Zero subsequent workflow steps copy files from the workspace root into `site/`, preserving artifact provenance intact.
 
@@ -117,17 +117,21 @@ flowchart TD
         J1_Checkout["actions/checkout@v5.0.0 (Unshallow)"]
         J1_Node["actions/setup-node@v7.1.0 (node-version: 24)"]
         J1_Proc["node scripts/processor/index.js\n- Reconcile, Validate & Compile\n- Single Authoritative Staging into site/\n- Staged Digest Verification\n- Direct writes to $GITHUB_OUTPUT"]
+        J1_CommitCond{"if: commit_needed == 'true'"}
         J1_Commit["git commit data/ & git push origin main"]
+        J1_Resolve["resolve-sha step:\nexport deploy_commit_sha"]
         J1_Upload["actions/upload-pages-artifact@v5.0.0 (path: site/)"]
         
-        J1_Checkout --> J1_Node --> J1_Proc --> J1_Commit --> J1_Upload
+        J1_Checkout --> J1_Node --> J1_Proc --> J1_CommitCond
+        J1_CommitCond -- Yes --> J1_Commit --> J1_Resolve --> J1_Upload
+        J1_CommitCond -- No (Case B) --> J1_Resolve --> J1_Upload
     end
 
     subgraph Job2["Job 2: deploy-to-pages (Node 24)"]
         J2_Cond{"if: deploy_needed == 'true'"}
         J2_Guard["scripts/processor/pre-deploy-guard.js\n(evaluateGenerationOrdering)"]
         J2_Deploy["actions/deploy-pages@v5.0.1 (environment: github-pages)"]
-        J2_Fin["scripts/processor/finalize-publishing.js\n(2-Tier Finalization with Stale Abort)"]
+        J2_Fin["scripts/processor/finalize-publishing.js\n(2-Tier Finalization & Fan-Out Recovery)"]
 
         J2_Cond --> J2_Guard --> J2_Deploy --> J2_Fin
     end
@@ -137,16 +141,17 @@ flowchart TD
 
 ### 5.1 Output Bridge Specification
 The processor writes outputs to `$GITHUB_OUTPUT`:
-- `deploy_needed`: `'true'` or `'false'`
+- `commit_needed`: `'true'` if fresh catalog files need committing; `'false'` for Case B recovery or clean state
+- `deploy_needed`: `'true'` if a fresh Pages deployment is required; `'false'` otherwise
 - `generation_id`: string e.g. `gen_1730635200000_a1b2c3d4`
 - `generation_sequence`: integer string e.g. `42`
-- `catalog_commit_sha`: 40-character hex string
+- `catalog_commit_sha`: 40-character hex string (new commit SHA or preserved Case B recovered SHA)
 - `catalog_digest`: string format `sha256:v1:...`
 - `captured_revision`: integer string e.g. `15`
 
-### 5.2 2-Tier Finalization Architecture
-1. **Tier 1 (Atomic Global State Anchor):** `db.runTransaction` reads `/system_config/catalog_state`, `/system_config/deployment_state`, and `/system_deployments/{generationId}`. Evaluates `evaluateGenerationOrdering` and revision monotonicity. Performs exactly 3 writes, establishing the canonical publication state atomically.
-2. **Tier 2 (Idempotent Status Fan-Out):** Batched writes (`db.batch()`, max 400 documents per batch) update associated submission records to `status: 'published'`. If interrupted, the startup reconciler safely resumes status updates without modifying the global publication sequence.
+### 5.2 2-Tier Finalization & Durable Fan-Out Recovery Architecture
+1. **Tier 1 (Atomic Global State Anchor):** `db.runTransaction` reads `/system_config/catalog_state`, `/system_config/deployment_state`, and `/system_deployments/{generationId}`. Evaluates `evaluateGenerationOrdering` and revision monotonicity. Performs exactly 3 writes: advances `deployment_state`, advances `catalog_state`, and marks `system_deployments` record `status: 'published'`, `reconciliationStatus: 'fanout_pending'`, `submissionFanoutStatus: 'pending'`.
+2. **Tier 2 (Independently Recoverable Status Fan-Out):** Batched writes (`db.batch()`, max 400 documents per batch) update associated submission records to `status: 'published'` using `expectedSubmissionIds`. After each batch commits, `submissionFanoutCursor` is updated. If interrupted by a crash, the reconciler discovers the generation via `status == 'published' && submissionFanoutStatus in ['pending', 'in_progress']` and resumes safely from the cursor. After 5 failed attempts, transitions to `manual_review` and logs an alert.
 
 ---
 

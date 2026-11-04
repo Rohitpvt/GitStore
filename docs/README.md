@@ -8,7 +8,7 @@ GitStore requires **zero binary hosting**, operates on **two platforms only** (G
 
 ---
 
-## 🚀 Key Architectural Pillars (Hardened in Phase 0.1.8)
+## 🚀 Key Architectural Pillars (Hardened in Phase 0.1.9)
 
 1. **Strict Two-Platform Confinement:**
    - **GitHub:** GitHub Pages (Static Storefront), GitHub Actions (Privileged Batch Processing Engine), GitHub Issues (Ingestion Queue), GitHub Releases (Direct Binary Distribution).
@@ -39,22 +39,31 @@ GitStore requires **zero binary hosting**, operates on **two platforms only** (G
    - Governed by a formal 12-state state machine.
    - Manifest `data/deployment-manifest.json` contains `generatedAt`, `generationSequence`, and deterministic SHA-256 `catalogDigest` (omitting commit SHAs).
    - Digest algorithm uses recursive canonical JSON serialization (`canonicalizeJson`), preserving array order, rejecting non-finite numbers, and using null-byte length-prefixed framing (`sha256:v1:...`).
+   - Unified catalog digest scope: `computeCatalogDigest(catalogDataRoot)` evaluates `catalog.json`, `categories.json`, and `products/*.json`, strictly excluding `deployment-manifest.json`, HTML, CSS, JS, and image assets.
    - Full-history commit recovery on unshallow fetch (`git log origin/main`) with branch ancestry verification (`git merge-base --is-ancestor`) and complete pagination of the GitHub Commits API following `Link: rel="next"`. Commit SHA format validation (`/^[0-9a-f]{40}$/i`) prevents command injection.
    - Granular commit recovery error classification: candidate manifest 404 is benign (`CANDIDATE_NO_MANIFEST`), while network/rate-limit/server errors set `isSearchIncomplete: true` and preserve generation state as `pending_retry`. `EMPTY_SEARCH` is declared only on complete, uninterrupted scans.
-8. **Node 24 Actions, Authoritative Staging & Official Pages API Status:**
+8. **Node 24 Actions, Verified Permissions & Case B SHA Preservation:**
    - Workflows use official Node 24 runtime Actions pinned to 40-character SHAs (`actions/checkout@v5.0.0`, `actions/setup-node@v7.1.0`, `actions/upload-pages-artifact@v5.0.0`, `actions/deploy-pages@v5.0.1`), compatible with runner `>= v2.327.1`.
-   - Single authoritative staging inside `scripts/processor/reconciler.js` eliminates corrupting workspace shell copies. For Case B recovery, the processor purges `site/`, extracts exclusively from target commit via `git archive ... | tar -x -C site/`, recomputes `stagedDigest`, and asserts `stagedDigest === catalogDigest` before artifact packaging.
-   - Robust output bridge `emitStepOutput(name, value)` exports 6 workflow parameters to `$GITHUB_OUTPUT` with random-delimiter escaping.
+   - Permissions strictly purged of unsupported keys (`metadata: read` removed; `contents: write` for build/commit; `pages: write`, `id-token: write`, `contents: read` for deploy).
+   - Decision separation: `commit_needed` is separated from `deploy_needed`. Case B recovery skips the commit step entirely, preserving the recovered commit SHA unchanged via a dedicated `resolve-sha` step.
+   - Verified action release metadata: `actions/upload-pages-artifact@v5.0.0` uses `actions/upload-artifact@v7.0.1` internally (not `v4`). Technical retention of `checkout@v5.0.0` over `v6.x` preserves `.git/config` credentials for git CLI operations.
    - Evaluates deployment status using dedicated endpoint `GET /repos/{owner}/{repo}/pages/deployments/{pages_deployment_id}` checking for `status === "succeed"`. Unknown status halts execution immediately.
-9. **Two-Tier Finalization Architecture & Monotonic Catalog Revisions:**
+9. **Two-Tier Finalization Architecture & Durable Fan-Out Recovery:**
    - Finalization is separated into a 2-tier architecture respecting the Firestore 500-write limit:
-     - **Tier 1 (State Anchor Transaction):** Reads `/system_config/catalog_state`, `/system_config/deployment_state`, and `/system_deployments/{generationId}` BEFORE writes. Asserts `evaluateGenerationOrdering` and monotonic revision check (`capturedRevision >= activeRevision`). Atomically commits exactly 3 state documents.
-     - **Tier 2 (Idempotent Batched Updates):** Executes idempotent batched writes in chunks of 400 documents for published submissions (`status: 'published'`).
+     - **Tier 1 (State Anchor Transaction):** Reads `/system_config/catalog_state`, `/system_config/deployment_state`, and `/system_deployments/{generationId}` BEFORE writes. Asserts `evaluateGenerationOrdering` and monotonic revision check (`capturedRevision >= activeRevision`). Atomically commits exactly 3 state documents and sets `submissionFanoutStatus: 'pending'`.
+     - **Tier 2 (Independently Recoverable Fan-Out):** Executes idempotent batched writes in chunks of 400 documents for published submissions (`expectedSubmissionIds`). Progress is tracked via `submissionFanoutCursor` on the generation document.
+     - **Startup Reconciler Resumption:** Reconciler discovers incomplete fan-out via `status == 'published' && submissionFanoutStatus in ['pending', 'in_progress']` and safely resumes from the cursor across crashes. After 5 failed attempts, transitions to `manual_review` and logs an alert.
    - If `capturedRevision < currentPublishedRevision`, the transaction throws immediately and aborts (`stale_aborted`) without touching published revision, records, or submission statuses.
 10. **Single Shared Generation Ordering Function & Split-Job Workflow:**
     - Unified ordering logic across generation creation, Case B recovery, pre-deployment guard, and finalization into one shared function `evaluateGenerationOrdering(artifactSeq, artifactGenId, activeSeq, activeGenId)`.
-    - Split-job workflow: `build-and-commit` (`contents: write`, `metadata: read`) and `deploy-to-pages` (`pages: write`, `id-token: write`, `contents: read`, `metadata: read` targeting `environment: github-pages`).
+    - Split-job workflow: `build-and-commit` (`contents: write`) and `deploy-to-pages` (`pages: write`, `id-token: write`, `contents: read` targeting `environment: github-pages`).
     - Public assets staged strictly into an isolated `site/` directory (`actions/upload-pages-artifact@v5.0.0` packaging `path: site/`). Pinned 40-character commit SHA actions used.
+11. **Static-First Read Architecture:**
+    - Storefront visitors load pre-compiled `data/catalog.json` snapshots served directly by GitHub Pages.
+    - Anonymous browsing generates **0 Firestore reads** and **0 App Check assessments**, keeping database usage under 3% of the free Firebase Spark quota.
+12. **Binary Non-Execution & Provenance:**
+    - GitStore never executes or sandboxes third-party binaries.
+    - Download links point directly to cryptographic assets in authors' public GitHub Releases.
 11. **Static-First Read Architecture:**
     - Storefront visitors load pre-compiled `data/catalog.json` snapshots served directly by GitHub Pages.
     - Anonymous browsing generates **0 Firestore reads** and **0 App Check assessments**, keeping database usage under 3% of the free Firebase Spark quota.
@@ -141,7 +150,7 @@ All technical specifications are organized within the [`docs/`](./docs) director
 |---|---|---|---|
 | [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) | High-level architecture, contracts, ADR-01 to ADR-18 | 1.9.0 | `IN_REVIEW` ⏳ |
 | [`docs/DATABASE_SCHEMA.md`](./docs/DATABASE_SCHEMA.md) | Firestore collections, security rules, reconciler logic | 1.9.0 | `IN_REVIEW` ⏳ |
-| [`docs/SECURITY.md`](./docs/SECURITY.md) | Threat model, action-bound step-up proof, 16-row verification matrix | 1.9.0 | `IN_REVIEW` ⏳ |
+| [`docs/SECURITY.md`](./docs/SECURITY.md) | Threat model, action-bound step-up proof, 17-row verification matrix | 1.9.0 | `IN_REVIEW` ⏳ |
 | [`docs/SUBMISSION_PIPELINE.md`](./docs/SUBMISSION_PIPELINE.md) | 12-state machine, ownership tiers, 11 failure scenarios | 1.9.0 | `IN_REVIEW` ⏳ |
 | [`docs/AUTHENTICATION.md`](./docs/AUTHENTICATION.md) | OAuth, magic links, App Check quotas, step-up proof | 1.9.0 | `IN_REVIEW` ⏳ |
 | [`docs/DEPLOYMENT_GUIDE.md`](./docs/DEPLOYMENT_GUIDE.md) | Node 24 workflow, secrets, pre-deploy guard, setup guide | 1.9.0 | `IN_REVIEW` ⏳ |
@@ -149,7 +158,7 @@ All technical specifications are organized within the [`docs/`](./docs) director
 | [`docs/COST_AND_LIMITS.md`](./docs/COST_AND_LIMITS.md) | Free-tier limits, hard-stop behavior, zero-cost analysis | 1.9.0 | `IN_REVIEW` ⏳ |
 | [`docs/PRD.md`](./docs/PRD.md) | Product vision, target personas, functional requirements | 1.9.0 | `IN_REVIEW` ⏳ |
 | [`docs/SDD.md`](./docs/SDD.md) | System design, sequence diagrams, component breakdowns | 1.9.0 | `IN_REVIEW` ⏳ |
-| [`docs/PHASE_PLAN.md`](./docs/PHASE_PLAN.md) | Master development roadmap & phase control system | 1.8.0 | `IN_REVIEW` ⏳ |
+| [`docs/PHASE_PLAN.md`](./docs/PHASE_PLAN.md) | Master development roadmap & phase control system | 1.9.0 | `IN_REVIEW` ⏳ |
 | [`docs/ROADMAP.md`](./docs/ROADMAP.md) | Strategic Gantt chart & execution timeline | 1.9.0 | `IN_REVIEW` ⏳ |
 | [`docs/UI_DESIGN_SYSTEM.md`](./docs/UI_DESIGN_SYSTEM.md) | Obsidian Dark Neo-Brutalist tokens & layout specs | 1.0.0 | `APPROVED` ✅ |
 
@@ -157,7 +166,7 @@ All technical specifications are organized within the [`docs/`](./docs) director
 
 ## 🚦 Project Status & Execution Governance
 
-- **Current Active Phase:** **Phase 0.1.8 — Node 24 Workflow Compatibility, Artifact Provenance & Transactional Deployment Integrity** (`IN_REVIEW` ⏳).
+- **Current Active Phase:** **Phase 0.1.9 — Workflow Validation, Recovery SHA Preservation & Durable Finalization Recovery** (`IN_REVIEW` ⏳).
 - **Execution Rule:** GitStore operates under strict phase-gate control. Implementation work on **Phase 1 (Frontend Core Foundation)** requires explicit user `APPROVED` sign-off.
 - **Repository:** [`https://github.com/Rohitpvt/GitStore.git`](https://github.com/Rohitpvt/GitStore.git)
 - **Primary Branch:** `main`

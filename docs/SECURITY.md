@@ -1,7 +1,7 @@
 # GitStore — Security Architecture & Threat Model
 
 **Document Version:** 1.9.0  
-**Phase:** Phase 0.1.8 — Node 24 Workflow Compatibility, Artifact Provenance & Transactional Deployment Integrity  
+**Phase:** Phase 0.1.9 — Workflow Validation, Recovery SHA Preservation & Durable Finalization Recovery  
 **Status:** IN_REVIEW — Awaiting Explicit User Approval  
 
 ---
@@ -145,12 +145,12 @@ GitStore enforces a strict tier-based ownership model:
 
 ## 7. Least-Privilege Split-Job Pages Architecture & Clean Staging
 
-### 7.1 Split-Job Structure
-1. **`build-and-commit`:** Granted `contents: write`, `metadata: read`. Compiles static catalogs, constructs `site/`, asserts `stagedDigest === catalogDigest`, pushes commit to `origin/main`, exports outputs to `$GITHUB_OUTPUT`, and uploads Pages artifact (`path: site/`).
-2. **`deploy-to-pages`:** Granted `pages: write`, `id-token: write`, `contents: read`, `metadata: read` targeting `environment: github-pages`. Runs conditionally when `needs.build-and-commit.outputs.deploy_needed == 'true'`. Evaluates pre-deploy ordering guard, dispatches deployment via `actions/deploy-pages@v5.0.1`, verifies dedicated Pages status (`succeed`), and executes 2-tier transactional finalization.
+### 7.1 Split-Job Structure & Verified Permissions
+1. **`build-and-commit`:** Granted `contents: write`. Read access to repository metadata is granted implicitly by GitHub Actions by default; invalid `metadata: read` is purged. Compiles static catalogs, constructs `site/`, asserts `stagedDigest === catalogDigest`, executes git commit only if `commit_needed == 'true'`, exports outputs to `$GITHUB_OUTPUT`, and uploads Pages artifact (`path: site/`).
+2. **`deploy-to-pages`:** Granted `pages: write`, `id-token: write`, `contents: read` targeting `environment: github-pages`. Runs conditionally when `needs.build-and-commit.outputs.deploy_needed == 'true'`. Evaluates pre-deploy ordering guard, dispatches deployment via `actions/deploy-pages@v5.0.1`, verifies dedicated Pages status (`succeed`), and executes 2-tier transactional finalization with durable fan-out recovery.
 
 ### 7.2 Staging Provenance & Shell Injection Defense
-- `site/` staging is constructed cleanly from the exact target commit and verified via recomputed catalog digest (`stagedDigest === catalogDigest`).
+- `site/` staging is constructed cleanly from the exact target commit and verified via recomputed catalog digest (`stagedDigest = computeCatalogDigest('site/data')`).
 - Commit SHAs are validated against `/^[0-9a-f]{40}$/i` before shell execution.
 - Output bridge writes to `$GITHUB_OUTPUT` reject values containing newline delimiters to prevent workflow command injection.
 
@@ -163,25 +163,26 @@ GitStore operates under an absolute non-execution invariant:
 
 ---
 
-## 9. Comprehensive 16-Row Verification Matrix
+## 9. Comprehensive 17-Row Verification Matrix
 
-In accordance with Phase 0.1.8 specifications, all 16 critical controls are classified across the 5 standard columns:
+In accordance with Phase 0.1.9 specifications, all 17 critical controls are classified across the 5 standard columns:
 
-| Control | Design status | Documentation evidence | Runtime status | Remaining work |
+| Area | Architecture status | Evidence | Runtime status | Remaining action |
 |---|---|---|---|---|
-| **Node 24 action compatibility** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Actions specify `runs.using: 'node24'` or composite; runner `>= v2.327.1`) | `PENDING_INTEGRATION_TEST` | Validate runner runtime execution on `ubuntu-latest` in Phase 4. |
-| **Verified action commit SHAs** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (`checkout@08c6903`, `setup-node@949feb2`, `upload-pages-artifact@fc324d3`, `deploy-pages@368f825`) | `PENDING_INTEGRATION_TEST` | Test workflow execution against verified SHAs in Phase 4. |
-| **Case B exact source revision** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Reconciler extracts catalog assets directly from `catalogCommitSha` via git archive) | `PENDING_INTEGRATION_TEST` | Simulate Case B recovery and assert source revision purity in Phase 4. |
-| **Clean isolated artifact staging** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Purges `site/` before staging; zero post-staging copies from workspace `main`) | `PENDING_INTEGRATION_TEST` | Verify staging directory isolation in workflow run in Phase 4. |
-| **Staged digest verification** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Recomputes `stagedDigest` from `site/` and asserts match against `gen.catalogDigest`) | `PENDING_INTEGRATION_TEST` | Test staged digest mismatch abort in Phase 4. |
-| **Explicit `$GITHUB_OUTPUT` bridge** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Direct append writes to `$GITHUB_OUTPUT` with newline injection guards) | `PENDING_INTEGRATION_TEST` | Test step output exports on Actions runner in Phase 4. |
-| **Cross-job output integrity** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Job 1 declares 6 outputs; Job 2 consumes via `needs.build-and-commit.outputs`) | `PENDING_INTEGRATION_TEST` | Verify parameter propagation across split jobs in Phase 4. |
-| **Finalization reads deployment state** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Transaction reads `deployment_state`, `catalog_state`, and `genDoc` before any writes) | `PENDING_INTEGRATION_TEST` | Verify pre-read transaction semantics on Firestore Emulator in Phase 2. |
-| **Transactional generation ordering** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Evaluates `evaluateGenerationOrdering` inside transaction; aborts if stale) | `PENDING_INTEGRATION_TEST` | Test sequence collision and stale abort handling in Phase 4. |
-| **Catalog revision monotonicity** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Asserts `capturedRevision >= latestPublishedRevision` and `<= latestRequestedRevision`) | `PENDING_INTEGRATION_TEST` | Test revision advancement in concurrent approval scenarios in Phase 4. |
-| **Firestore transaction write limits** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (2-tier finalization: 3-write atomic state anchor + 400-doc batched status updates) | `PENDING_INTEGRATION_TEST` | Test finalization of generations with > 500 products in Phase 4. |
-| **Action-specific moderation payload** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Security rules and worker validate custom schemas for all 6 moderation actions) | `PENDING_INTEGRATION_TEST` | Test rejection of invalid nested payload keys on Firebase Emulator in Phase 2. |
-| **Target ID/path relationship** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Rules assert `targetDocumentPath` matches canonical collection and exact `targetId`) | `PENDING_INTEGRATION_TEST` | Test target redirection rejection on Firebase Emulator in Phase 2. |
-| **Nonce ledger schema consistency** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Uses `requestedByUid` canonically across schema, rules, and transaction code) | `PENDING_INTEGRATION_TEST` | Test atomic nonce reservation and replay rejection in Phase 5. |
-| **Commit content API error handling** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Classifies 404 vs rate limits/5xx; only declares `EMPTY_SEARCH` on full clean search) | `PENDING_INTEGRATION_TEST` | Test transient network error retention as `pending_retry` in Phase 4. |
-| **Pages API status handling** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Dedicated endpoint `pages/deployments/{id}` checks `status === 'succeed'`) | `PENDING_INTEGRATION_TEST` | Validate live Pages deployment status query on GitHub API in Phase 4. |
+| **Valid GitHub Actions permissions** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Unsupported key `metadata: read` purged; only documented GITHUB_TOKEN keys used) | `PENDING_INTEGRATION_TEST` | Validate workflow parsing on GitHub Actions in Phase 4. |
+| **Build job permission scope** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (`contents: write` only; repo metadata granted implicitly by platform) | `PENDING_INTEGRATION_TEST` | Test catalog push on runner in Phase 4. |
+| **Deploy job permission scope** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (`pages: write`, `id-token: write`, `contents: read` strictly scoped to `github-pages` env) | `PENDING_INTEGRATION_TEST` | Verify OIDC minting and Pages deploy in Phase 4. |
+| **Case B commit-needed separation** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (`commit_needed` separated from `deploy_needed`; commit step skipped during Case B) | `PENDING_INTEGRATION_TEST` | Test Case B execution skipping commit step in Phase 4. |
+| **Recovered SHA preservation** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Case B exports recovered commit SHA without overwriting with `git rev-parse HEAD`) | `PENDING_INTEGRATION_TEST` | Test recovered SHA consistency across split jobs in Phase 4. |
+| **New-generation SHA handling** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (New generation commits `data/`, captures new SHA, validates 40-char format, and exports) | `PENDING_INTEGRATION_TEST` | Test new catalog commit creation and SHA capture in Phase 4. |
+| **Cross-job provenance consistency** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Job 1 `resolve-sha` step ensures artifact and deployment metadata reference exact same commit SHA) | `PENDING_INTEGRATION_TEST` | Assert commit SHA match between jobs in Phase 4. |
+| **Tier 1 publication state** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (3-write transaction advances `deployment_state` and `catalog_state`, sets `submissionFanoutStatus: 'pending'`) | `PENDING_INTEGRATION_TEST` | Test atomic state anchor on Firestore Emulator in Phase 2. |
+| **Tier 2 fan-out state** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Batched updates of 400 docs track `submissionFanoutCursor` on generation doc) | `PENDING_INTEGRATION_TEST` | Test submission fan-out batch chunking in Phase 4. |
+| **Partial batch recovery** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Idempotent updates and cursor tracking ensure crash between batches resumes safely) | `PENDING_INTEGRATION_TEST` | Simulate crash between batches and verify resumption in Phase 4. |
+| **Fan-out discovery query** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Exact Firestore query discovers `status == 'published'` and `submissionFanoutStatus in ['pending', 'in_progress']`) | `PENDING_INTEGRATION_TEST` | Verify composite index and reconciler query in Phase 4. |
+| **Expected submission ID naming** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Renamed to `expectedSubmissionIds` matching `/submissions/{id}` document IDs) | `PENDING_INTEGRATION_TEST` | Validate field name consistency in processor tests in Phase 4. |
+| **Catalog digest file scope** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Canonical contract includes `catalog.json`, `categories.json`, `products/*.json`; excludes manifest, HTML, assets) | `PENDING_INTEGRATION_TEST` | Test digest invariance against HTML edits in Phase 4. |
+| **Normal generation digest** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Compiler invokes `computeCatalogDigest('data')` using canonical JSON serialization) | `PENDING_INTEGRATION_TEST` | Test digest test vectors on compiled output in Phase 4. |
+| **Case B digest** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Reconciler invokes `computeCatalogDigest('site/data')` asserting match with `gen.catalogDigest`) | `PENDING_INTEGRATION_TEST` | Test Case B staged digest match in Phase 4. |
+| **Action metadata and nested dependency** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (`upload-pages-artifact@v5.0.0` verified using `actions/upload-artifact@v7.0.1`; `checkout@v5.0.0` retained over `v6.x`) | `PENDING_INTEGRATION_TEST` | Validate composite action resolution on runner in Phase 4. |
+| **Documentation-only evidence classification** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Strictly classified as DESIGNED/DOCUMENTATION_VERIFIED; zero unbuilt files claimed as live) | `PENDING_INTEGRATION_TEST` | Confirm working tree has zero application code in Phase 0.1. |

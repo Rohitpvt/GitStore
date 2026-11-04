@@ -1,7 +1,7 @@
 # GitStore — System Design Document (SDD)
 
 **Document Version:** 1.9.0  
-**Phase:** Phase 0.1.8 — Node 24 Workflow Compatibility, Artifact Provenance & Transactional Deployment Integrity  
+**Phase:** Phase 0.1.9 — Workflow Validation, Recovery SHA Preservation & Durable Finalization Recovery  
 **Status:** IN_REVIEW — Awaiting Explicit User Approval  
 
 ---
@@ -155,9 +155,9 @@ sequenceDiagram
     end
     Note over Worker: Static Compilation & Single Authoritative Staging
     Worker->>DB: Set status to 'catalog_generating' & snapshot revision
-    Worker->>Worker: Compile data/catalog.json, construct site/, verify stagedDigest === catalogDigest
-    Worker->>Worker: Git commit data/ & git push origin main
-    Worker->>Worker: Export outputs to $GITHUB_OUTPUT (deploy_needed=true, generation_id, etc.)
+    Worker->>Worker: Compile data/catalog.json, construct site/, verify stagedDigest = computeCatalogDigest('site/data')
+    Worker->>Worker: If commit_needed: Git commit data/ & git push origin main; resolve deploy commit SHA
+    Worker->>Worker: Export outputs to $GITHUB_OUTPUT (commit_needed, deploy_needed, generation_id, catalog_commit_sha, etc.)
     Worker->>Worker: actions/upload-pages-artifact@v5.0.0 (path: site/)
     Note over Worker: Job 2: deploy-to-pages (Node 24)
     Worker->>Worker: Pre-Deploy Guard: evaluateGenerationOrdering()
@@ -166,8 +166,8 @@ sequenceDiagram
     GHAPI-->>Worker: Return status: 'succeed'
     Worker->>Worker: HTTP check deployment-manifest.json (verify genId, seq, & catalogDigest)
     alt Deploy Succeeded & Manifest Verified via HTTP
-        Worker->>DB: 2-Tier Finalization: Transaction advances deployment_state & catalog_state (3 writes)
-        Worker->>DB: Batched writes update submissions to 'published' (batches of 400)
+        Worker->>DB: Tier 1: Transaction advances deployment_state & catalog_state, sets fanout pending (3 writes)
+        Worker->>DB: Tier 2: Batched writes update submissions to 'published' in chunks of 400, advancing cursor
     else Deploy Failed or Stale Sequence
         Worker->>DB: Set /system_deployments/{genId} status: 'stale_aborted' or 'failed'
     end
