@@ -109,7 +109,7 @@ Before initiating deployment, ensure you possess:
    - In case of a worker crash post-push before Firestore update, the startup reconciler recovers the SHA via complete pagination of `origin/main` commits following `Link: rel="next"`, proves branch ancestry via `git merge-base --is-ancestor`, and matches the recursive canonical `catalogDigest`. Granular error classification prevents network errors or rate limits from triggering false empty searches.
    - In Case B (commit exists on remote, but no Pages deployment exists), the reconciler stages `site/` from the target commit, verifies `stagedDigest`, returns `{ deployNeeded: true, generationId, generationSequence, catalogCommitSha, catalogDigest, capturedRevision }`, and sets `deploy_needed=true` in `$GITHUB_OUTPUT`. Job 1 uploads the Pages artifact, and Job 2 runs conditionally to execute the pre-deployment guard and `actions/deploy-pages@v5.0.1`.
    - Public HTTP checks on `https://rohitpvt.github.io/GitStore/data/deployment-manifest.json` confirm `generationId`, `generationSequence`, and `catalogDigest`.
-   - 2-Tier Transactional Finalization: An atomic transaction reads `/system_config/catalog_state`, `/system_config/deployment_state`, and the generation record BEFORE any writes. Inside the transaction, it evaluates `evaluateGenerationOrdering` and catalog revision monotonicity. If `capturedRevision < currentPublishedRevision`, the transaction aborts with `stale_aborted` to prevent rollbacks. It commits the global publication anchor in 3 writes, followed by idempotent batched writes (max 400 docs/batch) to update submission publication statuses, strictly respecting the Firestore 500-write limit.
+   - 2-Tier Transactional Finalization & Bounded Subcollections: An atomic transaction reads `/system_config/catalog_state`, `/system_config/deployment_state`, and the generation record BEFORE any writes. Inside the transaction, it evaluates `evaluateGenerationOrdering` and catalog revision monotonicity. If `capturedRevision < currentPublishedRevision`, the transaction aborts with `stale_aborted` to prevent rollbacks. It commits the global publication anchor in 3 writes, while submission fan-out work is partitioned into bounded deterministic subcollections (`/system_deployments/{generationId}/fanout_batches/{batchId}`) capped at 400 IDs each (~13 KB << 1 MiB limit). Parent documents store only $O(1)$ scalar summary counters. Fan-out executes conditional transactional updates enforcing status eligibility (`approved` only; never resurrecting `rejected`, `delisted`, or `withdrawn` submissions) and strictly monotonic sequence advancement (`publishedGenerationSequence`), preventing stale fan-out overwrites across all concurrency interleavings.
 
 ---
 
@@ -169,7 +169,7 @@ jobs:
       commit_needed: ${{ steps.catalog.outputs.commit_needed }}
     steps:
       - name: Checkout Repository (Unshallow)
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0 (Node 24)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (Node 24)
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
@@ -243,7 +243,7 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Checkout Repository for Guard Scripts
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0 (Node 24)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (Node 24)
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 1
@@ -304,7 +304,7 @@ All actions are pinned to immutable 40-character commit SHAs. Metadata and depen
 
 | Action | Tag | Pinned 40-Character Commit SHA | Runtime Type | Nested Dependencies | Minimum Runner | Upstream Status & Version Retention Justification |
 |---|---|---|---|---|---|---|
-| `actions/checkout` | `v5.0.0` | `08c6903cd8c0fde910a37f88322edcfb5dd907a8` | `runs.using: 'node24'` | None (native Node 24) | `>= v2.327.1` | **Retained v5:** While `v6.x` exists, it altered `persist-credentials` storage from `.git/config` to `$RUNNER_TEMP`, required runner `>= v2.329.0`, and migrated to ESM. `v5.0.0` provides stable Node 24 execution while preserving `.git/config` credentials required by native git commands (`git push origin main`) without breaking changes. |
+| `actions/checkout` | `v7.0.1` | `3d3c42e5aac5ba805825da76410c181273ba90b1` | `runs.using: 'node24'` | None (native Node 24) | `>= v2.327.1` | **Upgraded to v7.0.1:** Runs natively on Node 24 (`runs.using: 'node24'`) requiring Actions Runner `>= v2.327.1`. Official documentation confirms that storing credentials in `$RUNNER_TEMP` increases security against repository artifact leaks while configuring the Git credential helper so that native Git CLI operations (`git push origin main`) succeed automatically with default `persist-credentials: true` and `permissions: contents: write`, superseding prior claims regarding `.git/config` breakage. Also enforces default security blocking untrusted fork pull request checkouts under elevated triggers. |
 | `actions/setup-node` | `v7.1.0` | `949feb2413d6458794dcd2491c4babbbce0c15c1` | `runs.using: 'node24'` | None (native Node 24) | `>= v2.327.1` | Configures Node.js 24.x environment for processor and finalization scripts. |
 | `actions/upload-pages-artifact` | `v5.0.0` | `fc324d3547104276b827a68afc52ff2a11cc49c9` | `runs.using: 'composite'` | GNU/BSD tar + `actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1` | `>= v2.327.1` | **Dependency Correction:** Internally delegates to `actions/upload-artifact@v7.0.1` (NOT `v4`). Packages `site/` into `artifact.tar` under `$RUNNER_TEMP`. |
 | `actions/deploy-pages` | `v5.0.1` | `368f82528645a54fb793d4d04e342629a3f51346` | `runs.using: 'node24'` | None (native Node 24) | `>= v2.327.1` | Native Node 24 deployment to GitHub Pages via OpenID Connect (OIDC). |
@@ -334,6 +334,67 @@ export function computeCatalogDigest(catalogDataRoot) {
 - **Normal Compilation:** Reconciler invokes `computeCatalogDigest('data')`.
 - **Case B Staging:** Reconciler extracts files to `site/` and invokes `computeCatalogDigest('site/data')`.
 - Because both calls evaluate the exact same relative file paths and apply identical JSON canonicalization, `stagedDigest === catalogDigest` is strictly guaranteed without whole-site hash collisions.
+
+### 6.4 Comprehensive Reconciliation & Fan-Out Query Catalog
+
+The batch worker and reconciler execute deterministic Firestore queries backed by composite indexes:
+
+1. **Pending Deployment Generations:**
+   Discovers active compilation generations requiring build, staging, or Pages dispatch:
+   ```javascript
+   db.collection('system_deployments')
+     .where('status', 'in', ['pending', 'catalog_committed', 'deploying'])
+     .orderBy('generationSequence', 'asc');
+   ```
+
+2. **Published Generations with Incomplete Fan-Out:**
+   Discovers published generations where Tier 1 global publication committed, but Tier 2 submission status fan-out remains incomplete:
+   ```javascript
+   db.collection('system_deployments')
+     .where('status', '==', 'published')
+     .where('submissionFanoutStatus', 'in', ['pending', 'in_progress', 'partial', 'failed'])
+     .orderBy('generationSequence', 'asc');
+   ```
+
+3. **Pending Fan-Out Batches for a Generation:**
+   Queries uncompleted bounded batches within a specific generation:
+   ```javascript
+   db.collection('system_deployments')
+     .doc(generationId)
+     .collection('fanout_batches')
+     .where('status', 'in', ['pending', 'processing'])
+     .orderBy('batchIndex', 'asc');
+   ```
+
+4. **Retryable Fan-Out Batches:**
+   Queries failed batches that have not exceeded the 5-attempt retry threshold:
+   ```javascript
+   db.collection('system_deployments')
+     .doc(generationId)
+     .collection('fanout_batches')
+     .where('status', '==', 'pending')
+     .where('fanoutAttempts', '<', 5)
+     .orderBy('batchIndex', 'asc');
+   ```
+
+5. **System-Wide Manual Review Batches:**
+   Enables administrators to discover batches requiring manual intervention across all generations:
+   ```javascript
+   db.collectionGroup('fanout_batches')
+     .where('status', '==', 'manual_review')
+     .orderBy('createdAt', 'desc');
+   ```
+
+6. **System-Wide Manual Review Generations:**
+   Discovers generations flagged for administrator audit:
+   ```javascript
+   db.collection('system_deployments')
+     .where('submissionFanoutStatus', '==', 'manual_review')
+     .orderBy('createdAt', 'desc');
+   ```
+
+7. **Completed Terminal Invariant:**
+   Generations with `status == 'finalized'` and `submissionFanoutStatus == 'completed'` never match any active processing queries, guaranteeing they never re-enter worker execution loops.
 
 ---
 

@@ -31,7 +31,7 @@ flowchart TD
         GHIssues["GitHub Issue Forms\n(.github/ISSUE_TEMPLATE)"]
         GHReleases["Public GitHub Releases\n(External User Repositories)"]
         GHREST["GitHub REST API v3\n(Canonical Repo Collaborator Check,\nUpstream Repo, Tag & Asset Validation,\nPages Deployment Status via Commit SHA: succeed)"]
-        GHWorker["GitHub Actions Batch Worker (Node 24)\n(Scheduled every 10 min + Manual Dispatch)\n- Actions: checkout@v5, setup-node@v7, upload@v5, deploy@v5\n- Single Authoritative Staging (stagedDigest check)\n- Explicit $GITHUB_OUTPUT Bridge\n- 2-Tier Finalization with Stale Abort"]
+        GHWorker["GitHub Actions Batch Worker (Node 24)\n(Scheduled every 10 min + Manual Dispatch)\n- Actions: checkout@v7.0.1, setup-node@v7, upload@v5, deploy@v5\n- Single Authoritative Staging (stagedDigest check)\n- Explicit $GITHUB_OUTPUT Bridge\n- Bounded Subcollection Fan-Out & Stale Abort"]
     end
 
     %% Client Interactions
@@ -87,15 +87,16 @@ flowchart TD
 ### 2.3 Component 3: GitHub Actions Batch Worker Engine (Node 24)
 - **Workflow:** `.github/workflows/batch-processor.yml`.
 - **Runtime:** `ubuntu-latest` running on official Node 24 actions pinned to verified 40-character commit SHAs:
-  - `actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0`
-  - `actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0`
-  - `actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0`
-  - `actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1`
+  - `actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1` (`runs.using: 'node24'`, requires runner `>= v2.327.1`)
+  - `actions/setup-node@0a44ba7841725637a54e280ec667c276c6cc814e # v7.1.0` (`runs.using: 'node24'`, requires runner `>= v2.327.1`)
+  - `actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v5.0.0` (`runs.using: 'composite'`, packages gzip/tar)
+  - `actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v5.0.1` (`runs.using: 'node24'`, requires runner `>= v2.327.1`)
+- **Native Git CLI Credential Behavior:** Official documentation confirms that `actions/checkout` v7.0.1 stores credentials in `$RUNNER_TEMP` (preventing workspace leaks) while configuring the Git credential helper so native Git operations (`git push origin main`) succeed automatically with default `persist-credentials: true`.
 - **Core Operations:**
   1. **Split-Job Architecture & Output Bridge:** `build-and-commit` constructs `site/`, verifies `stagedDigest === catalogDigest`, commits to `main`, writes step outputs to `$GITHUB_OUTPUT`, and uploads Pages staging artifact. `deploy-to-pages` runs conditionally when `needs.build-and-commit.outputs.deploy_needed == 'true'`, executes the pre-deploy guard, and deploys via `actions/deploy-pages@v5.0.1`.
-  2. **Startup Reconciler with Granular Error Classification:** Searches Git history via unshallow fetch and Commits API pagination loop. Distinguishes benign missing blobs (`CANDIDATE_NO_MANIFEST`) from rate limits/timeouts (`INCOMPLETE_SEARCH`). Declares `EMPTY_SEARCH` only on complete, uninterrupted scans.
+  2. **Startup Reconciler with Granular Error Classification:** Searches Git history via unshallow fetch and Commits API pagination loop. Distinguishes benign missing blobs (`CANDIDATE_NO_MANIFEST`, HTTP 404) from rate limits/timeouts (`INCOMPLETE_SEARCH`), 401 auth failures (`API_AUTH_ERROR`), and corrupt manifest blobs (`CANDIDATE_CORRUPT_MANIFEST`). Declares `EMPTY_SEARCH` only on complete, uninterrupted scans with zero errors.
   3. **Case B Clean Staging:** Extracts assets from the target commit directly into `site/`, recomputes and validates `stagedDigest`, and prohibits any post-staging workspace copies.
-  4. **2-Tier Transactional Finalization:** Reads `catalog_state`, `deployment_state`, and generation record before writes. Evaluates `evaluateGenerationOrdering` and revision monotonicity inside the transaction. Commits global state in 3 writes, fanning out submission statuses in batches of 400.
+  4. **2-Tier Finalization & Bounded Subcollections:** Reads `catalog_state`, `deployment_state`, and generation record before writes. Evaluates `evaluateGenerationOrdering` and revision monotonicity inside the transaction. Commits global state in 3 writes. Submission fan-out work is stored in bounded subcollections (`fanout_batches`, max 400 IDs each), and executed via conditional transactions that enforce status eligibility (`approved` only) and monotonic sequence advancement (`publishedGenerationSequence`), preventing stale fan-out overwrites across all concurrency interleavings.
 
 ---
 
@@ -167,7 +168,7 @@ sequenceDiagram
     Worker->>Worker: HTTP check deployment-manifest.json (verify genId, seq, & catalogDigest)
     alt Deploy Succeeded & Manifest Verified via HTTP
         Worker->>DB: Tier 1: Transaction advances deployment_state & catalog_state, sets fanout pending (3 writes)
-        Worker->>DB: Tier 2: Batched writes update submissions to 'published' in chunks of 400, advancing cursor
+        Worker->>DB: Tier 2: Conditional transactions process bounded fanout_batches (<=400 docs) enforcing sequence monotonicity
     else Deploy Failed or Stale Sequence
         Worker->>DB: Set /system_deployments/{genId} status: 'stale_aborted' or 'failed'
     end

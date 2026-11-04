@@ -8,7 +8,7 @@ GitStore requires **zero binary hosting**, operates on **two platforms only** (G
 
 ---
 
-## 🚀 Key Architectural Pillars (Hardened in Phase 0.1.9)
+## 🚀 Key Architectural Pillars (Hardened in Phase 0.1.10)
 
 1. **Strict Two-Platform Confinement:**
    - **GitHub:** GitHub Pages (Static Storefront), GitHub Actions (Privileged Batch Processing Engine), GitHub Issues (Ingestion Queue), GitHub Releases (Direct Binary Distribution).
@@ -41,18 +41,19 @@ GitStore requires **zero binary hosting**, operates on **two platforms only** (G
    - Digest algorithm uses recursive canonical JSON serialization (`canonicalizeJson`), preserving array order, rejecting non-finite numbers, and using null-byte length-prefixed framing (`sha256:v1:...`).
    - Unified catalog digest scope: `computeCatalogDigest(catalogDataRoot)` evaluates `catalog.json`, `categories.json`, and `products/*.json`, strictly excluding `deployment-manifest.json`, HTML, CSS, JS, and image assets.
    - Full-history commit recovery on unshallow fetch (`git log origin/main`) with branch ancestry verification (`git merge-base --is-ancestor`) and complete pagination of the GitHub Commits API following `Link: rel="next"`. Commit SHA format validation (`/^[0-9a-f]{40}$/i`) prevents command injection.
-   - Granular commit recovery error classification: candidate manifest 404 is benign (`CANDIDATE_NO_MANIFEST`), while network/rate-limit/server errors set `isSearchIncomplete: true` and preserve generation state as `pending_retry`. `EMPTY_SEARCH` is declared only on complete, uninterrupted scans.
-8. **Node 24 Actions, Verified Permissions & Case B SHA Preservation:**
-   - Workflows use official Node 24 runtime Actions pinned to 40-character SHAs (`actions/checkout@v5.0.0`, `actions/setup-node@v7.1.0`, `actions/upload-pages-artifact@v5.0.0`, `actions/deploy-pages@v5.0.1`), compatible with runner `>= v2.327.1`.
+   - Granular commit recovery error classification: candidate manifest 404 is benign (`CANDIDATE_NO_MANIFEST`), while 401 auth failures, 403/429 rate limits, 5xx server errors, network timeouts, and connection resets set `isSearchIncomplete: true` and preserve generation state as `pending_retry`. Malformed manifest JSON is quarantined as `CANDIDATE_CORRUPT_MANIFEST` (`hasCorruptCandidates = true`), routing to `manual_review`. `EMPTY_SEARCH` is declared ONLY on 100% complete, zero-error, zero-corrupt scans.
+8. **Node 24 Actions, Verified Permissions, Upgrade to Checkout v7.0.1 & Case B SHA Preservation:**
+   - Workflows use official Node 24 runtime Actions pinned to 40-character SHAs (`actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1` [v7.0.1], `actions/setup-node@0a44ba7841725637a54e280ec667c276c6cc814e` [v7.1.0], `actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa` [v5.0.0], `actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e` [v5.0.1]), compatible with runner `>= v2.327.1`.
+   - Native Git CLI credential persistence: Official documentation confirms `actions/checkout@v7.0.1` securely isolates credentials in `$RUNNER_TEMP` while configuring the Git credential helper so native Git operations (`git push origin main`) succeed automatically with default `persist-credentials: true` and `contents: write`.
    - Permissions strictly purged of unsupported keys (`metadata: read` removed; `contents: write` for build/commit; `pages: write`, `id-token: write`, `contents: read` for deploy).
    - Decision separation: `commit_needed` is separated from `deploy_needed`. Case B recovery skips the commit step entirely, preserving the recovered commit SHA unchanged via a dedicated `resolve-sha` step.
-   - Verified action release metadata: `actions/upload-pages-artifact@v5.0.0` uses `actions/upload-artifact@v7.0.1` internally (not `v4`). Technical retention of `checkout@v5.0.0` over `v6.x` preserves `.git/config` credentials for git CLI operations.
    - Evaluates deployment status using dedicated endpoint `GET /repos/{owner}/{repo}/pages/deployments/{pages_deployment_id}` checking for `status === "succeed"`. Unknown status halts execution immediately.
-9. **Two-Tier Finalization Architecture & Durable Fan-Out Recovery:**
-   - Finalization is separated into a 2-tier architecture respecting the Firestore 500-write limit:
+9. **Bounded Fan-Out Subcollections, Conditional Monotonic Fan-Out & 2-Tier Finalization:**
+   - Finalization is separated into a 2-tier architecture respecting Firestore's 1 MiB document limit and 500-write limits:
      - **Tier 1 (State Anchor Transaction):** Reads `/system_config/catalog_state`, `/system_config/deployment_state`, and `/system_deployments/{generationId}` BEFORE writes. Asserts `evaluateGenerationOrdering` and monotonic revision check (`capturedRevision >= activeRevision`). Atomically commits exactly 3 state documents and sets `submissionFanoutStatus: 'pending'`.
-     - **Tier 2 (Independently Recoverable Fan-Out):** Executes idempotent batched writes in chunks of 400 documents for published submissions (`expectedSubmissionIds`). Progress is tracked via `submissionFanoutCursor` on the generation document.
-     - **Startup Reconciler Resumption:** Reconciler discovers incomplete fan-out via `status == 'published' && submissionFanoutStatus in ['pending', 'in_progress']` and safely resumes from the cursor across crashes. After 5 failed attempts, transitions to `manual_review` and logs an alert.
+     - **Tier 2 (Bounded Subcollection Fan-Out):** Fan-out work is partitioned into bounded subcollection documents (`/system_deployments/{generationId}/fanout_batches/{batchId}`) containing at most 400 IDs each (~13 KB << 1 MiB limit). Parent generation document retains strictly $O(1)$ scalar summary counters (`expectedSubmissionCount`, `completedSubmissionCount`, `totalFanoutBatches`, `completedFanoutBatches`).
+     - **Conditional Monotonic Update:** Fan-out updates execute in transactional mini-chunks of 50 documents, strictly enforcing status eligibility (`status in ['approved', 'published']`; never resurrecting rejected, delisted, or withdrawn submissions) and monotonic sequence advancement (`genData.generationSequence > (currentSub.publishedGenerationSequence || 0)`), preventing stale fan-out overwrites across all 9 concurrency scenarios.
+     - **Startup Reconciler Resumption:** Reconciler discovers incomplete fan-out via `status == 'published' && submissionFanoutStatus in ['pending', 'in_progress', 'partial']` and safely resumes remaining batches. After 5 failed attempts on any batch, transitions to `manual_review` and logs an alert.
    - If `capturedRevision < currentPublishedRevision`, the transaction throws immediately and aborts (`stale_aborted`) without touching published revision, records, or submission statuses.
 10. **Single Shared Generation Ordering Function & Split-Job Workflow:**
     - Unified ordering logic across generation creation, Case B recovery, pre-deployment guard, and finalization into one shared function `evaluateGenerationOrdering(artifactSeq, artifactGenId, activeSeq, activeGenId)`.
@@ -104,12 +105,12 @@ GitStore/
 │       ├── github-verifier.js      # REST API repository & asset validator
 │       ├── pre-deploy-guard.js     # Pre-deployment shared ordering assertion
 │       └── catalog-compiler.js     # Static JSON generator & recursive canonical digest
-├── docs/                           # Master Architectural Specifications (v1.8.0)
-│   ├── ARCHITECTURE.md             # Core system design, interface contracts, ADR-01 through ADR-18
-│   ├── DATABASE_SCHEMA.md          # Complete Firestore schema, reconciliation loop & security rules
-│   ├── SECURITY.md                 # Threat model, RBAC, action-bound step-up auth, 17-row verification matrix
-│   ├── SUBMISSION_PIPELINE.md      # Ingestion lifecycle, 12-state state machine, 11 failure scenarios
-│   ├── AUTHENTICATION.md           # GitHub OAuth, magic links, App Check reCAPTCHA Enterprise, step-up proof
+├── docs/                           # Master Architectural Specifications (v1.10.0)
+│   ├── ARCHITECTURE.md             # Core system design, interface contracts, ADR-01 through ADR-20
+│   ├── DATABASE_SCHEMA.md          # Complete Firestore schema, bounded fanout batches, reconciler logic & security rules
+│   ├── SECURITY.md                 # Threat model, RBAC, action-bound step-up auth, 18-row verification matrix
+│   ├── SUBMISSION_PIPELINE.md      # Ingestion lifecycle, 12-state state machine, 12 failure scenarios
+│   ├── AUTHENTICATION.md           # GitHub OAuth, magic links, App Check quotas, step-up proof
 │   ├── DEPLOYMENT_GUIDE.md         # Operations guide, split-job workflow, secrets, pre-deploy guard
 │   ├── TESTING_STRATEGY.md         # Testing pyramid, digest test vectors, rules unit tests, mocks
 │   ├── COST_AND_LIMITS.md          # Spark quota math, zero-cost architecture analysis
@@ -136,25 +137,25 @@ All technical specifications are organized within the [`docs/`](./docs) director
 
 | Document | Purpose | Version | Status |
 |---|---|---|---|
-| [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) | High-level architecture, contracts, ADR-01 to ADR-18 | 1.9.0 | `IN_REVIEW` ⏳ |
-| [`docs/DATABASE_SCHEMA.md`](./docs/DATABASE_SCHEMA.md) | Firestore collections, security rules, reconciler logic | 1.9.0 | `IN_REVIEW` ⏳ |
-| [`docs/SECURITY.md`](./docs/SECURITY.md) | Threat model, action-bound step-up proof, 17-row verification matrix | 1.9.0 | `IN_REVIEW` ⏳ |
-| [`docs/SUBMISSION_PIPELINE.md`](./docs/SUBMISSION_PIPELINE.md) | 12-state machine, ownership tiers, 11 failure scenarios | 1.9.0 | `IN_REVIEW` ⏳ |
-| [`docs/AUTHENTICATION.md`](./docs/AUTHENTICATION.md) | OAuth, magic links, App Check quotas, step-up proof | 1.9.0 | `IN_REVIEW` ⏳ |
-| [`docs/DEPLOYMENT_GUIDE.md`](./docs/DEPLOYMENT_GUIDE.md) | Node 24 workflow, secrets, pre-deploy guard, setup guide | 1.9.0 | `IN_REVIEW` ⏳ |
-| [`docs/TESTING_STRATEGY.md`](./docs/TESTING_STRATEGY.md) | Testing pyramid, digest test vectors, emulator tests | 1.9.0 | `IN_REVIEW` ⏳ |
-| [`docs/COST_AND_LIMITS.md`](./docs/COST_AND_LIMITS.md) | Free-tier limits, hard-stop behavior, zero-cost analysis | 1.9.0 | `IN_REVIEW` ⏳ |
-| [`docs/PRD.md`](./docs/PRD.md) | Product vision, target personas, functional requirements | 1.9.0 | `IN_REVIEW` ⏳ |
-| [`docs/SDD.md`](./docs/SDD.md) | System design, sequence diagrams, component breakdowns | 1.9.0 | `IN_REVIEW` ⏳ |
-| [`docs/PHASE_PLAN.md`](./docs/PHASE_PLAN.md) | Master development roadmap & phase control system | 1.9.0 | `IN_REVIEW` ⏳ |
-| [`docs/ROADMAP.md`](./docs/ROADMAP.md) | Strategic Gantt chart & execution timeline | 1.9.0 | `IN_REVIEW` ⏳ |
+| [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) | High-level architecture, contracts, ADR-01 to ADR-20 | 1.10.0 | `IN_REVIEW` ⏳ |
+| [`docs/DATABASE_SCHEMA.md`](./docs/DATABASE_SCHEMA.md) | Firestore collections, security rules, bounded fanout batches, reconciler logic | 1.10.0 | `IN_REVIEW` ⏳ |
+| [`docs/SECURITY.md`](./docs/SECURITY.md) | Threat model, action-bound step-up proof, 18-row verification matrix | 1.10.0 | `IN_REVIEW` ⏳ |
+| [`docs/SUBMISSION_PIPELINE.md`](./docs/SUBMISSION_PIPELINE.md) | 12-state machine, ownership tiers, 12 failure scenarios | 1.10.0 | `IN_REVIEW` ⏳ |
+| [`docs/AUTHENTICATION.md`](./docs/AUTHENTICATION.md) | OAuth, magic links, App Check quotas, step-up proof | 1.10.0 | `IN_REVIEW` ⏳ |
+| [`docs/DEPLOYMENT_GUIDE.md`](./docs/DEPLOYMENT_GUIDE.md) | Node 24 workflow, secrets, pre-deploy guard, query catalog | 1.10.0 | `IN_REVIEW` ⏳ |
+| [`docs/TESTING_STRATEGY.md`](./docs/TESTING_STRATEGY.md) | Testing pyramid, digest test vectors, emulator tests | 1.10.0 | `IN_REVIEW` ⏳ |
+| [`docs/COST_AND_LIMITS.md`](./docs/COST_AND_LIMITS.md) | Free-tier limits, hard-stop behavior, zero-cost analysis | 1.10.0 | `IN_REVIEW` ⏳ |
+| [`docs/PRD.md`](./docs/PRD.md) | Product vision, target personas, functional requirements | 1.10.0 | `IN_REVIEW` ⏳ |
+| [`docs/SDD.md`](./docs/SDD.md) | System design, sequence diagrams, component breakdowns | 1.10.0 | `IN_REVIEW` ⏳ |
+| [`docs/PHASE_PLAN.md`](./docs/PHASE_PLAN.md) | Master development roadmap & phase control system | 1.10.0 | `IN_REVIEW` ⏳ |
+| [`docs/ROADMAP.md`](./docs/ROADMAP.md) | Strategic Gantt chart & execution timeline | 1.10.0 | `IN_REVIEW` ⏳ |
 | [`docs/UI_DESIGN_SYSTEM.md`](./docs/UI_DESIGN_SYSTEM.md) | Obsidian Dark Neo-Brutalist tokens & layout specs | 1.0.0 | `APPROVED` ✅ |
 
 ---
 
 ## 🚦 Project Status & Execution Governance
 
-- **Current Active Phase:** **Phase 0.1.9 — Workflow Validation, Recovery SHA Preservation & Durable Finalization Recovery** (`IN_REVIEW` ⏳).
+- **Current Active Phase:** **Phase 0.1.10 — Fan-Out Ordering, Firestore Scalability & Recovery Error Integrity** (`IN_REVIEW` ⏳).
 - **Execution Rule:** GitStore operates under strict phase-gate control. Implementation work on **Phase 1 (Frontend Core Foundation)** requires explicit user `APPROVED` sign-off.
 - **Repository:** [`https://github.com/Rohitpvt/GitStore.git`](https://github.com/Rohitpvt/GitStore.git)
 - **Primary Branch:** `main`

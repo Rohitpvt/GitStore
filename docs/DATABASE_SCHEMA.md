@@ -177,6 +177,7 @@ interface SubmissionDocument {
   reviewedAt?: FirebaseFirestore.Timestamp | null; // Worker-Managed via Admin SDK
   publishedProductId?: string | null; // Worker-Managed via Admin SDK
   publishedGenerationId?: string | null; // Worker-Managed via Admin SDK
+  publishedGenerationSequence?: number | null; // Monotonic sequence of generation that published this submission (Worker-Managed via Admin SDK)
 
   createdAt: FirebaseFirestore.Timestamp;
   updatedAt: FirebaseFirestore.Timestamp;
@@ -362,12 +363,13 @@ interface SystemDeploymentDocument {
   reconciliationStatus: 'none' | 'sha_recovered' | 'pages_dispatched' | 'pending_retry' | 'fanout_pending' | 'reconciled' | 'manual_review' | 'abandoned';
   lastObservedPagesStatus: 'succeed' | 'queued' | 'in_progress' | 'errored' | null;
 
-  // Independently Recoverable Submission Fan-Out State
-  submissionFanoutStatus: 'pending' | 'in_progress' | 'completed' | 'manual_review';
-  expectedSubmissionIds: string[];   // Renamed from expectedProductIds; array of /submissions/{id} document IDs
-  completedSubmissionCount: number;  // Number of submissions confirmed updated
-  submissionFanoutCursor: number;    // Array index for resumption across batch boundaries
-  fanoutAttempts: number;            // Number of fan-out execution attempts
+  // Bounded & Independently Recoverable Submission Fan-Out Summary State (O(1) Document Size)
+  submissionFanoutStatus: 'pending' | 'in_progress' | 'completed' | 'partial' | 'failed' | 'manual_review';
+  expectedSubmissionCount: number;   // Total expected submissions across all batches (O(1) scalar)
+  completedSubmissionCount: number;  // Confirmed successfully processed/skipped submissions (O(1) scalar)
+  totalFanoutBatches: number;        // Total deterministic batch documents in subcollection (O(1) scalar)
+  completedFanoutBatches: number;    // Number of completed batches in subcollection (O(1) scalar)
+  fanoutAttempts: number;            // Number of fan-out execution attempts across the generation
   lastFanoutAttemptAt?: FirebaseFirestore.Timestamp | null;
   lastFanoutError?: string | null;
 
@@ -376,6 +378,30 @@ interface SystemDeploymentDocument {
   publishedAt?: FirebaseFirestore.Timestamp | null;
   finalizedAt?: FirebaseFirestore.Timestamp | null;
   updatedAt: FirebaseFirestore.Timestamp;
+}
+```
+
+### 2.11 Subcollection: `fanout_batches` (Bounded Submission Fan-Out Storage)
+- **Path:** `/system_deployments/{generationId}/fanout_batches/{batchId}`
+- **Document ID:** Deterministic zero-padded batch ID (`batch_00000`, `batch_00001`, ..., `batch_NNNNN`).
+- **Description:** Stores partitioned chunks of expected submission IDs (maximum 400 IDs per document, occupying ~13 KB, strictly obeying Firestore's 1 MiB document limit). Eliminates unbounded arrays from the parent generation document, enabling infinite horizontal scalability.
+- **Client Access:** `allow read, write: if false;` (Internal subcollection; Admin SDK only).
+
+```typescript
+interface FanoutBatchDocument {
+  generationId: string;              // Parent generation ID
+  batchIndex: number;                // 0-indexed sequential batch counter
+  batchId: string;                   // Deterministic ID (e.g., "batch_00000")
+  submissionIds: string[];           // Bounded array: max 400 /submissions/{id} document IDs (~13 KB << 1 MiB)
+  status: 'pending' | 'processing' | 'completed' | 'manual_review';
+  expectedCount: number;             // submissionIds.length (<= 400)
+  completedCount: number;            // Confirmed updated or idempotently verified submissions
+  skippedCount: number;              // Submissions skipped due to newer generation sequence or ineligible status
+  fanoutAttempts: number;            // Number of execution attempts for this specific batch
+  lastAttemptAt?: FirebaseFirestore.Timestamp | null;
+  lastError?: string | null;
+  createdAt: FirebaseFirestore.Timestamp;
+  completedAt?: FirebaseFirestore.Timestamp | null;
 }
 ```
 
@@ -429,6 +455,56 @@ export function evaluateGenerationOrdering(artifactSeq, artifactGenId, activeSeq
   if (artifactSeq === activeSeq && artifactGenId === activeGenId) return 'ALLOW_IDEMPOTENT';
   if (artifactSeq === activeSeq && artifactGenId !== activeGenId) return 'HALT_CONFLICT';
   return 'ALLOW_NEW';
+}
+
+/**
+ * Strict error classifier for GitHub Commits & Contents API inspection during commit recovery.
+ * Invariant: Only a confirmed HTTP 404 for missing manifest blob is treated as a benign skip.
+ * All other failures are classified as incomplete, retryable, corrupt, or fatal.
+ */
+export function classifyCommitInspectionError(err) {
+  // 1. Benign absence: Only a confirmed 404 indicating manifest blob does not exist in that commit
+  if (err.status === 404) {
+    return { classification: 'CANDIDATE_NO_MANIFEST', isFatal: false, isIncomplete: false, isCorrupt: false, retryable: false };
+  }
+
+  // 2. Fatal auth failure (bad or expired token)
+  if (err.status === 401) {
+    return { classification: 'API_AUTH_ERROR', isFatal: true, isIncomplete: true, isCorrupt: false, retryable: false };
+  }
+
+  // 3. Permission or secondary rate limit / abuse detection
+  if (err.status === 403) {
+    return { classification: 'API_PERMISSION_OR_RATE_LIMIT', isFatal: false, isIncomplete: true, isCorrupt: false, retryable: true };
+  }
+
+  // 4. Rate limit (primary API rate limit hit)
+  if (err.status === 429) {
+    return { classification: 'API_RATE_LIMIT', isFatal: false, isIncomplete: true, isCorrupt: false, retryable: true };
+  }
+
+  // 5. Upstream server error (5xx)
+  if (err.status >= 500 && err.status < 600) {
+    return { classification: 'API_SERVER_ERROR', isFatal: false, isIncomplete: true, isCorrupt: false, retryable: true };
+  }
+
+  // 6. Network timeouts, connection resets, DNS failures
+  if (err.code === 'ETIMEDOUT' || err.code === 'ECONNRESET' || err.code === 'ENOTFOUND' || err.name === 'AbortError' || (err.message && /timeout|reset|network|fetch/i.test(err.message))) {
+    return { classification: 'NETWORK_ERROR', isFatal: false, isIncomplete: true, isCorrupt: false, retryable: true };
+  }
+
+  // 7. Malformed JSON / SyntaxError during manifest blob parsing
+  if (err instanceof SyntaxError || (err.message && /JSON/i.test(err.message))) {
+    return { classification: 'CANDIDATE_CORRUPT_MANIFEST', isFatal: false, isIncomplete: false, isCorrupt: true, retryable: false };
+  }
+
+  // 8. Missing response content (malformed payload from Contents API)
+  if (err.message && /content/i.test(err.message)) {
+    return { classification: 'API_MALFORMED_RESPONSE', isFatal: false, isIncomplete: true, isCorrupt: true, retryable: true };
+  }
+
+  // 9. All other unexpected errors
+  return { classification: 'UNEXPECTED_ERROR', isFatal: false, isIncomplete: true, isCorrupt: false, retryable: true };
 }
 
 /**
@@ -513,9 +589,12 @@ async function reconcilePublishedState(db, octokit, pagesUrl) {
         console.warn(`[Reconciler] Local git log search failed: ${localGitErr.message}`);
       }
 
-      // Fallback: GitHub Commits API with Full Pagination & Granular Error Classification
+      // Fallback: GitHub Commits API with Full Pagination & Strict Error Classification
       if (!recoveredSha) {
         let currentUrl = `https://api.github.com/repos/Rohitpvt/GitStore/commits?sha=main&path=data/deployment-manifest.json&per_page=100`;
+        let hasCorruptCandidates = false;
+        let isFatalAuthError = false;
+
         while (currentUrl && !recoveredSha) {
           try {
             const apiCommits = await octokit.request(`GET ${currentUrl}`);
@@ -528,8 +607,14 @@ async function reconcilePublishedState(db, octokit, pagesUrl) {
                   path: 'data/deployment-manifest.json',
                   ref: item.sha
                 });
+
+                if (!fileContentRes.data || !fileContentRes.data.content) {
+                  throw new Error('API_MALFORMED_RESPONSE: Missing content field in GitHub Contents API response');
+                }
+
                 const decoded = Buffer.from(fileContentRes.data.content, 'base64').toString('utf8');
                 const manifest = JSON.parse(decoded);
+
                 if (manifest.generationId === gen.generationId && 
                     manifest.generationSequence === gen.generationSequence &&
                     manifest.catalogDigest === gen.catalogDigest) {
@@ -537,27 +622,33 @@ async function reconcilePublishedState(db, octokit, pagesUrl) {
                   break;
                 }
               } catch (blobErr) {
-                if (blobErr.status === 404) {
-                  // CANDIDATE_NO_MANIFEST: Commit did not touch manifest; continue to next candidate
+                // Strict Error Classification (Section 4 Invariants)
+                const errorInfo = classifyCommitInspectionError(blobErr);
+
+                if (errorInfo.classification === 'CANDIDATE_NO_MANIFEST') {
+                  // Benign candidate skip: Commit did not touch manifest blob
                   continue;
-                } else if (blobErr.status === 403 || blobErr.status === 429) {
-                  // API_RATE_LIMIT: Search cannot complete; must not declare empty
-                  console.warn(`[Reconciler] Rate limit hit during commit inspection for SHA ${item.sha}.`);
+                } else if (errorInfo.classification === 'CANDIDATE_CORRUPT_MANIFEST') {
+                  // Corrupt manifest JSON: Record corruption; DO NOT treat as empty or missing!
+                  console.warn(`[Reconciler] Corrupt manifest in commit ${item.sha}: ${blobErr.message}`);
+                  hasCorruptCandidates = true;
+                  continue;
+                } else if (errorInfo.isFatal) {
+                  // Fatal auth error: Must halt immediately and alert administrator
+                  console.error(`[Reconciler] Fatal commit inspection failure (${errorInfo.classification}): ${blobErr.message}`);
+                  isSearchIncomplete = true;
+                  isFatalAuthError = true;
+                  break;
+                } else if (errorInfo.isIncomplete) {
+                  // Upstream 5xx, 429/403 rate limit, network timeout, or connection reset
+                  console.warn(`[Reconciler] Incomplete commit inspection (${errorInfo.classification}) for SHA ${item.sha}: ${blobErr.message}`);
                   isSearchIncomplete = true;
                   break;
-                } else if (blobErr.status >= 500) {
-                  // API_SERVER_ERROR: Server error; search incomplete
-                  console.warn(`[Reconciler] Upstream 5xx error during commit inspection for SHA ${item.sha}.`);
-                  isSearchIncomplete = true;
-                  break;
-                } else {
-                  console.warn(`[Reconciler] Error inspecting commit ${item.sha}: ${blobErr.message}`);
-                  continue;
                 }
               }
             }
 
-            if (isSearchIncomplete || recoveredSha) break;
+            if (isSearchIncomplete || recoveredSha || isFatalAuthError) break;
 
             const linkHeader = apiCommits.headers['link'];
             const nextMatch = linkHeader ? linkHeader.match(/<([^>]+)>;\s*rel="next"/) : null;
@@ -568,30 +659,45 @@ async function reconcilePublishedState(db, octokit, pagesUrl) {
             break;
           }
         }
-      }
 
-      if (recoveredSha) {
-        console.log(`[Reconciler] Recovered catalogCommitSha ${recoveredSha} for generation ${gen.generationId}.`);
-        gen.catalogCommitSha = recoveredSha;
-        await genDoc.ref.update({
-          catalogCommitSha: recoveredSha,
-          reconciliationStatus: 'sha_recovered',
-          updatedAt: new Date()
-        });
-      } else if (isSearchIncomplete) {
-        console.warn(`[Reconciler] Search incomplete. Retaining generation ${gen.generationId} as pending_retry.`);
-        await genDoc.ref.update({ reconciliationStatus: 'pending_retry', updatedAt: new Date() });
-        continue;
-      } else {
-        console.warn(`[Reconciler] Exhaustive search confirmed EMPTY_SEARCH for generation ${gen.generationId}.`);
-        await genDoc.ref.update({
-          status: 'failed',
-          failureReason: 'commit_not_found_on_remote',
-          reconciliationStatus: 'abandoned',
-          retryEligibility: false,
-          updatedAt: new Date()
-        });
-        continue;
+        if (recoveredSha) {
+          console.log(`[Reconciler] Recovered catalogCommitSha ${recoveredSha} for generation ${gen.generationId}.`);
+          gen.catalogCommitSha = recoveredSha;
+          await genDoc.ref.update({
+            catalogCommitSha: recoveredSha,
+            reconciliationStatus: 'sha_recovered',
+            updatedAt: new Date()
+          });
+        } else if (isFatalAuthError) {
+          console.error(`[Reconciler] Fatal authentication failure on GitHub API. Retaining generation ${gen.generationId} in pending_retry.`);
+          await genDoc.ref.update({ reconciliationStatus: 'pending_retry', updatedAt: new Date() });
+          break; // Stop reconciler loop to avoid burning failed auth attempts
+        } else if (isSearchIncomplete) {
+          console.warn(`[Reconciler] Search incomplete due to network/rate-limit interruptions. Retaining generation ${gen.generationId} as pending_retry.`);
+          await genDoc.ref.update({ reconciliationStatus: 'pending_retry', updatedAt: new Date() });
+          continue;
+        } else if (hasCorruptCandidates) {
+          console.warn(`[Reconciler] Remote history contains corrupt manifest JSON. Routing generation ${gen.generationId} to manual_review.`);
+          await genDoc.ref.update({
+            status: 'failed',
+            reconciliationStatus: 'manual_review',
+            failureReason: 'corrupt_manifest_encountered_on_remote',
+            retryEligibility: false,
+            updatedAt: new Date()
+          });
+          continue;
+        } else {
+          // Exhaustive scan completed with ZERO network interruptions, ZERO auth errors, and ZERO corrupt candidates
+          console.warn(`[Reconciler] Exhaustive search confirmed EMPTY_SEARCH for generation ${gen.generationId}.`);
+          await genDoc.ref.update({
+            status: 'failed',
+            failureReason: 'commit_not_found_on_remote',
+            reconciliationStatus: 'abandoned',
+            retryEligibility: false,
+            updatedAt: new Date()
+          });
+          continue;
+        }
       }
     }
 
@@ -762,8 +868,8 @@ async function reconcilePublishedState(db, octokit, pagesUrl) {
             status: 'published',
             reconciliationStatus: 'fanout_pending',
             submissionFanoutStatus: 'pending',
-            submissionFanoutCursor: 0,
             completedSubmissionCount: 0,
+            completedFanoutBatches: 0,
             fanoutAttempts: 0,
             finalizedRevision: nextPublishedRev,
             verifiedAt: new Date(),
@@ -788,12 +894,13 @@ async function reconcilePublishedState(db, octokit, pagesUrl) {
   // 5. Query published generations with incomplete submission fan-out (Durable Fan-Out Recovery)
   const pendingFanoutGenerations = await db.collection('system_deployments')
     .where('status', '==', 'published')
-    .where('submissionFanoutStatus', 'in', ['pending', 'in_progress'])
+    .where('submissionFanoutStatus', 'in', ['pending', 'in_progress', 'partial'])
+    .orderBy('generationSequence', 'asc')
     .get();
 
   for (const fanoutDoc of pendingFanoutGenerations.docs) {
     const fanoutGen = fanoutDoc.data();
-    console.log(`[Reconciler] Resuming incomplete submission fan-out for generation ${fanoutGen.generationId} from cursor ${fanoutGen.submissionFanoutCursor || 0}`);
+    console.log(`[Reconciler] Resuming incomplete submission fan-out for generation ${fanoutGen.generationId} (${fanoutGen.completedFanoutBatches || 0}/${fanoutGen.totalFanoutBatches || 0} batches completed).`);
     await executeSubmissionFanout(db, fanoutDoc.ref, fanoutGen);
   }
 
@@ -801,26 +908,25 @@ async function reconcilePublishedState(db, octokit, pagesUrl) {
 }
 
 /**
- * Executes or resumes submission status fan-out in idempotent batches of 400 documents.
- * Guarantees progress persistence and safe resumption across worker crashes.
+ * Executes or resumes generation-aware, conditional submission status fan-out
+ * using bounded subcollection batches (/system_deployments/{generationId}/fanout_batches/{batchId}).
+ *
+ * Invariants Enforced (Phase 0.1.10):
+ * 1. Bounded Document Size: Submission IDs are stored exclusively in subcollection documents (max 400 IDs each).
+ *    Parent generation document keeps only O(1) summary counters, strictly obeying Firestore 1 MiB limits.
+ * 2. Status Eligibility Guard: Submissions must be in 'approved' or 'published' status. Submissions rejected,
+ *    delisted, or withdrawn by an administrator or developer are never resurrected to published.
+ * 3. Monotonic Generation Sequence: A submission is only updated if incoming genData.generationSequence
+ *    is strictly greater than its current publishedGenerationSequence. Stale older generations
+ *    cannot overwrite newer generation state.
+ * 4. Idempotent Replay: If publishedGenerationSequence matches, the update is recognized as already completed.
+ * 5. Bounded Transactional Mini-Chunks: Submissions within a batch are processed via atomic transactions
+ *    in chunks of 50 documents, guaranteeing state isolation without transaction timeouts.
  */
 async function executeSubmissionFanout(db, genDocRef, genData) {
-  const CHUNK_SIZE = 400;
-  const submissionIds = genData.expectedSubmissionIds || [];
-  let cursor = genData.submissionFanoutCursor || 0;
-  let completed = genData.completedSubmissionCount || 0;
+  const genId = genData.generationId;
+  const genSeq = genData.generationSequence;
   let attempts = (genData.fanoutAttempts || 0) + 1;
-
-  if (cursor >= submissionIds.length) {
-    await genDocRef.update({
-      submissionFanoutStatus: 'completed',
-      reconciliationStatus: 'reconciled',
-      status: 'finalized',
-      finalizedAt: new Date(),
-      updatedAt: new Date()
-    });
-    return;
-  }
 
   await genDocRef.update({
     submissionFanoutStatus: 'in_progress',
@@ -829,49 +935,147 @@ async function executeSubmissionFanout(db, genDocRef, genData) {
     updatedAt: new Date()
   });
 
-  try {
-    while (cursor < submissionIds.length) {
-      const chunk = submissionIds.slice(cursor, cursor + CHUNK_SIZE);
-      const batch = db.batch();
+  // Query pending and processing fan-out batches for this generation
+  const batchesQuery = await genDocRef.collection('fanout_batches')
+    .where('status', 'in', ['pending', 'processing'])
+    .orderBy('batchIndex', 'asc')
+    .get();
 
-      for (const subId of chunk) {
-        const subRef = db.collection('submissions').doc(subId);
-        batch.update(subRef, {
-          status: 'published',
-          publishedGenerationId: genData.generationId,
-          'processingLease.leaseHolder': null,
-          updatedAt: new Date()
+  if (batchesQuery.empty) {
+    // Check if all batches are completed
+    const completedBatchesSnap = await genDocRef.collection('fanout_batches')
+      .where('status', '==', 'completed')
+      .get();
+
+    if (completedBatchesSnap.size === (genData.totalFanoutBatches || 0) && (genData.totalFanoutBatches || 0) > 0) {
+      await genDocRef.update({
+        submissionFanoutStatus: 'completed',
+        reconciliationStatus: 'reconciled',
+        status: 'finalized',
+        finalizedAt: new Date(),
+        updatedAt: new Date()
+      });
+      console.log(`[Fanout] All ${genData.totalFanoutBatches} batches completed for generation ${genId}. Finalized.`);
+    }
+    return;
+  }
+
+  try {
+    for (const batchDoc of batchesQuery.docs) {
+      const batchData = batchDoc.data();
+      const submissionIds = batchData.submissionIds || [];
+      const batchAttempts = (batchData.fanoutAttempts || 0) + 1;
+
+      // Mark batch processing
+      await batchDoc.ref.update({
+        status: 'processing',
+        fanoutAttempts: batchAttempts,
+        lastAttemptAt: new Date(),
+        updatedAt: new Date()
+      });
+
+      let batchCompleted = 0;
+      let batchSkipped = 0;
+      const MINI_CHUNK_SIZE = 50;
+
+      // Process submission IDs in transactional mini-chunks
+      for (let i = 0; i < submissionIds.length; i += MINI_CHUNK_SIZE) {
+        const chunkIds = submissionIds.slice(i, i + MINI_CHUNK_SIZE);
+
+        await db.runTransaction(async (transaction) => {
+          // Read all submissions in the mini-chunk
+          const subRefs = chunkIds.map(id => db.collection('submissions').doc(id));
+          const subSnapshots = await Promise.all(subRefs.map(ref => transaction.get(ref)));
+
+          for (let j = 0; j < subSnapshots.length; j++) {
+            const snap = subSnapshots[j];
+            const subId = chunkIds[j];
+            const ref = subRefs[j];
+
+            if (!snap.exists) {
+              console.warn(`[Fanout] Submission ${subId} not found in database. Skipping.`);
+              batchSkipped++;
+              continue;
+            }
+
+            const currentSub = snap.data();
+
+            // 1. Status Eligibility Guard: Never resurrect non-approved / rejected / delisted / withdrawn submissions
+            const permittedStatuses = ['approved', 'published'];
+            if (!permittedStatuses.includes(currentSub.status)) {
+              console.warn(`[Fanout] Submission ${subId} status is '${currentSub.status}' (ineligible for publication). Skipping.`);
+              batchSkipped++;
+              continue;
+            }
+
+            // 2. Monotonic Generation Sequence Check
+            const currentPublishedSeq = currentSub.publishedGenerationSequence || 0;
+
+            if (currentPublishedSeq > genSeq) {
+              // Current submission is already associated with a NEWER generation!
+              console.warn(`[Fanout] Submission ${subId} already published by newer sequence ${currentPublishedSeq} > ${genSeq}. Rejecting stale fan-out update.`);
+              batchSkipped++;
+              continue;
+            }
+
+            if (currentPublishedSeq === genSeq && currentSub.publishedGenerationId === genId && currentSub.status === 'published') {
+              // Idempotent replay: already published by this exact generation
+              batchCompleted++;
+              continue;
+            }
+
+            // 3. Valid Monotonic Publication Update
+            const targetProductId = currentSub.targetProductId || `prod_${currentSub.repoNumericId}_${currentSub.productData?.slug || ''}`;
+            transaction.update(ref, {
+              status: 'published',
+              publishedGenerationId: genId,
+              publishedGenerationSequence: genSeq,
+              publishedProductId: targetProductId,
+              'processingLease.leaseHolder': null,
+              updatedAt: new Date()
+            });
+            batchCompleted++;
+          }
         });
       }
 
-      // 1. Commit submission batch
-      await batch.commit();
+      // Mark batch completed
+      await batchDoc.ref.update({
+        status: 'completed',
+        completedCount: batchCompleted,
+        skippedCount: batchSkipped,
+        completedAt: new Date(),
+        updatedAt: new Date()
+      });
 
-      // 2. Advance cursor atomically after batch success
-      cursor += chunk.length;
-      completed = cursor;
-
+      // Update parent summary counters atomically
       await genDocRef.update({
-        submissionFanoutCursor: cursor,
-        completedSubmissionCount: completed,
+        completedSubmissionCount: FirebaseFirestore.FieldValue.increment(batchCompleted),
+        completedFanoutBatches: FirebaseFirestore.FieldValue.increment(1),
         updatedAt: new Date()
       });
     }
 
-    // 3. Mark generation fully finalized and reconciled
-    await genDocRef.update({
-      submissionFanoutStatus: 'completed',
-      reconciliationStatus: 'reconciled',
-      status: 'finalized',
-      finalizedAt: new Date(),
-      updatedAt: new Date()
-    });
-    console.log(`[Fanout] Submission fan-out successfully completed for generation ${genData.generationId} (${completed} submissions).`);
+    // Check if all batches are now completed
+    const remainingBatchesSnap = await genDocRef.collection('fanout_batches')
+      .where('status', 'in', ['pending', 'processing'])
+      .get();
+
+    if (remainingBatchesSnap.empty) {
+      await genDocRef.update({
+        submissionFanoutStatus: 'completed',
+        reconciliationStatus: 'reconciled',
+        status: 'finalized',
+        finalizedAt: new Date(),
+        updatedAt: new Date()
+      });
+      console.log(`[Fanout] All batches finalized for generation ${genId}.`);
+    }
 
   } catch (err) {
-    console.error(`[Fanout] Submission fan-out error on generation ${genData.generationId} at cursor ${cursor}: ${err.message}`);
+    console.error(`[Fanout] Error processing fan-out for generation ${genId}: ${err.message}`);
     if (attempts >= 5) {
-      console.error(`[Fanout] Max retries (5) exceeded. Transitioning generation ${genData.generationId} to manual_review.`);
+      console.error(`[Fanout] Max retries (5) exceeded. Transitioning generation ${genId} to manual_review.`);
       await genDocRef.update({
         submissionFanoutStatus: 'manual_review',
         reconciliationStatus: 'manual_review',
@@ -880,23 +1084,19 @@ async function executeSubmissionFanout(db, genDocRef, genData) {
       });
       await db.collection('admin_logs').add({
         action: 'SUBMISSION_FANOUT_FAILED',
-        generationId: genData.generationId,
-        cursor: cursor,
+        generationId: genId,
         attempts: attempts,
         error: err.message,
         createdAt: new Date()
       });
     } else {
       await genDocRef.update({
+        submissionFanoutStatus: 'partial',
         lastFanoutError: err.message,
         updatedAt: new Date()
       });
     }
-    throw err;
   }
-}
-
-  return handoffResult;
 }
 ```
 
@@ -987,6 +1187,79 @@ service cloud.firestore {
         && (!('featureNotes' in payload) || (payload.featureNotes is string && payload.featureNotes.size() <= 500));
     }
 
+    // Exhaustive Nested productData Schema Validators (Section 5 Invariants)
+    function isValidProductData(p) {
+      return p is map
+        && p.keys().hasAll([
+          'name', 'slug', 'repoUrl', 'repoOwner', 'repoName', 'releaseTag',
+          'selectedAsset', 'shortDescription', 'fullDescription', 'category',
+          'iconUrl', 'screenshots', 'supportedPlatforms', 'version', 'license'
+        ])
+        && p.keys().hasOnly([
+          'name', 'slug', 'repoUrl', 'repoOwner', 'repoName', 'releaseTag',
+          'selectedAsset', 'shortDescription', 'fullDescription', 'category',
+          'iconUrl', 'screenshots', 'supportedPlatforms', 'version', 'license',
+          'liveDemoUrl'
+        ])
+        // Basic Information
+        && p.name is string && p.name.size() >= 3 && p.name.size() <= 60
+        && p.slug is string && p.slug.size() >= 3 && p.slug.size() <= 30
+        && p.slug.matches('^[a-z0-9]+(-[a-z0-9]+)*$')
+        && p.repoUrl is string && p.repoUrl.size() <= 200
+        && p.repoUrl.matches('^https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')
+        && p.repoOwner is string && p.repoOwner.size() >= 1 && p.repoOwner.size() <= 39
+        && p.repoOwner.matches('^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$')
+        && p.repoName is string && p.repoName.size() >= 1 && p.repoName.size() <= 100
+        && p.repoName.matches('^[A-Za-z0-9_.-]+$')
+        && p.releaseTag is string && p.releaseTag.size() >= 1 && p.releaseTag.size() <= 50
+        && p.shortDescription is string && p.shortDescription.size() >= 10 && p.shortDescription.size() <= 200
+        && p.fullDescription is string && p.fullDescription.size() >= 20 && p.fullDescription.size() <= 10000
+        && p.category is string && p.category in [
+          'developer-tools', 'utilities', 'productivity', 'graphics-media',
+          'games', 'education', 'security', 'other'
+        ]
+        && p.version is string && p.version.size() >= 1 && p.version.size() <= 32
+        && p.license is string && p.license.size() >= 1 && p.license.size() <= 50
+        // Selected Asset Map (all 5 fields validated)
+        && isValidSelectedAsset(p.selectedAsset)
+        // Media (iconUrl + screenshots list elements)
+        && p.iconUrl is string && (p.iconUrl == '' || (p.iconUrl.size() <= 500 && p.iconUrl.matches('^https://.*')))
+        && isValidScreenshots(p.screenshots)
+        // Platforms (enum list validation)
+        && isValidPlatforms(p.supportedPlatforms)
+        // Optional liveDemoUrl
+        && (!('liveDemoUrl' in p) || p.liveDemoUrl == null || (p.liveDemoUrl is string && p.liveDemoUrl.size() <= 500 && p.liveDemoUrl.matches('^https://.*')));
+    }
+
+    function isValidSelectedAsset(asset) {
+      return asset is map
+        && asset.keys().hasAll(['name', 'extension', 'sizeBytes', 'downloadUrl', 'assetId'])
+        && asset.keys().hasOnly(['name', 'extension', 'sizeBytes', 'downloadUrl', 'assetId'])
+        && asset.name is string && asset.name.size() >= 1 && asset.name.size() <= 128
+        && asset.extension is string && asset.extension.size() >= 1 && asset.extension.size() <= 16
+        && asset.sizeBytes is int && asset.sizeBytes > 0 && asset.sizeBytes <= 524288000 // 500 MiB limit
+        && asset.downloadUrl is string && asset.downloadUrl.size() <= 500 && asset.downloadUrl.matches('^https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/releases/download/.*')
+        && asset.assetId is int && asset.assetId > 0;
+    }
+
+    function isValidScreenshots(shots) {
+      return shots is list
+        && shots.size() <= 6
+        && (shots.size() < 1 || (shots[0] is string && shots[0].size() <= 500 && shots[0].matches('^https://.*')))
+        && (shots.size() < 2 || (shots[1] is string && shots[1].size() <= 500 && shots[1].matches('^https://.*')))
+        && (shots.size() < 3 || (shots[2] is string && shots[2].size() <= 500 && shots[2].matches('^https://.*')))
+        && (shots.size() < 4 || (shots[3] is string && shots[3].size() <= 500 && shots[3].matches('^https://.*')))
+        && (shots.size() < 5 || (shots[4] is string && shots[4].size() <= 500 && shots[4].matches('^https://.*')))
+        && (shots.size() < 6 || (shots[5] is string && shots[5].size() <= 500 && shots[5].matches('^https://.*')));
+    }
+
+    function isValidPlatforms(platforms) {
+      return platforms is list
+        && platforms.size() >= 1
+        && platforms.size() <= 6
+        && platforms.hasOnly(['windows', 'macos', 'linux', 'android', 'ios', 'web']);
+    }
+
     // -------------------------------------------------------------------------
     // 1. Private User Documents (/users/{userId})
     // -------------------------------------------------------------------------
@@ -1037,34 +1310,14 @@ service cloud.firestore {
         && request.resource.data.status == 'queued'
         && request.resource.data.claimStatus == 'claimed'
         && request.resource.data.submissionSource == 'dashboard'
-        && request.resource.data.productData is map
-        && request.resource.data.productData.keys().hasOnly([
-          'name', 'slug', 'repoUrl', 'repoOwner', 'repoName', 'releaseTag',
-          'selectedAsset', 'shortDescription', 'fullDescription', 'category',
-          'iconUrl', 'screenshots', 'supportedPlatforms', 'version',
-          'license', 'liveDemoUrl'
-        ])
-        && request.resource.data.productData.name is string
-        && request.resource.data.productData.name.size() >= 3
-        && request.resource.data.productData.name.size() <= 60
-        && request.resource.data.productData.shortDescription is string
-        && request.resource.data.productData.shortDescription.size() <= 200
-        && request.resource.data.productData.fullDescription is string
-        && request.resource.data.productData.fullDescription.size() <= 10000
-        && request.resource.data.productData.screenshots is list
-        && request.resource.data.productData.screenshots.size() <= 6
-        && request.resource.data.productData.supportedPlatforms is list
-        && request.resource.data.productData.supportedPlatforms.size() >= 1
-        && request.resource.data.productData.selectedAsset is map
-        && request.resource.data.productData.selectedAsset.keys().hasOnly(['name', 'extension', 'sizeBytes', 'downloadUrl', 'assetId'])
-        && request.resource.data.productData.selectedAsset.sizeBytes is number
-        && request.resource.data.productData.selectedAsset.sizeBytes > 0
+        && isValidProductData(request.resource.data.productData)
         && request.resource.data.createdAt == request.time
         && request.resource.data.updatedAt == request.time;
       allow update: if isOwner(resource.data.developerUid)
         && (resource.data.status == 'queued' || resource.data.status == 'rejected')
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['productData', 'status', 'updatedAt'])
         && request.resource.data.status == 'queued'
+        && isValidProductData(request.resource.data.productData)
         && request.resource.data.updatedAt == request.time;
       allow delete: if false;
     }
@@ -1186,6 +1439,9 @@ service cloud.firestore {
     }
     match /system_deployments/{generationId} {
       allow read, write: if false;
+      match /fanout_batches/{batchId} {
+        allow read, write: if false;
+      }
     }
     match /system_config/deployment_state {
       allow read, write: if false;
@@ -1199,3 +1455,84 @@ service cloud.firestore {
     }
   }
 }
+```
+
+---
+
+## 5. Required Composite Indexes (`firestore.indexes.json`)
+
+To ensure efficient queries for batch workers, reconcilers, and administration without table scans, the following composite indexes must be defined:
+
+```json
+{
+  "indexes": [
+    {
+      "collectionGroup": "system_deployments",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "submissionFanoutStatus", "order": "ASCENDING" },
+        { "fieldPath": "generationSequence", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "system_deployments",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "reconciliationStatus", "order": "ASCENDING" },
+        { "fieldPath": "generationSequence", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "system_deployments",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "submissionFanoutStatus", "order": "ASCENDING" },
+        { "fieldPath": "createdAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "fanout_batches",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "batchIndex", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "fanout_batches",
+      "queryScope": "COLLECTION_GROUP",
+      "fields": [
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "createdAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "submissions",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "publishedGenerationSequence", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "submissions",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "developerUid", "order": "ASCENDING" },
+        { "fieldPath": "createdAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "moderation_requests",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "createdAt", "order": "ASCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}
+```

@@ -15,8 +15,8 @@ The design of GitStore is governed by seven non-negotiable architectural invaria
 3. **Static-First Read Architecture & Targeted Free Quotas:** Storefront visitor traffic is 100% decoupled from the transactional database. 100% of anonymous catalog requests terminate at GitHub Pages' static file server (`data/catalog.json`), keeping Cloud Firestore operations reserved strictly for authenticated developer interactions, submission workflows, and background worker state transitions. Operating costs target $0.00/month by remaining strictly within the published free quotas of GitHub and Firebase (Spark Plan) without attached billing accounts.
 4. **Zero-Trust Client Boundary & Complete Field Integrity:** The client-side browser is treated as untrusted. No client-side code possesses the authority to grant permissions, verify developers, alter product publication statuses, claim processing leases, or bypass release validation. User profile documents (`/users/{uid}`) are strictly private; public developer metadata is isolated in an explicit public projection (`/public_profiles/{uid}`). In `/submissions/{submissionId}`, client creation is strictly restricted to developer-owned payload fields; worker-managed fields (`validationResults`, `ownershipProof`, `processingLease`, `adminNotes`, `reviewedBy`, `reviewedAt`, `publishedProductId`) are excluded from client creation allowlists and initialized solely by trusted workers via the Firebase Admin SDK. In `/moderation_requests`, Firestore rules enforce action-specific nested payload schemas and derive target document paths directly from action types and target IDs. Internal collections (`/system_deployments`, `/system_config/deployment_state`, `/system_config/catalog_state`, `/admin_logs`, `/consumed_stepup_nonces`) default to deny for all client access.
 5. **Decoupled Privileged Administration via Option A with Nonce Replay Protection:** Normal browser clients never receive Firebase Admin SDK credentials, and client JavaScript cannot mint custom claims. All privileged administrative and moderation operations execute via the privileged **GitHub Actions Batch Worker**, verified authoritatively against **GitStore's own canonical GitHub repository** (`Rohitpvt/GitStore`) collaborator permissions (`role_name === 'admin'` or `'maintain'`). Privileged operations strictly require fresh, interactive GitHub reauthentication (`reauthenticateWithPopup`). **Zero raw OAuth access tokens are stored in Firestore.** The request stores an action-bound payload containing caller UID (`requestedByUid`), immutable numeric GitHub ID (`identities['github.com'][0]`), `auth_time`, action, target document path, action nonce, action-specific payload, and a client-generated `actionHash` (which serves as a client data-integrity checksum, not a cryptographic signature). To prevent nonce reuse across different request documents, worker processing atomically claims the request and reserves the nonce in a dedicated collection `/consumed_stepup_nonces/{nonceHash}` within a single Firestore transaction. The Security Rules enforce a strict 5-minute authentication freshness gate at creation time (`auth_time < 300s`), while worker execution operates on a 30-minute queue TTL from `createdAt`.
-6. **Node 24 GitHub Actions Pipeline, Clean Staging & Dedicated Pages Status (`succeed`):** Batch processing workflows execute on official GitHub Actions pinned to Node 24 runtimes (`actions/checkout@v5.0.0`, `actions/setup-node@v7.1.0`, `actions/upload-pages-artifact@v5.0.0`, `actions/deploy-pages@v5.0.1`). Artifact staging follows a single authoritative procedure: the `site/` staging directory is constructed exclusively from the verified source commit, its digest is recomputed and verified (`stagedDigest === catalogDigest`), and no subsequent workflow step copies from `main`. Step outputs are exported via direct append writes to `$GITHUB_OUTPUT`. GitHub Pages deployment status is verified using the dedicated official endpoint `GET /repos/{owner}/{repo}/pages/deployments/{pages_deployment_id}` checking for `"status": "succeed"`. Fallback commit recovery follows the full GitHub Commits API pagination loop without arbitrary page caps, distinguishes rate-limit or network errors (`INCOMPLETE_SEARCH`) from true missing commits (`EMPTY_SEARCH`), and validates commit SHA formats before shell execution.
-7. **Transactional Generation Ordering & 2-Tier Finalization:** When finalizing deployment state, the worker executes an atomic transaction that reads current versions of `/system_config/catalog_state`, `/system_config/deployment_state`, and `/system_deployments/{generationId}` BEFORE any writes. Inside the transaction, it evaluates the shared ordering decision (`evaluateGenerationOrdering`) and catalog revision monotonicity (`capturedRevision >= latestPublishedRevision` and `capturedRevision <= latestRequestedRevision`). Stale generations abort immediately (`stale_aborted`) without modifying published sequence, published revision, commit SHA, or submission statuses. To strictly respect the Firestore 500-write limit, finalization uses a 2-tier architecture: the 3-write atomic transaction establishes the global canonical state, followed by idempotent batched writes (max 400 docs/batch) to fan out published statuses to submissions.
+6. **Node 24 GitHub Actions Pipeline, Clean Staging & Dedicated Pages Status (`succeed`):** Batch processing workflows execute on official GitHub Actions pinned to Node 24 runtimes (`actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1` [v7.0.1], `actions/setup-node@0a44ba7841725637a54e280ec667c276c6cc814e` [v7.1.0], `actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa` [v5.0.0], `actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e` [v5.0.1]). Runner execution requires GitHub Actions Runner `>= v2.327.1`. Native Git CLI operations (`git push`) succeed with default `persist-credentials: true` using the runner's git credential helper. Artifact staging follows a single authoritative procedure: the `site/` staging directory is constructed exclusively from the verified source commit, its digest is recomputed and verified (`stagedDigest === catalogDigest`), and no subsequent workflow step copies from `main`. Step outputs are exported via direct append writes to `$GITHUB_OUTPUT`. GitHub Pages deployment status is verified using the dedicated official endpoint `GET /repos/{owner}/{repo}/pages/deployments/{pages_deployment_id}` checking for `"status": "succeed"`. Fallback commit recovery follows the full GitHub Commits API pagination loop without arbitrary page caps, distinguishes rate-limit or network errors (`INCOMPLETE_SEARCH`) and corrupt manifest blobs (`CANDIDATE_CORRUPT_MANIFEST`) from true missing commits (`EMPTY_SEARCH`), and validates commit SHA formats before shell execution.
+7. **Transactional Generation Ordering, Bounded Subcollections & Conditional Monotonic Fan-Out:** When finalizing deployment state, the worker executes an atomic transaction that reads current versions of `/system_config/catalog_state`, `/system_config/deployment_state`, and `/system_deployments/{generationId}` BEFORE any writes. Inside the transaction, it evaluates the shared ordering decision (`evaluateGenerationOrdering`) and catalog revision monotonicity (`capturedRevision >= latestPublishedRevision` and `capturedRevision <= latestRequestedRevision`). Stale generations abort immediately (`stale_aborted`) without modifying published sequence, published revision, commit SHA, or submission statuses. To strictly respect the Firestore 1 MiB document limit and 500-write limit, finalization uses a 2-tier architecture: the 3-write atomic transaction establishes the global canonical state, while submission fan-out work is stored in bounded deterministic subcollections (`/system_deployments/{generationId}/fanout_batches/{batchId}`) capped at 400 IDs each (~13 KB << 1 MiB). Parent documents store only $O(1)$ scalar summary counters. Submission status fan-out executes conditional transactional updates verifying status eligibility (`approved` only; never resurrecting `rejected`, `delisted`, or `withdrawn` submissions) and strictly monotonic generation advancement (`publishedGenerationSequence`), preventing stale fan-out overwrites across all concurrency interleavings.
 
 ---
 
@@ -298,45 +298,62 @@ Evaluate:
   - Assert `freshGen.capturedRevision <= catalogState.latestRequestedRevision` (future revision anomaly check).
   - Write 1: Update `/system_config/deployment_state`.
   - Write 2: Update `/system_config/catalog_state`.
-  - Write 3: Update `/system_deployments/{generationId}` (`status: 'published'`, `reconciliationStatus: 'fanout_pending'`, `submissionFanoutStatus: 'pending'`, `submissionFanoutCursor: 0`, `completedSubmissionCount: 0`).
+  - Write 3: Update `/system_deployments/{generationId}` (`status: 'published'`, `reconciliationStatus: 'fanout_pending'`, `submissionFanoutStatus: 'pending'`, `completedSubmissionCount: 0`, `completedFanoutBatches: 0`, `fanoutAttempts: 0`).
 
-#### 3.6.2 Independently Recoverable Submission Status Fan-Out (Tier 2)
-To respect Firestore's 500-write limit and prevent submissions from becoming permanently stuck if a worker stops midway:
-- Submission fan-out is tracked independently on the generation document:
-  ```typescript
-  interface SubmissionFanoutState {
-    submissionFanoutStatus: 'pending' | 'in_progress' | 'completed' | 'manual_review';
-    expectedSubmissionIds: string[];   // Renamed from expectedProductIds; contains /submissions/{id} document IDs
-    completedSubmissionCount: number;
-    submissionFanoutCursor: number;
-    fanoutAttempts: number;
-    lastFanoutAttemptAt?: FirebaseFirestore.Timestamp | null;
-    lastFanoutError?: string | null;
-  }
-  ```
-- **Batching & Cursor Tracking:** The worker processes `expectedSubmissionIds` from `submissionFanoutCursor` in blocks of 400 documents (`db.batch()`). After each batch commits, `submissionFanoutCursor` is updated.
-- **Idempotency:** Updating `/submissions/{id}` to `{ status: 'published', publishedGenerationId: gen.generationId }` is strictly idempotent. A crash before cursor recording re-runs the previous batch safely.
-- **Completion & Finalization:** When all submissions are processed, the generation document is marked `submissionFanoutStatus: 'completed'`, `reconciliationStatus: 'reconciled'`, and `status: 'finalized'`.
-- **Manual Review Fallback:** If fan-out fails 5 consecutive times, the generation transitions to `submissionFanoutStatus: 'manual_review'`, and an alert is recorded in `/admin_logs`.
-- **Startup Discovery Queries:**
-  - Incomplete fan-out: `where('status', '==', 'published').where('submissionFanoutStatus', 'in', ['pending', 'in_progress'])`
-  - Manual review required: `where('submissionFanoutStatus', '==', 'manual_review')`
+#### 3.6.2 Bounded Fan-Out Subcollections & Conditional Monotonic Submission Fan-Out (Tier 2)
+To strictly respect Firestore's 1 MiB document limit and 500-write transaction limits, submission fan-out work is partitioned into bounded subcollections:
+- **Bounded Storage Schema (`/system_deployments/{generationId}/fanout_batches/{batchId}`):**
+  - Submission IDs are never stored in an unbounded array on the parent document.
+  - Work is partitioned into deterministic subcollection documents (`batch_00000`, `batch_00001`, ...) containing at most 400 submission IDs (~13 KB << 1 MiB).
+  - Parent document `/system_deployments/{generationId}` retains strictly bounded $O(1)$ scalar summary fields:
+    ```typescript
+    interface SystemDeploymentSummary {
+      expectedSubmissionCount: number;
+      completedSubmissionCount: number;
+      submissionFanoutStatus: 'pending' | 'in_progress' | 'completed' | 'partial' | 'failed' | 'manual_review';
+      totalFanoutBatches: number;
+      completedFanoutBatches: number;
+      fanoutAttempts: number;
+      lastFanoutAttemptAt?: FirebaseFirestore.Timestamp | null;
+      lastFanoutError?: string | null;
+    }
+    ```
+- **Conditional Generation-Aware Fan-Out Execution:**
+  - Fan-out updates are executed via `db.runTransaction` in transactional mini-chunks (50 documents per chunk) to eliminate write contention and transaction timeouts.
+  - Every submission update verifies:
+    1. **Status Eligibility:** `sub.status` must be `approved` or `published`. If the submission was rejected, delisted, or withdrawn by an administrator or author, the update is skipped to prevent resurrecting non-approved submissions.
+    2. **Monotonic Generation Sequence Advance:** Incoming `genData.generationSequence` must be strictly greater than `currentSub.publishedGenerationSequence || 0`. If an incoming fan-out has an older sequence, it is rejected as a stale overwrite.
+    3. **Idempotent Replay:** If `publishedGenerationSequence === genData.generationSequence` and `publishedGenerationId === genData.generationId`, the submission is acknowledged as already processed (no-op).
+    4. **Audit Trail:** Writes `status = 'published'`, `publishedGenerationId = genData.generationId`, `publishedGenerationSequence = genData.generationSequence`, `publishedProductId = prodId`, `updatedAt = new Date()`.
+- **Exhaustive Concurrency Resolution (9 Invariants):**
+  1. *A and B fan-out simultaneously:* Firestore transactions enforce optimistic concurrency. If B (sequence 11) commits first, A (sequence 10) retries, reads sequence 11, observes $10 < 11$, and aborts update. If A commits first, B reads sequence 10, observes $11 > 10$, and updates to 11. B always wins monotonically.
+  2. *A resumes after B has completed:* A reads `publishedGenerationSequence == 11` > 10, skips all touched documents as stale. B's state is preserved.
+  3. *A resumes after B has published but before B completes fan-out:* For submissions B touched, A skips ($10 < 11$). For submissions B has not touched yet, A updates to 10; when B reaches them later, B updates $11 > 10$. B ultimately wins.
+  4. *Admin rejects a submission after A captured its revision:* In Firestore, `sub.status` is `'rejected'`. A's fan-out transaction reads status, fails status eligibility guard, and skips the submission. Rejection is preserved.
+  5. *Admin delists a product during A's deployment:* `sub.status` is `'delisted'`. A's fan-out transaction fails status eligibility guard, skipping update. Product remains delisted.
+  6. *Worker crashes after a batch commits:* Batches commit atomically. Upon restart, reconciler resumes batch; submissions already updated evaluate `already_completed` (no-op), and remaining records commit cleanly.
+  7. *Worker crashes before cursor / batch completion write:* Re-running the batch evaluates each document idempotently. Zero duplicate increments.
+  8. *Duplicate fan-out worker execution:* Multiple runners process batches concurrently. Idempotent transactions ensure exact state convergence with zero conflicting writes.
+  9. *Submission already associated with newer published generation:* Monotonic guard detects $S_{current} > S_{incoming}$ and rejects stale update.
+- **Completion & Manual Review Fallback:** When all batches achieve `status: 'completed'`, the parent generation transitions to `submissionFanoutStatus: 'completed'`, `reconciliationStatus: 'reconciled'`, and `status: 'finalized'`. If a batch fails 5 consecutive times, it transitions to `status: 'manual_review'` and alerts administrators via `/admin_logs`.
 
 ---
 
 ### 3.7 Interface Contract: Commit Recovery Granular Error Classification
 
-During startup commit recovery, candidate commit inspections on the GitHub Commits API distinguish benign candidate mismatches from critical search interruptions:
+During startup commit recovery, candidate commit inspections on the GitHub Commits & Contents API distinguish benign candidate mismatches from critical search interruptions and manifest corruptions:
 
-| Event / Error | HTTP Status | Classification | Operational Behavior |
+| Event / Error | HTTP Status / Exception | Classification | Operational Behavior |
 |---|---|---|---|
-| Manifest file not in commit | `404 Not Found` | `CANDIDATE_NO_MANIFEST` | Normal for non-catalog commits. Continue inspecting next candidate. |
-| Manifest blob unparseable | `200 OK` (bad JSON) | `CANDIDATE_MANIFEST_CORRUPT` | Log warning. Continue inspecting next candidate. |
-| Manifest generation mismatch | `200 OK` (diff ID) | `CANDIDATE_GENERATION_MISMATCH` | Continue inspecting next candidate. |
-| Secondary rate limit / abuse | `403 Forbidden` / `429` | `API_RATE_LIMIT` | **Search Incomplete.** Retain generation as `pending_retry`. Do not declare empty. |
-| Upstream timeout / 5xx | `500` / `502` / `503` | `API_SERVER_ERROR` | **Search Incomplete.** Retain generation as `pending_retry`. Do not declare empty. |
-| Authentication failure | `401 Unauthorized` | `API_AUTH_ERROR` | Fatal configuration error. Halt batch worker immediately. |
-| All pages checked, 0 match | Complete pagination | `EMPTY_SEARCH` | Declared **ONLY** when search completes with zero interruptions. Mark `abandoned`. |
+| Manifest file not in candidate commit | `404 Not Found` | `CANDIDATE_NO_MANIFEST` | **Benign candidate skip.** Normal for non-catalog commits. Continue inspecting next candidate. |
+| Authentication failure / invalid token | `401 Unauthorized` | `API_AUTH_ERROR` | **Fatal error.** Abort commit scan immediately. Retain generation in `pending_retry`. Alert admin. |
+| Permissions error or abuse rate limit | `403 Forbidden` | `API_PERMISSION_OR_RATE_LIMIT` | **Search Incomplete.** Retain generation in `pending_retry`. Do not declare empty. |
+| Primary API rate limit reached | `429 Too Many Requests` | `API_RATE_LIMIT` | **Search Incomplete.** Retain generation in `pending_retry`. Do not declare empty. |
+| Upstream gateway / server error | `500` / `502` / `503` / `504` | `API_SERVER_ERROR` | **Search Incomplete.** Retain generation in `pending_retry`. Do not declare empty. |
+| Network timeout / connection reset | `ETIMEDOUT` / `ECONNRESET` | `NETWORK_ERROR` | **Search Incomplete.** Retain generation in `pending_retry`. Do not declare empty. |
+| Malformed JSON / parsing failure | `SyntaxError` (invalid JSON) | `CANDIDATE_CORRUPT_MANIFEST` | **Corrupt candidate.** Set `hasCorruptCandidates = true`. Route to `manual_review` if no match. |
+| Missing payload content | `fileContentRes.data.content == null` | `API_MALFORMED_RESPONSE` | **Search Incomplete.** Retain generation in `pending_retry` or route to `manual_review`. |
+| Complete scan with 0 matches & 0 errors | All pages inspected cleanly | `EMPTY_SEARCH` | Declared **ONLY** when search completes with zero network/API interruptions and zero corrupt candidates. Mark `abandoned`. |
 
 ---
 
@@ -351,12 +368,20 @@ During startup commit recovery, candidate commit inspections on the GitHub Commi
 
 ### ADR-16: 12-State Recovery Machine, Case B SHA Preservation & Unified Digest Scope
 - **Status:** Accepted (Phase 0.1.9 Reconciled)
-- **Decision:** Dedicated Pages status endpoint verified for `"status": "succeed"`. Case B staging is constructed cleanly from exact source commit and verified via `computeCatalogDigest('site/data') === gen.catalogDigest`. The catalog digest contract (`computeCatalogDigest(catalogDataRoot)`) evaluates `catalog.json`, `categories.json`, and `products/*.json` while strictly excluding `deployment-manifest.json` and static web assets. Commits API search implements granular error classification distinguishing `EMPTY_SEARCH` from `INCOMPLETE_SEARCH`.
+- **Decision:** Dedicated Pages status endpoint verified for `"status": "succeed"`. Case B staging is constructed cleanly from exact source commit and verified via `computeCatalogDigest('site/data') === gen.catalogDigest`. The catalog digest contract (`computeCatalogDigest(catalogDataRoot)`) evaluates `catalog.json`, `categories.json`, and `products/*.json` while strictly excluding `deployment-manifest.json` and static web assets.
 
-### ADR-17: Transactional Generation Ordering, 2-Tier Finalization & Durable Fan-Out Recovery
-- **Status:** Accepted (Phase 0.1.9 Reconciled)
-- **Decision:** Database finalization transaction reads `catalog_state`, `deployment_state`, and generation record before any writes, evaluating `evaluateGenerationOrdering` and revision monotonicity. Stale generations abort immediately. 2-tier commitment separates 3-write global state anchor from 400-doc batched submission status fan-out. Submission fan-out is tracked independently (`submissionFanoutStatus`, `submissionFanoutCursor`, `expectedSubmissionIds`) with automatic resumption across crashes and a 5-attempt fallback to `manual_review`.
+### ADR-17: Transactional Generation Ordering, Bounded Fan-Out Subcollections & Conditional Monotonic Submission Fan-Out
+- **Status:** Accepted (Phase 0.1.10 Reconciled)
+- **Decision:** Database finalization transaction reads `catalog_state`, `deployment_state`, and generation record before any writes, evaluating `evaluateGenerationOrdering` and revision monotonicity. Stale generations abort immediately. To eliminate unbounded arrays on `/system_deployments/{generationId}`, submission fan-out work is stored in bounded deterministic subcollections (`/system_deployments/{generationId}/fanout_batches/{batchId}`) capped at 400 IDs each (~13 KB << 1 MiB limit). Parent document stores only $O(1)$ scalar summary counters. Submission fan-out executes conditional transactional updates enforcing status eligibility (`approved` only; never resurrecting `rejected`, `delisted`, or `withdrawn` submissions) and strictly monotonic sequence advancement (`publishedGenerationSequence`), preventing stale fan-out overwrites across all concurrency interleavings.
 
-### ADR-18: Valid Actions Permissions, SHA Preservation, Action Metadata & $GITHUB_OUTPUT Bridge
-- **Status:** Accepted (Phase 0.1.9 Reconciled)
-- **Decision:** GitHub Actions workflow permissions strictly purged of unsupported keys (`metadata: read`). Decision flags `commit_needed` and `deploy_needed` are decoupled, preventing Case B recovery from overwriting its recovered commit SHA. Actions release metadata accurately verified: `upload-pages-artifact@v5.0.0` uses `actions/upload-artifact@v7.0.1` internally, and `checkout@v5.0.0` is retained over `v6.x` to preserve standard `.git/config` credential persistence. Outputs exported via direct append writes to `$GITHUB_OUTPUT`.
+### ADR-18: Valid Actions Permissions, SHA Preservation, Action Metadata, $GITHUB_OUTPUT Bridge & Official Actions Checkout v7.0.1
+- **Status:** Accepted (Phase 0.1.10 Reconciled)
+- **Decision:** GitHub Actions workflow permissions strictly purged of unsupported keys (`metadata: read`). Decision flags `commit_needed` and `deploy_needed` are decoupled, preventing Case B recovery from overwriting its recovered commit SHA. Step outputs exported via direct append writes to `$GITHUB_OUTPUT`. Workflow checkout upgraded to official `actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1` (`v7.0.1`), running natively on Node 24 (runner `>= v2.327.1`). Official documentation confirms native Git CLI operations (`git push`) succeed with default `persist-credentials: true` via runner git credential helper configuration, superseding prior claims regarding `.git/config`.
+
+### ADR-19: Granular Commit Inspection Error Classification & Corrupt Manifest Quarantine
+- **Status:** Accepted (Phase 0.1.10 Reconciled)
+- **Decision:** The reconciler implements an explicit error classifier function (`classifyCommitInspectionError`). Strictly HTTP 404 for missing manifest blobs is treated as a benign candidate skip (`CANDIDATE_NO_MANIFEST`). All authentication failures (401), rate limits (403, 429), server errors (5xx), network timeouts, connection resets, and malformed responses are classified as incomplete/fatal search interruptions, preserving the generation in `pending_retry`. Malformed manifest JSON is quarantined as `CANDIDATE_CORRUPT_MANIFEST`, setting `hasCorruptCandidates = true`. `EMPTY_SEARCH` can only be declared after a full, successful history scan with zero network/API interruptions and zero corrupt candidates; otherwise, the generation routes to `manual_review`.
+
+### ADR-20: Exhaustive Nested productData Schema Enforcement in Rules and Worker Validation
+- **Status:** Accepted (Phase 0.1.10 Reconciled)
+- **Decision:** Firestore Security Rules and batch worker validation enforce deep structural schema validation for all nested fields of `productData` on both `create` and `update`. All maps enforce strict key allowlisting (`hasOnly`) and presence (`hasAll`). Validations include: canonical regex slug format (`^[a-z0-9]+(-[a-z0-9]+)*$`), repository URL and owner/name patterns, semver version formats, license strings, category enums, full `selectedAsset` map validation (all 5 keys: `name`, `extension`, `sizeBytes` with 500 MiB upper limit, `downloadUrl`, `assetId`), media URLs (https prefix and element type validation for `screenshots` list up to 6 items), and `supportedPlatforms` list enum validation against `['windows', 'macos', 'linux', 'android', 'ios', 'web']`. Arbitrary nested keys are strictly rejected.

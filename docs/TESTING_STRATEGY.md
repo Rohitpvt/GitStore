@@ -104,9 +104,17 @@ describe('Deterministic Recursive Canonical Digest Tests', () => {
      - Authenticated developer CANNOT read another developer's `/users/{otherUid}` document.
      - Authenticated developer CAN read their own `/users/{uid}` document.
      - Update with `diff().affectedKeys()`: Owner CAN update `displayName`, `avatarUrl`, `bio`, `settings`. Attempting to modify `isAdmin`, `isVerifiedDeveloper`, `reputationScore`, `githubNumericId`, or `email` is rejected.
-  3. **Submission Field Tampering & Creation Allowlist Enforcement:**
+  3. **Submission Field Tampering & Nested `productData` Schema Enforcement:**
      - Client CAN create submission document with exact allowed client payload keys: `['id', 'developerUid', 'submissionSource', 'repoNumericId', 'repoId', 'targetProductId', 'productData', 'status', 'claimStatus', 'createdAt', 'updatedAt']`.
-     - Client CANNOT create submission containing ANY worker-managed fields: `validationResults`, `ownershipProof`, `processingLease`, `adminNotes`, `reviewedBy`, `reviewedAt`, `publishedProductId`. Test asserts create operation is REJECTED with permission-denied.
+     - Client CANNOT create submission containing ANY worker-managed fields: `validationResults`, `ownershipProof`, `processingLease`, `adminNotes`, `reviewedBy`, `reviewedAt`, `publishedProductId`, `publishedGenerationId`, `publishedGenerationSequence`. Test asserts create operation is REJECTED with permission-denied.
+     - **Nested `productData` Validation Tests:**
+       - *Slug Canonicalization:* Valid slug `awesome-app-1` SUCCEEDS. Invalid slugs `Awesome-App`, `app_v1`, `-app`, `app-` are REJECTED.
+       - *Repository URLs & Identity:* Valid `https://github.com/owner/repo` SUCCEEDS; non-GitHub URLs or URLs > 200 chars are REJECTED.
+       - *Selected Asset Map:* Test with all 5 mandatory keys (`name`, `extension`, `sizeBytes`, `downloadUrl`, `assetId`). REJECT if any key is missing or extraneous keys exist. REJECT if `sizeBytes` <= 0 or > 524,288,000 (500 MiB). REJECT if `downloadUrl` does not match GitHub release format.
+       - *Screenshots Array:* Array of 0-6 HTTPS URLs SUCCEEDS. Array with > 6 items or containing non-URL / non-string items is REJECTED.
+       - *Supported Platforms Enum:* Array containing `['windows', 'linux']` SUCCEEDS. Array containing invalid platform (e.g. `'solaris'`, `'xbox'`) or empty array is REJECTED.
+       - *Arbitrary Nested Keys:* Attempting to inject extra properties (e.g. `productData.isFeatured = true` or `productData.selectedAsset.checksum = 'abc'`) is REJECTED by `hasOnly()` checks.
+       - *Update Schema Consistency:* Updating a queued or rejected submission enforces the exact same nested schema validation rules.
   4. **Action-Specific Moderation Payload Tests (`/moderation_requests`):**
      - `APPROVE_SUBMISSION`: SUCCEEDS with valid `reviewNotes` (<= 1000 chars) or empty payload. FAILS if unexpected keys are present.
      - `REJECT_SUBMISSION`: FAILS if `rejectionReason` is missing or < 10 chars. SUCCEEDS with valid reason (10–1000 chars).
@@ -144,10 +152,13 @@ describe('Deterministic Recursive Canonical Digest Tests', () => {
 
 ### 5.3 Commit Recovery Granular Error Classification Tests
 - **CANDIDATE_NO_MANIFEST (HTTP 404):** Mock commit lookup returning 404 for manifest blob. Assert worker continues to next candidate commit without error.
-- **CANDIDATE_MANIFEST_CORRUPT:** Mock invalid JSON in manifest blob. Assert worker logs warning and continues to next candidate.
-- **API_RATE_LIMIT (HTTP 403 / 429):** Mock secondary rate limit on commit lookup. Assert worker sets `isSearchIncomplete = true`, retains generation in `pending_retry`, and DOES NOT declare `EMPTY_SEARCH` or abandon the generation.
+- **API_AUTH_ERROR (HTTP 401):** Mock commit lookup returning 401. Assert worker marks fatal error, sets `isSearchIncomplete = true`, halts search loop immediately, retains generation in `pending_retry`, and alerts administrator.
+- **API_PERMISSION_OR_RATE_LIMIT (HTTP 403 / 429):** Mock secondary rate limit on commit lookup. Assert worker sets `isSearchIncomplete = true`, retains generation in `pending_retry`, and DOES NOT declare `EMPTY_SEARCH` or abandon the generation.
 - **API_SERVER_ERROR (HTTP 5xx):** Mock upstream server error. Assert worker retains generation in `pending_retry`.
-- **EMPTY_SEARCH Assertion:** Mock all commit pages returning 0 matches with zero API errors. Assert worker marks generation `failed` with `commit_not_found_on_remote`.
+- **NETWORK_ERROR (Timeouts & Connection Resets):** Mock `ETIMEDOUT` or `ECONNRESET` during Contents API fetch. Assert worker sets `isSearchIncomplete = true`, retains generation in `pending_retry`, and does not treat network interruption as proof of absence.
+- **CANDIDATE_CORRUPT_MANIFEST (Malformed JSON):** Mock invalid JSON in manifest blob. Assert worker records corruption (`hasCorruptCandidates = true`), logs warning, and continues. Assert search NEVER declares empty if corrupt candidates exist; routes to `manual_review` instead.
+- **API_MALFORMED_RESPONSE (Missing Content):** Mock HTTP 200 response with null `content` field. Assert classified as malformed response, setting `isSearchIncomplete = true`.
+- **EMPTY_SEARCH Assertion:** Mock all commit pages returning 0 matches with zero API errors and zero corrupt candidates. Assert worker marks generation `failed` with `commit_not_found_on_remote` and `reconciliationStatus = 'abandoned'`.
 
 ### 5.4 Single Authoritative Staging & Case B Provenance Tests
 - **Case B Recovery Staging & SHA Preservation:**
@@ -164,22 +175,27 @@ describe('Deterministic Recursive Canonical Digest Tests', () => {
 - **Output Export:** Execute `emitStepOutput('deploy_needed', 'true')` and `emitStepOutput('commit_needed', 'false')` with mock `GITHUB_OUTPUT` file. Read file; assert content matches expected lines.
 - **Newline Injection Defense:** Call `emitStepOutput('key', 'val\nattack=true')`. Assert throws security error.
 
-### 5.6 2-Tier Transactional Finalization & Durable Fan-Out Recovery Tests
+### 5.6 2-Tier Transactional Finalization, Bounded Subcollections & Concurrency Tests
 - **Tier 1 (Atomic Anchor):**
   - Transaction reads `catalog_state`, `deployment_state`, and `system_deployments/{id}` before any writes.
   - Evaluates `evaluateGenerationOrdering`.
-  - Assert: Exactly 3 writes committed in transaction; marks `status: 'published'`, `reconciliationStatus: 'fanout_pending'`, `submissionFanoutStatus: 'pending'`.
+  - Assert: Exactly 3 writes committed in transaction; marks `status: 'published'`, `reconciliationStatus: 'fanout_pending'`, `submissionFanoutStatus: 'pending'`, `completedSubmissionCount: 0`, `completedFanoutBatches: 0`.
 - **Stale Abort:** If candidate `capturedRevision < catalogState.latestPublishedRevision`, transaction throws immediately. Generation marked `stale_aborted`.
-- **Tier 2 (Independently Recoverable Fan-Out Tests across 8 Failure Modes):**
-  1. *Crash before first batch:* Initial state `submissionFanoutStatus: 'pending'`, cursor 0. Reconciler discovers via Query 2, processes batch 1 (0..399), advances cursor to 400.
-  2. *Crash after first successful batch commit:* Batch 1 commits in Firestore, but crash occurs before cursor update. Next run reads cursor 0, re-executes batch 1 idempotently (`status: 'published'`), and updates cursor to 400 without data corruption.
-  3. *Crash after cursor update:* Cursor recorded as 400. Next run skips 0..399 entirely and processes chunk 400..799.
-  4. *Crash after intermediate batch:* Resumes from last committed cursor.
-  5. *Failure in later batch:* Transient Firestore error stops loop; cursor preserved at last committed batch; retried next cycle.
-  6. *Duplicate worker execution:* Concurrency group prevents overlap; idempotent batch writes ensure duplicate runs produce identical state.
-  7. *Generation superseded:* Older approved submissions still marked `published` without corrupting newer generation sequences.
-  8. *Max Retries & Manual Review Fallback:* After 5 consecutive failed fan-out attempts, generation transitions to `submissionFanoutStatus: 'manual_review'`, `reconciliationStatus: 'manual_review'`, and writes alert entry to `/admin_logs`.
-- **Firestore 500-Write Limit Adherence:** Mock generation with 550 expected submissions (`expectedSubmissionIds`). Assert: Worker splits updates into 2 batches (batch 1: 400 docs, batch 2: 150 docs), strictly respecting the Firestore 500-write limit.
+- **Bounded Storage & 1 MiB Document Size Invariant:**
+  - Mock generation with 10,000 published submissions.
+  - Assert: Submissions partitioned into 25 deterministic subcollection batches (`batch_00000` to `batch_00024`), each containing at most 400 IDs (~13 KB).
+  - Assert: Parent generation document retains only $O(1)$ scalar counters (`expectedSubmissionCount: 10000`, `totalFanoutBatches: 25`, etc.), remaining strictly bounded and far below the 1 MiB limit (< 2 KB).
+- **Conditional Monotonic Submission Fan-Out Tests (9 Concurrency Scenarios):**
+  1. *A and B fan-out simultaneously:* Test concurrent execution of Generation A (seq 10) and B (seq 11). Assert monotonic transactions ensure Generation B's `publishedGenerationSequence: 11` is committed on all documents, never regressed by A.
+  2. *A resumes after B has completed:* Worker resumes fan-out for Generation A. All submissions already bear sequence 11. Assert A skips every document (`skipped_stale_generation`); B's publication state is 100% preserved.
+  3. *A resumes after B published but before B completes fan-out:* Interleaved execution. Assert submissions updated by A to 10 are subsequently updated by B to 11; B ultimately wins.
+  4. *Admin rejects submission after A captured revision:* Mock admin setting `status: 'rejected'` while A deploys. Assert A's fan-out transaction detects ineligible status and skips document (`skipped_status_ineligible`), never resurrecting rejected submission to `published`.
+  5. *Admin delists product during A's deployment:* Mock admin setting `status: 'delisted'`. Assert fan-out transaction skips document, keeping product delisted.
+  6. *Worker crashes after a batch commits:* Batch commits in Firestore, but worker crashes before batch completion record. Upon reboot, worker re-runs batch; transactions detect `already_completed` (no-op); batch completes idempotently without double-incrementing counters.
+  7. *Worker crashes before cursor / batch completion write:* Assert idempotent replay skips already-updated submissions and commits clean batch state.
+  8. *Duplicate fan-out worker execution:* Run duplicate workers against same batch. Assert exact state convergence with zero conflicting writes.
+  9. *Submission already associated with newer published generation:* Mock submission with `publishedGenerationSequence: 42`. Incoming generation has sequence 40. Assert update rejected and skipped.
+- **Max Retries & Manual Review Fallback:** After 5 consecutive failed attempts on any batch, transitions to `status: 'manual_review'` and records alert in `/admin_logs`.
 
 ---
 
