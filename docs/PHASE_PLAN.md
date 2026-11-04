@@ -1,8 +1,8 @@
 # GitStore — Master Phase Plan & Development Control System
 
-**Document Version:** 1.7.0  
-**Last Updated:** 2026-11-03  
-**Current Project State:** Phase 0.1.7 (Replay Protection, Firestore Field Integrity & Deployment State Consistency) — `IN_REVIEW` ⏳ | Awaiting User `APPROVED` Gate for Phase 1  
+**Document Version:** 1.8.0  
+**Last Updated:** 2026-11-04  
+**Current Project State:** Phase 0.1.8 (Node 24 Workflow Compatibility, Artifact Provenance & Transactional Deployment Integrity) — `IN_REVIEW` ⏳ | Awaiting User `APPROVED` Gate for Phase 1  
 **Project Lead:** Technical Project Manager, Software Architect, & QA Lead  
 **Governing Standard:** Strict Dual-Platform Confinement (**GitHub** & **Firebase** ONLY)
 
@@ -33,7 +33,8 @@ To ensure strict quality control and eliminate premature execution:
 | **Phase 0.1.4**| Evidence Alignment, Deployment Recovery & Governance Consistency | `COMPLETED` ✅ | 100% (All 8 core objectives closed) | Reconciled Baseline |
 | **Phase 0.1.5**| Final Security Rules, Administrator Step-Up Authentication & Deployment Recovery Audit | `COMPLETED` ✅ | 100% (All 9 core objectives closed) | Hardened Baseline |
 | **Phase 0.1.6**| Step-Up Proof Integrity, Firestore Rules & Deployment Reconciliation | `COMPLETED` ✅ | 100% (All 8 core objectives closed) | Hardened Baseline |
-| **Phase 0.1.7**| Replay Protection, Firestore Field Integrity & Deployment State Consistency | `IN_REVIEW` ⏳ | 100% (All 10 core objectives closed) | User Review Pending |
+| **Phase 0.1.7**| Replay Protection, Firestore Field Integrity & Deployment State Consistency | `COMPLETED` ✅ | 100% (All 10 core objectives closed) | Hardened Baseline |
+| **Phase 0.1.8**| Node 24 Workflow Compatibility, Artifact Provenance & Transactional Deployment Integrity | `IN_REVIEW` ⏳ | 100% (All 8 core audit items closed) | User Review Pending |
 | **Phase 1** | Frontend Core Foundation (Mock Storefront) | `NOT_STARTED` 🛑 | 0 / 5 Subphases | Requires Phase 0.1 Approval |
 | **Phase 2** | Firebase Foundation and Authentication | `NOT_STARTED` 🛑 | 0 / 4 Subphases | Requires Phase 1 Approval |
 | **Phase 3** | Developer Dashboard and Submission System | `NOT_STARTED` 🛑 | 0 / 4 Subphases | Requires Phase 2 Approval |
@@ -81,7 +82,7 @@ To ensure strict quality control and eliminate premature execution:
 ---
 
 ### Phase 0.1.7: Replay Protection, Firestore Field Integrity & Deployment State Consistency
-- **Status:** `IN_REVIEW` ⏳ (All 10 Core Objectives Closed; Awaiting User Gate)
+- **Status:** `COMPLETED` ✅ (All 10 Core Objectives Closed; Hardened Baseline)
 - **Objective:** Resolve remaining architectural and security defects identified during independent review of Phase 0.1.6:
   1. *GitHub Pages Deployment-Status Correction:* Replaced incorrect `status === 'built'` with documented `status === 'succeed'` on dedicated endpoint `GET /repos/{owner}/{repo}/pages/deployments/{pages_deployment_id}` (where parameter accepts numeric deployment ID or string commit SHA). Distinguish dedicated Pages API from generic deployments and builds. Schema updated to `pagesDeploymentReference: string | number | null`. Handle 200 (succeed, queued/in_progress, errored), 404 (Case B trigger), 401/403 (fatal permissions error), 5xx (transient). Unknown status never silently passes.
   2. *Repair Case B Recovery and Real Artifact Handoff:* In Case B (commit on remote, no Pages deployment), worker checks out commit, validates digest, rebuilds `site/`, returns `{ deployNeeded: true, ... }`, exports `deploy_needed=true` to `$GITHUB_OUTPUT`, Job 1 declares outputs, triggers `actions/upload-pages-artifact@v3`, and Job 2 (`deploy-to-pages`) runs `if: needs.build-and-commit.outputs.deploy_needed == 'true'`, runs pre-deploy guard, and deploys via `actions/deploy-pages@v4`.
@@ -95,6 +96,29 @@ To ensure strict quality control and eliminate premature execution:
   10. *Complete Commit Pagination & Error Classification:* Traverse `Link: rel="next"` without arbitrary 5-page limits. Distinguish empty search from incomplete search (rate limit/network -> `pending_retry`, never `abandoned`). Validate commit SHA format `/^[0-9a-f]{40}$/i` before shell commands.
 - **Files Modified:** All 14 architecture, schema, security, and governance files across `docs/` and root repository.
 - **Definition of Done (DoD):** All 10 problem areas formally closed, ADR-05, ADR-07, ADR-10, ADR-14 through ADR-18 refined, documentation synchronized, zero application code written, working tree verified clean.
+
+---
+
+### Phase 0.1.8: Node 24 Workflow Compatibility, Artifact Provenance & Transactional Deployment Integrity
+- **Status:** `IN_REVIEW` ⏳ (All 8 Core Audit Items Closed; Awaiting User Gate)
+- **Objective:** Resolve critical architectural, workflow runtime, staging provenance, output bridge, and finalization defects identified in the Phase 0.1.7 independent audit:
+  1. *Update GitHub Actions to Supported Node 24 Runtimes:* GitHub removed Node 20 from hosted runners on September 23, 2026. Action metadata updated from deprecated Node 20 runtimes to official Node 24 releases, pinned to verified 40-character commit SHAs:
+     - `actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0` (`runs.using: 'node24'`, runner `>= v2.327.1`)
+     - `actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0` (`runs.using: 'node24'`, runner `>= v2.327.1`)
+     - `actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0` (`runs.using: 'composite'`, packages gzip/tar)
+     - `actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1` (`runs.using: 'node24'`, runner `>= v2.327.1`)
+     - Verified compatibility between `upload-pages-artifact@v5` and `deploy-pages@v5`. Purged all stale `@v3`/`@v4` action tags.
+  2. *Authoritative Case B Staging & Provenance:* Eliminated fragmented staging and corrupting workflow shell copy (`cp -r data/* site/data/` copying from workspace `main`). Designed single authoritative staging procedure inside `processor/reconciler.js`: completely purges `site/`, reconstructs exclusively from target commit via `git archive ${catalogCommitSha} ... | tar -x -C site/`, recomputes `stagedDigest = computeCatalogDigest('site')`, asserts `stagedDigest === catalogDigest`, and strictly preserves `site/` intact until artifact upload.
+  3. *Complete GitHub Actions Output Bridge:* Implemented robust output bridge function `emitStepOutput(name, value)` appending key-value pairs directly to `$GITHUB_OUTPUT` with multi-line/newline injection protection (random 32-character EOF delimiter fencing). Exported 6 parameters: `deploy_needed`, `generation_id`, `generation_sequence`, `catalog_commit_sha`, `catalog_digest`, and `captured_revision`.
+  4. *Two-Tier Finalization Architecture & Monotonic Guard:* Replaced bloated monolithic transaction with a 2-tier finalization architecture respecting Firestore's 500-write limit:
+     - **Tier 1 (State Anchor Transaction):** Reads `/system_config/catalog_state`, `/system_config/deployment_state`, and `/system_deployments/{generationId}` BEFORE any writes. Asserts `evaluateGenerationOrdering` and monotonic revision check (`capturedRevision >= activeRevision`). Atomically commits exactly 3 state documents.
+     - **Tier 2 (Idempotent Batched Updates):** Executes idempotent batched writes in chunks of 400 documents for published submissions (`status: 'published'`).
+  5. *Exhaustive Action-Specific Moderation Payload Validation:* Defined action-specific payload validation functions (`validModerationPayload(action, payload)`) in Firestore Security Rules and processor logic for `APPROVE_SUBMISSION`, `REJECT_SUBMISSION`, `VERIFY_DEVELOPER`, `REVOKE_DEVELOPER`, `DELIST_PRODUCT`, and `FEATURE_PRODUCT`. Validated target ID format and `targetDocumentPath` binding. Prohibited arbitrary nested keys.
+  6. *ActionHash & Nonce Ledger Consistency:* Standardized on canonical `requestedByUid` across schema, rules, and processor code. Classified `actionHash` as client data-integrity checksum. Nonce document ID equals SHA-256 nonce hash.
+  7. *Commit Recovery Granular Error Classification:* Candidate manifest 404 classified as benign `CANDIDATE_NO_MANIFEST`. Network failures, HTTP 403 (rate limits), or HTTP 5xx errors set `isSearchIncomplete: true` and retain generation as `pending_retry`. `EMPTY_SEARCH` declared only on complete, uninterrupted scans.
+  8. *Pages API Status & Public Manifest HTTP Verification:* Dedicated endpoint `GET /repos/{owner}/{repo}/pages/deployments/{id}` checks `status === 'succeed'`. Firestore finalization deferred until public manifest HTTP check confirms generation sequence and digest on the live CDN.
+- **Files Modified:** All 14 architecture, schema, security, and governance files across `docs/` and root repository.
+- **Definition of Done (DoD):** All 8 core audit items closed, ADR-15 through ADR-18 refined, documentation synchronized to v1.9.0 (v1.8.0 for `PHASE_PLAN.md`), zero application code written, working tree verified clean.
 
 ---
 
@@ -186,4 +210,12 @@ To ensure strict quality control and eliminate premature execution:
 | 2026-11-03 | 0.1.7 | Mixed-Provider Firebase Reauthentication Scenario | Documented 9-step verification scenario and classified runtime provider switching as `PENDING_INTEGRATION_TEST`. Mandated active GitHub session for admin actions. | In Review (ADR-15) |
 | 2026-11-03 | 0.1.7 | Durable Revision Transaction with Stale Abort | Worker requires explicit non-negative `capturedRevision`. Reads `catalog_state` inside transaction and immediately aborts (`stale_aborted`) if `capturedRevision < currentPublishedRevision`. | In Review (ADR-17) |
 | 2026-11-03 | 0.1.7 | Single Shared Generation Ordering Decision Function | Unified ordering logic across generation creation, recovery, pre-deployment guard, and finalization into `evaluateGenerationOrdering`. | In Review (ADR-16, 18) |
-| 2026-11-03 | 0.1.7 | Complete Commit Pagination & Error Classification | Commits API loop traverses `Link: rel="next"` without arbitrary depth limits. Network/rate limits classified as `INCOMPLETE_SEARCH` (`pending_retry`), never `EMPTY_SEARCH`. SHA format validation prevents shell injection. | In Review (ADR-16) |
+| 2026-11-03 | 0.1.7 | Complete Commit Pagination & Error Classification | Commits API loop traverses `Link: rel="next"` without arbitrary depth limits. Network/rate limits classified as `INCOMPLETE_SEARCH` (`pending_retry`), never `EMPTY_SEARCH`. SHA format validation prevents shell injection. | Approved (ADR-16) |
+| 2026-11-04 | 0.1.8 | Node 24 Actions Runner Migration | GitHub removed Node 20 from hosted runners on Sep 23, 2026. Action metadata migrated to Node 24 pinned by 40-char SHA (`checkout@v5.0.0`, `setup-node@v7.1.0`, `upload-pages-artifact@v5.0.0`, `deploy-pages@v5.0.1`). | In Review (ADR-18) |
+| 2026-11-04 | 0.1.8 | Authoritative Case B Staging & Provenance | Eliminated corrupting workflow shell copy step (`cp -r data/* site/data/`). Reconciler is single authoritative staging mechanism: purges `site/`, extracts from target commit via `git archive ... | tar -x -C site/`, asserts `stagedDigest === catalogDigest`, and preserves `site/` intact. | In Review (ADR-16, 18) |
+| 2026-11-04 | 0.1.8 | Robust Output Bridge (`emitStepOutput`) | Implemented step output bridge with delimiter escaping for multi-line protection, exporting 6 parameters to `$GITHUB_OUTPUT`. | In Review (ADR-18) |
+| 2026-11-04 | 0.1.8 | Two-Tier Finalization Architecture | Replaced 500-write breaching transaction with Tier 1 (3-write state anchor transaction reading all state before writes) + Tier 2 (idempotent batched writes in chunks of 400). | In Review (ADR-17) |
+| 2026-11-04 | 0.1.8 | Action-Specific Moderation Payload Schemas | Implemented `validModerationPayload(action, payload)` and helper schemas in Security Rules and processor logic for all 6 moderation actions. | In Review (ADR-14, 15) |
+| 2026-11-04 | 0.1.8 | Canonical `requestedByUid` & Nonce Hash ID | Standardized on `requestedByUid` across schema, rules, and code. Document ID equals SHA-256 nonce hash. | In Review (ADR-15) |
+| 2026-11-04 | 0.1.8 | Commit Recovery Granular Error Classification | Candidate 404 classified as benign `CANDIDATE_NO_MANIFEST`. Network/rate limit errors set `isSearchIncomplete: true` and preserve `pending_retry`. | In Review (ADR-16) |
+| 2026-11-04 | 0.1.8 | Pages API Dedicated Status & HTTP Verification | Dedicated Pages API endpoint verifies `status === 'succeed'`. Firestore finalization deferred until public manifest HTTP check confirms CDN propagation. | In Review (ADR-16) |

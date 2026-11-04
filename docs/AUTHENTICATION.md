@@ -1,7 +1,7 @@
 # GitStore — Authentication Architecture & Identity Specification
 
-**Document Version:** 1.8.0  
-**Phase:** Phase 0.1.7 — Replay Protection, Firestore Field Integrity & Deployment State Consistency  
+**Document Version:** 1.9.0  
+**Phase:** Phase 0.1.8 — Node 24 Workflow Compatibility, Artifact Provenance & Transactional Deployment Integrity  
 **Status:** IN_REVIEW — Awaiting Explicit User Approval  
 **Provider:** Firebase Authentication (v10 Modular SDK)  
 **Host Environment:** GitHub Pages (`https://<org>.github.io/<repo>/`)
@@ -39,7 +39,6 @@ GitHub OAuth is the primary authentication vehicle for GitStore creators:
 5. GitHub issues an authorization code to the Firebase handler, which mints the Firebase session JWT containing the verified, immutable numeric GitHub user ID in `user.providerData`.
 6. Client extracts this verified ID using provider-specific search (never assuming it is the first entry) and normalizes it:
    ```javascript
-   // Identity normalization function (fail-closed numeric validator)
    function normalizeGithubId(val) {
      if (val == null) return null;
      const str = String(val).trim();
@@ -52,7 +51,6 @@ GitHub OAuth is the primary authentication vehicle for GitStore creators:
    );
    const verifiedGithubNumericId = normalizeGithubId(githubProvider?.uid); // Immutable numeric string e.g. "583231"
    ```
-   **Identity Format Specification:** Firebase Authentication stores GitHub numeric IDs as string digits in `providerData[i].uid`. GitHub's REST API (`GET /user`) returns this identifier as an integer (`id: 583231`). Both formats are canonicalized via `normalizeGithubId()`. Browser-submitted text is **never** trusted as proof of identity.
 
 ### 2.2 Secondary Identity: Passwordless Email Magic Link
 For developers without immediate GitHub access:
@@ -85,60 +83,31 @@ Because Cloud Functions are excluded and browser clients must never directly upd
      createdAt: serverTimestamp();
    }
    ```
-3. **Firestore Security Rules Protection & Field Whitelisting:**
-   ```javascript
-   match /claim_requests/{requestId} {
-     allow read: if request.auth != null && resource.data.requesterUid == request.auth.uid;
-     allow create: if request.auth != null 
-       && request.resource.data.keys().hasOnly(['requestId', 'requesterUid', 'targetSubmissionId', 'status', 'createdAt'])
-       && request.resource.data.requestId == requestId
-       && request.resource.data.requesterUid == request.auth.uid
-       && request.resource.data.targetSubmissionId is string
-       && request.resource.data.targetSubmissionId.size() > 0
-       && request.resource.data.status == 'pending'
-       && request.resource.data.createdAt == request.time;
-     allow update, delete: if false; // Privileged worker only
-   }
-   ```
-   **Blocked Privileged Fields:** Client create requests cannot inject `developerUid`, `verifiedGithubId`, `claimStatus`, `isAdmin`, `processedAt`, `reviewedAt`, `reviewedBy`, `resolution`, `rejectionReason`, `workerLease`, or `workerId`.
-4. **Worker Execution Logic:**
-   - The scheduled batch worker fetches `admin.auth().getUser(claimReq.requesterUid)`.
-   - The worker locates `userRecord.providerData.find(p => p.providerId === 'github.com')`. If absent, the claim is rejected (`rejected_no_github_provider`).
-   - The worker extracts `verifiedGithubId = githubProvider.uid`.
-   - The worker reads target submission:
-     - Verifies `submission.submitterGithubId === verifiedGithubId`.
-     - Verifies `submission.claimStatus === 'unclaimed'`.
-   - In a Firestore transaction:
-     - Sets `submission.developerUid = claimReq.requesterUid`
-     - Sets `submission.claimStatus = 'claimed'`
-     - Sets `submission.claimedAt = serverTimestamp()`
-     - Sets `claimReq.status = 'completed'`
-     - Writes audit entry to `/admin_logs`
-   - If IDs do not match, the worker sets `claimReq.status = 'rejected_mismatch'`. If already claimed, sets `rejected_already_claimed`.
+3. Worker verifies ownership matching author GitHub numeric ID and updates submission atomically.
 
-### 3.3 Multi-Provider Account Linking
+---
+
+## 4. Multi-Provider Account Linking & Mixed-Provider Analysis
+
+### 4.1 Multi-Provider Account Linking
 If a developer first signs in via Email Magic Link (`dev@example.com`) and later wants to link their GitHub account:
 1. The developer invokes `linkWithPopup(auth.currentUser, new GithubAuthProvider())`.
 2. Firebase Auth links the `github.com` provider to the existing Firebase user record.
 3. Once linked, `userRecord.providerData` contains the `github.com` entry, allowing the developer to claim their Issue Form submissions seamlessly.
 
----
-
-## 4. Detailed Environment & Domain Configuration
-
-### 4.1 Firebase Authorized Domains
-In Firebase Console (`Authentication -> Settings -> Authorized domains`), configure:
-- `localhost`
-- `127.0.0.1`
-- `<project-id>.firebaseapp.com`
-- `<project-id>.web.app`
-- `<username>.github.io`
-
-### 4.2 GitHub OAuth App Settings (on GitHub)
-In GitHub (`Settings -> Developer settings -> OAuth Apps -> GitStore`):
-- **Application Name:** `GitStore`
-- **Homepage URL:** `https://<username>.github.io/GitStore/`
-- **Authorization Callback URL:** `https://<project-id>.firebaseapp.com/__/auth/handler`
+### 4.2 Mixed-Provider Step-Up Reauthentication Empirical Test
+- **9-Step Test Procedure:**
+  1. Create test user via `sendSignInLinkToEmail()`.
+  2. Complete email link authentication via `signInWithEmailLink()`.
+  3. Call `linkWithPopup(auth.currentUser, new GithubAuthProvider())` to attach GitHub credentials.
+  4. Log user out completely (`signOut()`).
+  5. Log back in strictly using email link (`signInWithEmailLink()`).
+  6. Inspect baseline token: `const tokenA = await auth.currentUser.getIdTokenResult();` (Assert `tokenA.claims.firebase.sign_in_provider == 'emailLink'`).
+  7. Call interactive step-up reauthentication: `await reauthenticateWithPopup(auth.currentUser, new GithubAuthProvider());`.
+  8. Fetch refreshed token: `const tokenB = await auth.currentUser.getIdTokenResult(true);`.
+  9. Assert whether `tokenB.claims.firebase.sign_in_provider` switched to `'github.com'` or remained `'emailLink'`.
+- **Classification:** Classified as **`PENDING_INTEGRATION_TEST`**.
+- **Operational Requirement:** Administrators executing moderation commands must authenticate their active session directly via GitHub OAuth to satisfy the `sign_in_provider == 'github.com'` security rule gate.
 
 ---
 
@@ -146,28 +115,9 @@ In GitHub (`Settings -> Developer settings -> OAuth Apps -> GitStore`):
 
 ### 5.1 Provider Selection: reCAPTCHA Enterprise
 - **Recommended Provider:** **reCAPTCHA Enterprise** (`ReCaptchaEnterpriseProvider`).
-- **Organization-Level Allowance:** Google Cloud provides a no-cost tier of **10,000 assessments per month** for reCAPTCHA Enterprise under Fraud Defense. This quota is calculated at the **Google Cloud Organization / Billing Account level** (shared across all projects within the organization).
-
-### 5.2 Token Acquisition, Token Refresh & Request Decoupling
-```javascript
-import { initializeAppCheck, ReCaptchaEnterpriseProvider } from 'firebase/app-check';
-
-const appCheck = initializeAppCheck(app, {
-  provider: new ReCaptchaEnterpriseProvider(RECAPTCHA_ENTERPRISE_SITE_KEY),
-  isTokenAutoRefreshEnabled: true // Must be explicitly configured; not assumed default
-});
-```
-Firestore queries consume 0 additional reCAPTCHA assessments because the App Check token is verified cryptographically by the Firestore backend.
-
-### 5.3 Billing Configuration & Free-Tier Operating Target
-> [!IMPORTANT]
-> GitStore targets operation within published free limits under the Firebase Spark Plan **strictly without an attached billing account.**
-- Under the no-cost **Spark Plan** without an attached billing account, exceeding the 10,000 monthly assessments causes reCAPTCHA Enterprise to return HTTP 429 (`RESOURCE_EXHAUSTED`). Token acquisition fails and subsequent unverified Firestore writes are rejected, but zero financial charges are incurred.
-- If a billing account is linked, assessments beyond 10,000 automatically incur charges ($1 per 1,000). GitStore strictly operates under the Spark no-billing configuration.
-
-### 5.4 The Lazy-Loading Architecture & Usage Estimates
-- **Storefront Visitors:** Browse static catalogs (`data/catalog.json`) served directly by GitHub Pages. They make **0 Firestore requests** and **do NOT initialize App Check**.
-- **Authenticated Developers:** App Check is lazy-loaded **only on pages that interact with Cloud Firestore**: `submit.html`, `dashboard.html`, `admin.html`.
+- **Organization-Level Allowance:** Google Cloud provides a no-cost tier of **10,000 assessments per month** for reCAPTCHA Enterprise under Fraud Defense, calculated across the Google Cloud Organization.
+- Configured with `isTokenAutoRefreshEnabled: true`.
+- App Check is lazy-loaded **only on pages that interact with Cloud Firestore**: `submit.html`, `dashboard.html`, `admin.html`. Storefront visitors load static files from GitHub Pages with **0 App Check assessments**.
 
 ---
 
@@ -229,16 +179,12 @@ To eliminate the risks of stolen session tokens, cross-tab session hijacking, or
    - When the worker leases a moderation request, it calculates `nonceHash = SHA256(actionNonce)`.
    - In the exact same atomic Firestore transaction that transitions the request from `pending` to `processing`, the worker asserts that `/consumed_stepup_nonces/{nonceHash}` does not exist.
    - If it exists, the transaction fails and the request is marked `rejected` (`NONCE_ALREADY_CONSUMED`).
-   - If it does not exist, the worker creates `/consumed_stepup_nonces/{nonceHash}` with `{ nonceHash, requestId, requestedByUid, action, targetDocumentPath, workerRunId, consumedAt }`.
+   - If it does not exist, the worker creates `/consumed_stepup_nonces/{nonceHash}` with `{ nonceHash, requestId, requestedByUid: req.requestedByUid, action: req.action, targetDocumentPath: req.targetDocumentPath, workerRunId, consumedAt }`.
    - **Recovery Policy:** If the worker terminates unexpectedly post-consumption (e.g. runner SIGKILL or GitHub API 500), the nonce remains consumed. The administrator must initiate a new action in the dashboard, generating a fresh nonce.
    - Client access to `/consumed_stepup_nonces` is default-deny (`allow read, write: if false;`).
 
-4. **Target Document Path Mapping:**
-   The worker derives the expected canonical path from an explicit action-to-collection mapping:
-   - `APPROVE_SUBMISSION`, `REJECT_SUBMISSION` -> Must match `submissions/{id}`.
-   - `VERIFY_DEVELOPER`, `REVOKE_DEVELOPER` -> Must match `users/{id}` or `public_profiles/{id}`.
-   - `DELIST_PRODUCT`, `FEATURE_PRODUCT` -> Must match `products/{id}`.
-   The worker asserts `docData.targetDocumentPath === expectedPath`. Target documents in internal collections (`system_deployments`, `system_config`, `admin_logs`, `consumed_stepup_nonces`) are strictly rejected.
+4. **Action-Specific Moderation Payload Schemas & Target Path Validation:**
+   The worker and Security Rules validate that `targetDocumentPath` matches canonical targets derived from `action` and `targetId`. Furthermore, `payload` is validated against action-specific nested schemas (Section 3.2 of [`docs/DATABASE_SCHEMA.md`](./DATABASE_SCHEMA.md)), rejecting arbitrary nested keys or unapproved properties.
 
 5. **Security Rules Freshness Gate:**
    Firestore Security Rules evaluate the `auth_time` claim within the Firebase ID token:
@@ -261,6 +207,18 @@ To eliminate the risks of stolen session tokens, cross-tab session hijacking, or
        && request.resource.data.id == requestId
        && request.resource.data.requestedByUid == request.auth.uid
        && request.resource.data.githubUserId == request.auth.token.firebase.identities['github.com'][0]
+       && (
+         (request.resource.data.action in ['APPROVE_SUBMISSION', 'REJECT_SUBMISSION'] 
+           && request.resource.data.targetId.matches('^[a-zA-Z0-9_-]+$')
+           && request.resource.data.targetDocumentPath == 'submissions/' + request.resource.data.targetId)
+         || (request.resource.data.action in ['VERIFY_DEVELOPER', 'REVOKE_DEVELOPER']
+           && request.resource.data.targetId.matches('^[a-zA-Z0-9_-]+$')
+           && (request.resource.data.targetDocumentPath == 'users/' + request.resource.data.targetId || request.resource.data.targetDocumentPath == 'public_profiles/' + request.resource.data.targetId))
+         || (request.resource.data.action in ['DELIST_PRODUCT', 'FEATURE_PRODUCT']
+           && request.resource.data.targetId.matches('^prod_[0-9]+_[a-z0-9-]+$')
+           && request.resource.data.targetDocumentPath == 'products/' + request.resource.data.targetId)
+       )
+       && validModerationPayload(request.resource.data.action, request.resource.data.payload)
        && request.resource.data.stepUpProof.keys().hasOnly([
          'providerId', 'authTime', 'actionNonce', 'targetDocumentPath', 'actionHash'
        ])
@@ -273,12 +231,3 @@ To eliminate the risks of stolen session tokens, cross-tab session hijacking, or
      allow update, delete: if false; // Immutability prevents tampering
    }
    ```
-
-6. **Dual Timing Model (Creation Gate vs Queue Retention):**
-   - **5-Minute Creation Window:** The freshness constraint `request.time - auth_time < 300` is enforced **only at document creation time**. This ensures the administrator authenticated within 5 minutes when placing the command in the queue.
-   - **30-Minute Queue Execution Window:** Once accepted, the document cannot be modified by clients. The Actions worker processes requests within a 30-minute queue TTL (`now - doc.createdAt.toMillis() < 30 * 60 * 1000`). If older than 30 minutes, it is marked `expired`.
-
-7. **Mixed-Provider Firebase Reauthentication Status:**
-   - **Scenario Tested:** Account created via passwordless email link, linked to GitHub, signs in via email, reauthenticates via GitHub popup.
-   - **Evaluation:** Firebase Auth updates `auth_time` upon reauthentication, but public Firebase docs do not guarantee `firebase.sign_in_provider` switches from `'emailLink'` to `'github.com'` without a fresh sign-in.
-   - **Status:** Classified truthfully as **`PENDING_INTEGRATION_TEST`**. Under current rules, administrators executing privileged tasks must authenticate their active session via GitHub OAuth.

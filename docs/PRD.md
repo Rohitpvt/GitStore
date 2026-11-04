@@ -1,7 +1,7 @@
 # GitStore — Product Requirements Document (PRD)
 
-**Document Version:** 1.8.0  
-**Phase:** Phase 0.1.7 — Replay Protection, Firestore Field Integrity & Deployment State Consistency  
+**Document Version:** 1.9.0  
+**Phase:** Phase 0.1.8 — Node 24 Workflow Compatibility, Artifact Provenance & Transactional Deployment Integrity  
 **Status:** IN_REVIEW — Awaiting Explicit User Approval  
 **Target Systems:** GitHub (Pages, Actions, Issues, Releases) & Firebase (Auth, Cloud Firestore, Security Rules, App Check)
 
@@ -42,12 +42,12 @@ GitStore is a specialized, open, high-performance software discovery and distrib
 ### 3.1 Supported Product Formats & Globally Unique Multi-Product Repositories
 - **Supported Formats:** Desktop Executables (`.exe`, `.msi`), macOS (`.dmg`), Linux (`.zip`, `.tar.gz`), Android (`.apk`), Web Apps, and Templates.
 - **Multi-Product Repositories:** A single GitHub repository (monorepos, tool suites) can distribute multiple independent software applications under globally unique deterministic product IDs (`prod_{repoNumericId}_{productSlug}`) tied to the repository's immutable numeric GitHub ID (`gh_repo_{repoNumericId}`).
-- **Cross-Repository Collision Prevention:** Repositories under the same owner with identical product slugs (e.g. `microsoft/toolkit-a -> viewer` vs `microsoft/toolkit-b -> viewer`) generate distinct non-colliding product IDs (`prod_892341901_viewer` vs `prod_945112002_viewer`).
+- **Cross-Repository Collision Prevention:** Repositories under the same owner with identical product slugs generate distinct non-colliding product IDs.
 
 ### 3.2 Submission Channels & Account Reconciliation
 - **Developer Web Dashboard:** Authenticated developers submit products with real-time status tracking. Firestore Security Rules enforce a strict client creation allowlist (`keys().hasOnly(['id', 'developerUid', 'submissionSource', 'repoNumericId', 'repoId', 'targetProductId', 'productData', 'status', 'claimStatus', 'createdAt', 'updatedAt'])`). Client submission creation is strictly blocked if any worker-managed fields (`validationResults`, `ownershipProof`, `processingLease`, `adminNotes`, `reviewedBy`, `reviewedAt`, `publishedProductId`) are present. Trusted worker initializes worker-managed fields via the Firebase Admin SDK.
 - **GitHub Issue Forms:** Alternative issue-based submission route. Issue submitters do **not** receive fake placeholder accounts; submissions are recorded as `unclaimed` with their immutable numeric GitHub ID (`sub_issue_{repoNumericId}_{issueNumber}`).
-- **Secure Asynchronous Claiming Queue:** Developers claim issue-submitted applications through `/claim_requests`, validated authoritatively against their linked GitHub account in Firebase Auth by the batch worker. Client creation is strictly whitelisted via `hasOnly(['requestId', 'requesterUid', 'targetSubmissionId', 'status', 'createdAt'])`, blocking all privileged and worker fields.
+- **Secure Asynchronous Claiming Queue:** Developers claim issue-submitted applications through `/claim_requests`, validated authoritatively against their linked GitHub account in Firebase Auth by the batch worker.
 
 ### 3.3 Strict Ownership, Release Authority & Verified Developer Distinction
 1. **Repository Ownership:** Proves control over the repository configuration (`repo.owner.id === submitterGithubId`).
@@ -57,10 +57,9 @@ GitStore is a specialized, open, high-performance software discovery and distrib
 
 ### 3.4 Decoupled Administrator Moderation Workflow with Action-Bound Proofs
 - Administrative operations write commands to `/moderation_requests` accompanied by an action-bound proof from interactive `reauthenticateWithPopup(auth.currentUser, new GithubAuthProvider())`. Security Rules verify freshness (`auth_time < 300s`) and provider (`sign_in_provider == 'github.com'`) at creation gate. **Zero raw OAuth tokens are stored in Firestore.**
-- **Replay Protection via Dedicated Ledger:** The worker claims the request and reserves the single-use `actionNonce` in an internal collection `/consumed_stepup_nonces/{nonceHash}` within ONE atomic transaction. Replays are rejected with `NONCE_ALREADY_CONSUMED`. Failed execution leaves nonces permanently burned.
+- **Action-Specific Payloads & Target Path Binding:** Security Rules enforce action-specific schemas for `APPROVE_SUBMISSION`, `REJECT_SUBMISSION`, `VERIFY_DEVELOPER`, `REVOKE_DEVELOPER`, `DELIST_PRODUCT`, and `FEATURE_PRODUCT`, and assert exact binding between `action`, `targetId`, and `targetDocumentPath`.
+- **Replay Protection via Dedicated Ledger:** The worker claims the request and reserves the single-use `actionNonce` in an internal collection `/consumed_stepup_nonces/{nonceHash}` using `requestedByUid` within ONE atomic transaction. Replays are rejected with `NONCE_ALREADY_CONSUMED`. Failed execution leaves nonces permanently burned.
 - **Truthful ActionHash Classification:** The client-generated `actionHash` is classified as a client data-integrity checksum, not a cryptographic signature. Authorization rests on verified Firebase ID token claims, GitHub numeric identity matching, and canonical collaborator checks on `Rohitpvt/GitStore`.
-- **Target Document Path Validation:** The worker validates `targetDocumentPath` against canonical action-to-collection mappings, preventing access to internal collections or cross-document confusion.
-- The Actions worker validates permissions against **GitStore's canonical repository** (`Rohitpvt/GitStore`) root owner immutable numeric ID (`owner.id`) for bootstrap authorization and collaborator roles (`role_name === 'admin'` or `'maintain'`) for maintainers.
 
 ### 3.5 Public Storefront Capabilities
 - **Homepage:** Hero showcase, featured applications, category shelves, recent releases.
@@ -92,12 +91,10 @@ GitStore is a specialized, open, high-performance software discovery and distrib
 ### 5.2 Security & Integrity
 - **Non-Execution Invariant:** GitStore never executes submitted files or binaries. All validation is structural, cryptographic, and metadata-focused via the GitHub REST API.
 - **Zero-Trust Client Security:** Firestore Security Rules enforce exhaustive schemas (`keys().hasOnly()`, `diff().affectedKeys().hasOnly()`) on all client-creatable collections. Admin operations execute strictly inside GitHub Actions.
-- **12-State Recoverable Deployment State Machine:** Submissions transition to `published` in Firestore only after:
-  1. Compiling a non-circular manifest (`data/deployment-manifest.json` records `generatedAt`, `generationSequence`, and deterministic recursive `catalogDigest`, omitting commit SHAs).
-  2. Executing least-privilege split-job deployment (`build-and-commit` and `deploy-to-pages`) with explicit cross-job outputs, isolated `site/` staging, and a pre-deployment guard governed by the single shared ordering decision function.
-  3. GitHub Pages deployment confirmation via official dedicated endpoint `GET /repos/{owner}/{repo}/pages/deployments/{pages_deployment_id}` returning `status === "succeed"`.
-  4. Public HTTP manifest and digest verification asserting matching `generationId`, `generationSequence`, and `catalogDigest` evaluated against the shared ordering matrix.
-  5. Backed by an automated reconciliation loop across all non-terminal reconciliation states, featuring complete pagination of commit history following `Link: rel="next"`, branch ancestry verification (`git merge-base --is-ancestor`), executable Case B recovery with real artifact handoff via `$GITHUB_OUTPUT`, and durable catalog revisions (`/system_config/catalog_state`) managed inside atomic transactions with stale generation abort (`capturedRevision < currentPublishedRevision`).
+- **Node 24 Compatible Pipelines:** All Actions use Node 24-compatible runtimes (`actions/checkout@v5.0.0`, `actions/setup-node@v7.1.0`, `actions/upload-pages-artifact@v5.0.0`, `actions/deploy-pages@v5.0.1`) pinned to 40-character commit SHAs.
+- **Single Authoritative Staging & Case B Provenance:** Staging is performed cleanly from the exact target commit into `site/`, verified via `stagedDigest === catalogDigest`, and protected from subsequent workspace copies. Outputs are exported to `$GITHUB_OUTPUT`.
+- **2-Tier Transactional Finalization:** Transaction reads `catalog_state`, `deployment_state`, and generation doc before any writes, evaluating `evaluateGenerationOrdering` and revision monotonicity. Stale generations abort immediately (`stale_aborted`). The 3-write global publication anchor is followed by idempotent batched writes (max 400 docs/batch) for submission statuses, respecting the Firestore 500-write limit.
+- **Granular Commit Recovery Error Classification:** Traverses `Link: rel="next"` without arbitrary depth caps. Distinguishes rate limits/timeouts (`INCOMPLETE_SEARCH`) from true missing commits (`EMPTY_SEARCH`).
 
 ### 5.3 Mandatory GitHub Pages Pre-Launch Gate
 - **Pre-Launch Policy Clarification:** While password forms are eliminated to satisfy the sensitive transaction policy, formal written clarification regarding the classification of GitStore as a non-commercial open directory must be obtained from GitHub Support as a formal **Phase 4 Launch Gate**. *Classified as Unresolved / Pending External Confirmation.*

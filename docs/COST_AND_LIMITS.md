@@ -1,7 +1,7 @@
 # GitStore — Cost Analysis & Operational Limits Specification
 
-**Document Version:** 1.8.0  
-**Phase:** Phase 0.1.7 — Replay Protection, Firestore Field Integrity & Deployment State Consistency  
+**Document Version:** 1.9.0  
+**Phase:** Phase 0.1.8 — Node 24 Workflow Compatibility, Artifact Provenance & Transactional Deployment Integrity  
 **Status:** IN_REVIEW — Awaiting Explicit User Approval  
 **Budget Objective:** Target $0.00 / Month under Strict Free Quotas (Architectural Estimates; Spark Plan without Linked Billing)
 
@@ -27,7 +27,8 @@ This document details the exact consumption math, failure behaviors when quotas 
 
 ### Critical GitHub Insights:
 1. **Public Repository Actions:** GitHub provides standard Linux runner minutes for open-source public repositories. However, jobs can be delayed by 5–30 minutes during platform peak load, and job concurrency is capped at 20 jobs.
-2. **Static Asset Serving:** GitHub Pages serves the static storefront (`index.html`, `explore.html`, `data/catalog.json`) directly via standard HTTP GET. Browsing consumes zero external cloud database bandwidth.
+2. **Node 24 Execution:** Workflow jobs execute on Node 24 runtimes without incurring runtime emulation or setup delays.
+3. **Static Asset Serving:** GitHub Pages serves the static storefront (`index.html`, `explore.html`, `data/catalog.json`) directly via standard HTTP GET. Browsing consumes zero external cloud database bandwidth.
 
 ---
 
@@ -38,16 +39,17 @@ Firebase’s **Spark Plan** is a strict no-cost tier with no credit card require
 | Resource | Spark Free Quota | Projected GitStore Consumption (Estimates) | Hard-Stop Behavior When Exceeded |
 |---|---|---|---|
 | **Firestore Document Reads** | **50,000 reads / day** | ~400 – 1,200 reads / day | Returns `RESOURCE_EXHAUSTED` (HTTP 429) until midnight PST reset. |
-| **Firestore Document Writes** | **20,000 writes / day** | ~50 – 150 writes / day | Returns `RESOURCE_EXHAUSTED` (HTTP 429) until midnight PST reset. |
+| **Firestore Document Writes** | **20,000 writes / day** | ~50 – 250 writes / day | Returns `RESOURCE_EXHAUSTED` (HTTP 429) until midnight PST reset. |
 | **Firestore Document Deletes**| **20,000 deletes / day**| ~5 – 20 deletes / day | Returns `RESOURCE_EXHAUSTED` (HTTP 429) until midnight PST reset. |
 | **Stored Firestore Data** | **1 GiB total storage** | ~5 MB for 2,000 products | Further writes fail with storage quota errors. |
 | **Firebase Authentication** | **50,000 MAUs / month** | ~500 – 2,000 active developers | Further user creations/logins fail until monthly reset. |
 | **Firebase App Check (reCAPTCHA Enterprise)** | **10,000 assessments / month**| ~200 – 1,000 assessments / month | Returns HTTP 429; token acquisition fails; Firestore requests rejected. |
 
-### Storage Overhead for Step-Up Replay Prevention:
-- Each administrative moderation action records one document in `/consumed_stepup_nonces/{nonceHash}` (~200 bytes).
-- At projected administrative volumes (~10–50 moderation actions per week), annual consumption is < 1 MB and < 2,600 writes/year, representing < 0.05% of Spark Plan storage and daily write quotas.
-- Worker-managed fields on submissions (`validationResults`, `processingLease`, etc.) are written directly by the trusted batch worker via Firebase Admin SDK, bypassing security rules and incurring zero client-side rule evaluation cost.
+### Transaction Write Limits & Overhead:
+- Firestore enforces a strict transaction write limit of **500 writes per transaction**.
+- GitStore’s 2-tier finalization commits the global publication anchor in **exactly 3 transactional writes** (`catalog_state`, `deployment_state`, and `system_deployments`), keeping transactional overhead < 1% of the limit.
+- Submission and product publication statuses are updated in **batched writes** chunked into blocks of 400 documents, entirely eliminating transaction write limit exhaustion.
+- Nonce ledger storage in `/consumed_stepup_nonces/{nonceHash}` consumes ~200 bytes per administrative action (< 1 MB/year), representing < 0.05% of Spark Plan storage and daily write quotas.
 
 ---
 

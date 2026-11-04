@@ -1,7 +1,7 @@
 # GitStore — Cloud Firestore Database Schema & Data Architecture
 
-**Document Version:** 1.8.0  
-**Phase:** Phase 0.1.7 — Replay Protection, Firestore Field Integrity & Deployment State Consistency  
+**Document Version:** 1.9.0  
+**Phase:** Phase 0.1.8 — Node 24 Workflow Compatibility, Artifact Provenance & Transactional Deployment Integrity  
 **Status:** IN_REVIEW — Awaiting Explicit User Approval  
 **Database:** Google Cloud Firestore (Native Mode)
 
@@ -18,10 +18,10 @@ GitStore employs **Cloud Firestore** as its operational and transactional data b
    - Product: `/products/prod_{repoId}_{productSlug}` (e.g. `prod_892341901_viewer`)
    This mathematically prevents collisions even if two repositories under the same owner use the identical slug `viewer`.
 3. **No Fake / Placeholder Firebase Accounts:** GitHub Issue submissions do **not** create placeholder Firebase Auth accounts. Unclaimed submissions record `submitterGithubId` (immutable numeric GitHub ID) and `claimStatus: 'unclaimed'`. They are claimed securely via an asynchronous `/claim_requests` queue when the developer authenticates via Firebase.
-4. **Step-Up Proof Integrity, ActionHash Checksum & Nonce Replay Protection:** Administrative commands and ownership claim requests write to restricted Firestore queues. Moderation requests strictly require fresh GitHub step-up reauthentication (`reauthenticateWithPopup`). **Zero raw OAuth access tokens are stored in Firestore.** The request stores an action-bound payload containing caller UID, immutable numeric GitHub ID (`identities['github.com'][0]`), `auth_time`, action, target document path, action nonce, and a client-generated `actionHash` (which serves as a data-integrity checksum, not a cryptographic signature). To prevent nonce reuse across different request documents, worker processing atomically claims the request and reserves the nonce in a dedicated collection `/consumed_stepup_nonces/{nonceHash}` within a single Firestore transaction. The Security Rules enforce a strict 5-minute authentication freshness gate at creation time (`auth_time < 300s`), while worker execution operates on a 30-minute queue TTL from `createdAt`. The worker validates the target document path against an explicit action-to-collection mapping.
-5. **12-State Deployment Recovery State Machine & Dedicated Pages Status (`succeed`):** Deployments transition across a formal 12-state state machine. Catalog integrity is proven via a deterministic SHA-256 `catalogDigest` computed recursively over canonicalized catalog files (length-prefixed, null-byte framed `sha256:v1:...`, excluding manifest). GitHub Pages deployment status is verified using the dedicated official endpoint `GET /repos/{owner}/{repo}/pages/deployments/{pages_deployment_id}` (where parameter accepts numeric deployment ID or commit SHA reference) checking for the documented success status `"status": "succeed"` (distinct from generic deployments and builds). In Case B recovery, the reconciler restores the Git tree, validates the digest, reconstructs `site/`, and explicitly exports `deployNeeded = true` to trigger artifact packaging and Pages deployment.
-6. **Durable Catalog Revisions & Transactional State Management:** Monotonic revision counters track requested vs published catalog state (`/system_config/catalog_state`). Inside an atomic Firestore transaction, the worker reads current catalog revisions, ensures monotonic advancement, and transactionally updates `isDirty = (currentRequested > capturedRevision)`. If a generation is detected to be stale (`capturedRevision < currentPublishedRevision`), the transaction aborts the entire finalization path immediately without modifying published sequence, published revision, commit SHA, or submission statuses.
-7. **Single Shared Generation Ordering Function:** A single shared decision function (`evaluateGenerationOrdering`) governs generation creation, recovery, pre-deployment guard (executed immediately before `actions/deploy-pages@v4`), Pages verification, and Firestore finalization, ensuring strict consistency across all 4 sequence cases.
+4. **Step-Up Proof Integrity, ActionHash Checksum & Nonce Replay Protection:** Administrative commands write to `/moderation_requests`. Moderation requests strictly require fresh GitHub step-up reauthentication (`reauthenticateWithPopup`). **Zero raw OAuth access tokens are stored in Firestore.** The request stores an action-bound payload containing caller UID (`requestedByUid`), immutable numeric GitHub ID (`identities['github.com'][0]`), `auth_time`, action, target document path, action nonce, action-specific payload, and a client-generated `actionHash` (which serves as a client data-integrity checksum, not a cryptographic signature). To prevent nonce reuse across different request documents, worker processing atomically claims the request and reserves the nonce in a dedicated collection `/consumed_stepup_nonces/{nonceHash}` within a single Firestore transaction. The Security Rules enforce a strict 5-minute authentication freshness gate at creation time (`auth_time < 300s`), while worker execution operates on a 30-minute queue TTL from `createdAt`. The worker validates the target document path against an explicit action-to-collection mapping and validates action-specific payload schemas.
+5. **Node 24 GitHub Actions Pipeline & Provenance-Preserving Staging:** Batch operations run on official GitHub Actions pinned to Node 24 releases (`actions/checkout@v5.0.0`, `actions/setup-node@v7.1.0`, `actions/upload-pages-artifact@v5.0.0`, `actions/deploy-pages@v5.0.1`). Artifact staging follows a single authoritative procedure: the `site/` staging directory is constructed exclusively from the verified source commit, its digest is recomputed and verified (`stagedDigest === catalogDigest`), and no subsequent workflow step copies from `main`. Step outputs are exported via direct append writes to `$GITHUB_OUTPUT`.
+6. **12-State Deployment Recovery State Machine & Dedicated Pages Status (`succeed`):** Deployments transition across a formal 12-state state machine. Catalog integrity is proven via a deterministic SHA-256 `catalogDigest` computed recursively over canonicalized catalog files (length-prefixed, null-byte framed `sha256:v1:...`, excluding manifest). GitHub Pages deployment status is verified using the dedicated official endpoint `GET /repos/{owner}/{repo}/pages/deployments/{pages_deployment_id}` (where parameter accepts numeric deployment ID or commit SHA reference) checking for the documented success status `"status": "succeed"` (distinct from generic deployments and builds). In Case B recovery, the reconciler restores the Git tree, validates the digest, reconstructs `site/`, and explicitly exports `deployNeeded = true` to trigger artifact packaging and Pages deployment. Fallback commit recovery follows the full GitHub Commits API pagination loop without arbitrary page caps, distinguishes rate-limit or network errors (`INCOMPLETE_SEARCH`) from true missing commits (`EMPTY_SEARCH`), and validates commit SHA formats before shell execution.
+7. **Transactional Generation Ordering & 2-Tier Finalization:** When finalizing deployment state, the worker executes an atomic transaction that reads current versions of `/system_config/catalog_state`, `/system_config/deployment_state`, and `/system_deployments/{generationId}` BEFORE any writes. Inside the transaction, it evaluates the shared ordering decision (`evaluateGenerationOrdering`) and catalog revision monotonicity (`capturedRevision >= latestPublishedRevision` and `capturedRevision <= latestRequestedRevision`). Stale generations abort immediately (`stale_aborted`) without modifying published sequence, published revision, commit SHA, or submission statuses. To strictly respect the Firestore 500-write limit, finalization uses a 2-tier architecture: the 3-write atomic transaction establishes the global canonical state, followed by idempotent batched writes (max 400 docs/batch) to fan out published statuses to submissions.
 8. **Decoupled Storefront Access:** Storefront reads bypass Firestore completely during normal user browsing, consuming static JSON compiled by GitHub Actions and served by GitHub Pages.
 
 ---
@@ -98,53 +98,49 @@ type SubmissionStatus =
   | 'published'            // Confirmed live on GitHub Pages storefront
   | 'deployment_failed'    // Pages deploy failed/timed out; queued for recompilation retry
   | 'rejected'             // Failed manual review or policy inspection
-  | 'failed';              // Automation error (e.g. 404 repo, corrupt release asset)
+  | 'abandoned';           // Failed validation or unrecoverable error
 
 type OwnershipProofTier = 
-  | 'direct_owner'         // Submitter is personal repo owner (eligible for auto-publish if verified)
-  | 'org_member'           // Submitter is public org member (forced to needs_review)
-  | 'committer'            // Submitter has merged commits (forced to needs_review)
-  | 'community';           // Submitter has no proven affiliation (forced to needs_review)
+  | 'direct_personal_owner'  // Personal repo matching developer's verified GitHub ID (Auto-Publish eligible)
+  | 'org_member'             // Member of repository organization (Requires admin approval)
+  | 'committer'              // Commits in Git log but not owner (Requires admin approval)
+  | 'community_nominator'    // Third party recommending open-source tool (Requires admin approval)
+  | 'unverified';            // Check failed or private repository
 
 interface SubmissionDocument {
   id: string;                        // "sub_issue_{repoId}_{issueNumber}" or "sub_dash_{nanoid}"
-  developerUid: string | null;       // Foreign Key -> users/{uid} (null if unclaimed)
-  submitterGithubId: string | null;  // Numeric GitHub user ID e.g. "583231" (immutable)
-  submitterGithubUsername: string | null;
-  claimStatus: 'unclaimed' | 'claim_pending' | 'claimed';
-  claimedAt: FirebaseFirestore.Timestamp | null;
+  developerUid: string | null;       // Owner Firebase UID (null if unclaimed issue)
   submissionSource: 'dashboard' | 'github_issue';
-  issueNumber: number | null;
-
-  // Globally Unique Entity Identifiers
-  repoNumericId: number;             // GitHub's immutable numeric repo ID e.g. 892341901
+  repoNumericId: number;             // Immutable numeric GitHub Repo ID e.g. 892341901
   repoId: string;                    // "gh_repo_" + repoNumericId
   targetProductId: string;           // "prod_" + repoNumericId + "_" + productSlug
+  claimStatus: 'claimed' | 'unclaimed';
+  submitterGithubId?: string;        // Extracted from Issue author for async claiming
 
-  // Strict Product Payload (Client-Supplied)
+  // Developer-Submitted Payload (Enforced by strict whitelist)
   productData: {
-    name: string;                    // 3 - 60 chars
-    slug: string;                    // URL-safe kebab-case string (e.g., "fast-terminal")
-    repoUrl: string;                 // Full URL (https://github.com/owner/repo)
-    repoOwner: string;               // Current owner handle (mutable on rename)
-    repoName: string;                // Current repository name (mutable on rename)
-    releaseTag: string;              // Specific tag (e.g., "v1.4.2")
+    name: string;                    // 3–60 chars
+    slug: string;                    // 3–30 chars (lowercase a-z, 0-9, hyphens)
+    repoUrl: string;                 // Must match https://github.com/owner/repo
+    repoOwner: string;
+    repoName: string;
+    releaseTag: string;
     selectedAsset: {
-      name: string;                  // Asset filename (e.g. "TerminalSetup.exe")
-      extension: 'exe' | 'msi' | 'apk' | 'dmg' | 'zip' | 'tar.gz';
-      sizeBytes: number;             // > 0
+      name: string;
+      extension: string;
+      sizeBytes: number;
       downloadUrl: string;
-      assetId: number;               // GitHub numeric asset ID
+      assetId: number;
     };
-    shortDescription: string;        // <= 200 chars
-    fullDescription: string;         // <= 10000 chars
+    shortDescription: string;        // Max 200 chars
+    fullDescription: string;         // Max 10000 chars (Markdown)
     category: string;
     iconUrl: string;
-    screenshots: string[];           // <= 6 URLs
-    supportedPlatforms: ('windows' | 'macos' | 'linux' | 'android' | 'web')[];
+    screenshots: string[];           // Max 6 URLs
+    supportedPlatforms: string[];    // At least 1 (windows, macos, linux, android, web)
     version: string;
     license: string;
-    liveDemoUrl: string | null;
+    liveDemoUrl?: string | null;
   };
 
   // State Management & Processing Lease (Worker-Managed via Admin SDK)
@@ -180,6 +176,7 @@ interface SubmissionDocument {
   reviewedBy?: string | null;        // Worker-Managed via Admin SDK
   reviewedAt?: FirebaseFirestore.Timestamp | null; // Worker-Managed via Admin SDK
   publishedProductId?: string | null; // Worker-Managed via Admin SDK
+  publishedGenerationId?: string | null; // Worker-Managed via Admin SDK
 
   createdAt: FirebaseFirestore.Timestamp;
   updatedAt: FirebaseFirestore.Timestamp;
@@ -207,21 +204,29 @@ interface ClaimRequestDocument {
 }
 ```
 
-### 2.5 Collection: `moderation_requests` (Action-Bound Proof, Zero Raw Tokens)
+### 2.5 Collection: `moderation_requests` (Action-Bound Proof, Action-Specific Payloads)
 - **Path:** `/moderation_requests/{requestId}`
 - **Document ID:** Auto-generated ID (`mod_req_{nanoid}`).
 - **Description:** Decoupled asynchronous command queue enabling administrators to initiate privileged actions with mandatory fresh GitHub step-up reauthentication.
-- **ActionHash Classification:** The client-supplied SHA-256 `actionHash` is a **data-integrity checksum** computed over `${action}:${targetDocumentPath}:${actionNonce}:${authTime}`. It prevents accidental payload corruption or parameter tampering in transit. It is **not** an independent cryptographic signature or authentication proof. The authoritative authorization basis rests upon:
-  1. Authenticated Firebase ID token with fresh `auth_time` (< 300s).
-  2. Verified GitHub provider claim and numeric ID matching (`identities['github.com'][0]`).
-  3. Authoritative collaborator permission verification against `Rohitpvt/GitStore` via GitHub REST API.
-  4. Worker-managed atomic nonce consumption in `/consumed_stepup_nonces`.
-  5. Strict worker validation that `targetDocumentPath` matches the canonical action-to-collection mapping.
-- **Action-to-Collection Mapping:**
-  * `APPROVE_SUBMISSION`, `REJECT_SUBMISSION` -> Target must match `submissions/{id}`.
-  * `VERIFY_DEVELOPER`, `REVOKE_DEVELOPER` -> Target must match `users/{id}` or `public_profiles/{id}`.
-  * `DELIST_PRODUCT`, `FEATURE_PRODUCT` -> Target must match `products/{id}`.
-  * Target documents in internal collections (`system_deployments`, `system_config`, `admin_logs`, `consumed_stepup_nonces`) are strictly rejected.
+- **Field Consistency:** The initiating admin UID is stored canonically in `requestedByUid` (matching `request.auth.uid`).
+- **ActionHash Classification:** The client-supplied SHA-256 `actionHash` is a **data-integrity checksum** computed over `${action}:${targetDocumentPath}:${actionNonce}:${authTime}`. It detects client-side data tampering in transit, but does **not** serve as a cryptographic signature.
+- **Authoritative Security Foundation:**
+  1. Authenticated Firebase ID token with fresh `auth_time` (< 300s) and provider `github.com`.
+  2. Verified numeric GitHub ID matching (`identities['github.com'][0]`).
+  3. Authoritative collaborator permission verification against `Rohitpvt/GitStore` via GitHub REST API (`role_name === 'admin' || role_name === 'maintain'`).
+  4. Worker-managed atomic nonce reservation in `/consumed_stepup_nonces`.
+  5. Strict worker and security rule validation that `targetDocumentPath` matches the canonical action-to-target mapping and `payload` satisfies action-specific schemas.
+
+#### Action-Specific Payload & Target Binding Matrix
+
+| Action | Target Pattern (`targetDocumentPath`) | Target ID Format (`targetId`) | Permitted Payload Keys | Required Payload Keys | Field Types & Constraints |
+|---|---|---|---|---|---|
+| `APPROVE_SUBMISSION` | `submissions/${targetId}` | `^[a-zA-Z0-9_-]+$` | `reviewNotes` | None | `reviewNotes`: optional string, <= 1000 chars |
+| `REJECT_SUBMISSION` | `submissions/${targetId}` | `^[a-zA-Z0-9_-]+$` | `rejectionReason`, `reviewNotes` | `rejectionReason` | `rejectionReason`: string, 10–1000 chars; `reviewNotes`: optional string, <= 1000 chars |
+| `VERIFY_DEVELOPER` | `public_profiles/${targetId}` or `users/${targetId}` | `^[a-zA-Z0-9_-]+$` | `verificationReason`, `evidenceUrl` | `verificationReason` | `verificationReason`: string, 10–500 chars; `evidenceUrl`: optional string, <= 200 chars |
+| `REVOKE_DEVELOPER` | `public_profiles/${targetId}` or `users/${targetId}` | `^[a-zA-Z0-9_-]+$` | `revocationReason` | `revocationReason` | `revocationReason`: string, 10–500 chars |
+| `DELIST_PRODUCT` | `products/${targetId}` | `^prod_[0-9]+_[a-z0-9-]+$` | `delistReason`, `noticePeriodDays` | `delistReason` | `delistReason`: string, 10–1000 chars; `noticePeriodDays`: optional number, 0–30 |
+| `FEATURE_PRODUCT` | `products/${targetId}` | `^prod_[0-9]+_[a-z0-9-]+$` | `featuredRank`, `featureNotes` | `featuredRank` | `featuredRank`: number, 1–100; `featureNotes`: optional string, <= 500 chars |
 
 ```typescript
 type ModerationAction = 
@@ -235,9 +240,9 @@ type ModerationAction =
 interface StepUpProof {
   providerId: 'github.com';          // Enforced by Security Rules
   authTime: number;                  // Seconds since epoch, strictly matching request.auth.token.auth_time
-  actionNonce: string;               // 64-char random hex or UUIDv4 generated on client
+  actionNonce: string;               // UUIDv4 or 64-char random hex generated on client
   targetDocumentPath: string;        // e.g. "submissions/sub_issue_892341901_42"
-  actionHash: string;                // Client data-integrity checksum: SHA256(`${action}:${targetDocumentPath}:${actionNonce}:${authTime}`)
+  actionHash: string;                // Client checksum: SHA256(`${action}:${targetDocumentPath}:${actionNonce}:${authTime}`)
 }
 
 interface ModerationRequestDocument {
@@ -245,13 +250,9 @@ interface ModerationRequestDocument {
   action: ModerationAction;
   targetId: string;                  // Entity identifier e.g. "sub_issue_892341901_42"
   targetDocumentPath: string;        // Full path e.g. "submissions/sub_issue_892341901_42"
-  payload: {
-    reason?: string;
-    notes?: string;
-    delistReason?: string;
-  };
+  payload: Record<string, any>;      // Action-specific validated schema
   requestedByUid: string;            // Firebase Auth UID (must match request.auth.uid)
-  githubUserId: string;              // Immutable numeric GitHub user ID (must match request.auth.token.firebase.identities['github.com'][0])
+  githubUserId: string;              // Immutable numeric GitHub user ID (must match token identities)
   stepUpProof: StepUpProof;
   status: 'pending' | 'processing' | 'completed' | 'rejected' | 'expired';
   rejectionReason: string | null;    // Worker-managed
@@ -263,7 +264,7 @@ interface ModerationRequestDocument {
 
 ### 2.6 Collection: `consumed_stepup_nonces` (Worker-Managed Replay Ledger)
 - **Path:** `/consumed_stepup_nonces/{nonceHash}`
-- **Document ID:** `nonceHash` (SHA-256 hash of `stepUpProof.actionNonce`).
+- **Document ID:** `nonceHash` (SHA-256 hex string of `stepUpProof.actionNonce`).
 - **Description:** Internal ledger preventing step-up nonce reuse across different moderation request documents.
 - **Client Access:** `allow read, write: if false;` (Internal collection; Admin SDK only).
 - **Atomic Reservation Invariant:** In the exact same Firestore transaction that leases a moderation request and transitions it to `processing`, the worker checks whether `/consumed_stepup_nonces/{nonceHash}` exists. If it exists, the transaction fails and the request is rejected with `NONCE_ALREADY_CONSUMED`. If it does not exist, the worker creates the document.
@@ -272,7 +273,7 @@ interface ModerationRequestDocument {
 interface ConsumedStepUpNonceDocument {
   nonceHash: string;                 // Primary key: SHA256(actionNonce)
   requestId: string;                 // Reference to moderation_requests/{id}
-  requestedByUid: string;            // Administrator UID
+  requestedByUid: string;            // Administrator UID (matches request.requestedByUid)
   action: ModerationAction;          // Moderation action authorized
   targetDocumentPath: string;        // Document modified
   workerRunId: string;               // Actions run ID consuming the nonce
@@ -341,232 +342,89 @@ interface ProductDocument {
 }
 ```
 
-### 2.8 Deployment Manifest & Recovery Metadata (`data/deployment-manifest.json`)
-Compiled alongside `data/catalog.json` and deployed to GitHub Pages to provide public deployment verification. In accordance with non-circular integrity requirements, `data/deployment-manifest.json` does **not** contain the commit SHA of the Git commit containing it, records `generatedAt` rather than `deployedAt`, and includes `catalogDigest`:
-
-```typescript
-interface DeploymentManifest {
-  generationId: string;              // "gen_{timestamp}_{randomSuffix}" e.g. "gen_1730300400000_a1b2c3d"
-  generationSequence: number;        // Monotonically increasing sequence integer e.g. 104
-  generatedAt: string;               // ISO 8601 UTC timestamp of catalog/manifest generation
-  catalogDigest: string;             // "sha256:v1:{hex}" over canonicalized static files (excluding manifest)
-  productCount: number;              // Total active products in catalog.json
-  schemaVersion: "1.8.0";            // Schema specification version
-  environment: 'github-pages';
-}
-```
-
-### 2.9 Collection: `system_deployments` (12-State Durable Ledger)
+### 2.8 Collection: `system_deployments` (Internal Tracking)
 - **Path:** `/system_deployments/{generationId}`
-- **Document ID:** Generation ID matching manifest (`gen_{timestamp}_{randomSuffix}`).
-- **Description:** Durable ledger of every catalog compilation and deployment attempt. Preserved permanently upon failure to prevent desynchronization between Git commits and Firestore records.
-- **Client Access:** `allow read, write: if false;` (Internal collection; worker only via Admin SDK).
+- **Document ID:** `generationId` (e.g., `gen_1730635200000_a1b2c3d4`).
+- **Description:** Tracks compilation generations, commit provenance, staged digest validation, and deployment verification.
+- **Client Access:** `allow read, write: if false;` (Internal collection; Admin SDK only).
 
 ```typescript
-type DeploymentSystemState =
-  | 'approved'
-  | 'catalog_generating'
-  | 'catalog_committed'
-  | 'deploying'
-  | 'deployment_success'
-  | 'deployment_verified'
-  | 'published'
-  | 'compilation_failed'
-  | 'deployment_failed'
-  | 'deployment_retained'
-  | 'reconciliation_active'
-  | 'stale_aborted';
-
-type ReconciliationStatus = 
-  | 'none'
-  | 'sha_recovered'
-  | 'pages_dispatched'
-  | 'pending_retry'
-  | 'reconciled'
-  | 'abandoned'
-  | 'stale_aborted';
-
-interface SystemDeploymentRecord {
-  generationId: string;              // Unique generation ID
-  generationSequence: number;        // Monotonically incrementing sequence number
-  catalogCommitSha: string | null;   // Git commit SHA (git rev-parse HEAD or recovered via git log blob inspection)
-  catalogDigest: string;             // SHA-256 digest of canonicalized catalog files (sha256:v1:...)
-  capturedRevision: number;          // Explicit revision snapshot from system_config/catalog_state (never undefined/null)
-  pagesDeploymentReference: string | number | null; // Dedicated GitHub Pages deployment reference (numeric ID or commit SHA)
-  expectedProductIds: string[];      // Array of submission IDs included in this generation
-  status: DeploymentSystemState;
-  reconciliationStatus: ReconciliationStatus;
-  attemptHistory: Array<{
-    attemptNumber: number;
-    startedAt: FirebaseFirestore.Timestamp;
-    completedAt?: FirebaseFirestore.Timestamp;
-    stage: 'generation' | 'commit' | 'artifact_upload' | 'pages_deploy' | 'cdn_verification' | 'db_finalization';
-    pagesDeploymentReference?: string | number;
-    pagesStatus?: 'succeed' | 'queued' | 'in_progress' | 'errored';
-    error?: string;
-  }>;
-  lastObservedPagesStatus?: 'succeed' | 'queued' | 'in_progress' | 'errored';
-  failureReason?: string;
-  retryEligibility: boolean;
+interface SystemDeploymentDocument {
+  generationId: string;              // Primary key
+  generationSequence: number;        // Strictly monotonic generation counter
+  capturedRevision: number;          // Mandatory catalog revision snapshot (never substituted with sequence)
+  finalizedRevision?: number | null; // Revision confirmed at publication finalization
+  catalogCommitSha: string | null;   // 40-char git commit SHA on origin/main
+  catalogDigest: string;             // Expected canonical digest (sha256:v1:...)
+  stagedDigest?: string | null;      // Digest recomputed from staged site/ files
+  pagesDeploymentReference: string | number | null; // Numeric ID or commit SHA reference
+  status: 'pending' | 'catalog_committed' | 'deploying' | 'published' | 'failed' | 'stale_aborted' | 'deployment_retained';
+  reconciliationStatus: 'none' | 'sha_recovered' | 'pages_dispatched' | 'pending_retry' | 'reconciled' | 'abandoned';
+  lastObservedPagesStatus: 'succeed' | 'queued' | 'in_progress' | 'errored' | null;
+  expectedProductIds: string[];
+  attemptCount: number;
   createdAt: FirebaseFirestore.Timestamp;
-  verifiedAt?: FirebaseFirestore.Timestamp;
-  finalizedAt?: FirebaseFirestore.Timestamp;
-}
-```
-
-### 2.10 Document: `system_config/deployment_state`
-- **Path:** `/system_config/deployment_state`
-- **Description:** Global monotonic deployment sequence pointer and concurrency lease tracker.
-- **Client Access:** `allow read, write: if false;` (Internal collection; worker only via Admin SDK).
-
-```typescript
-interface GlobalDeploymentState {
-  latestGenerationId: string;
-  latestSequence: number;            // Current highest sequence number generated
-  latestPublishedSequence: number;   // Current highest sequence confirmed published on Pages
-  latestPublishedGenerationId: string;
-  latestPublishedCommitSha: string;
-  latestPublishedCatalogDigest: string;
-  status: 'idle' | 'deploying';
-  activeWorkerLease?: {
-    workerId: string;
-    leaseExpiresAt: FirebaseFirestore.Timestamp;
-  };
-  lastPublishedAt?: FirebaseFirestore.Timestamp;
+  publishedAt?: FirebaseFirestore.Timestamp | null;
+  finalizedAt?: FirebaseFirestore.Timestamp | null;
   updatedAt: FirebaseFirestore.Timestamp;
 }
 ```
-
-### 2.11 Document: `system_config/catalog_state` (Durable Revision Tracker)
-- **Path:** `/system_config/catalog_state`
-- **Description:** Durable monotonic revision tracking for work preservation across batch compilation cycles.
-- **Client Access:** `allow read, write: if false;` (Internal collection; worker only via Admin SDK).
-
-```typescript
-interface GlobalCatalogState {
-  latestRequestedRevision: number;    // Advanced on any approved submission, delisting, or category change
-  latestPublishedRevision: number;    // Advanced when GitHub Pages deployment and CDN verification complete
-  activeCapturedRevision: number;     // Revision snapshot captured by currently running compilation worker
-  lastRevisionAdvancedAt: FirebaseFirestore.Timestamp;
-  lastPublishedAt?: FirebaseFirestore.Timestamp;
-  isDirty: boolean;                   // latestRequestedRevision > latestPublishedRevision
-  updatedAt: FirebaseFirestore.Timestamp;
-}
-```
-
-### 2.12 Collections: `categories`, `reports`, `admin_logs`, `system_config`
-- `categories`: Taxonomy slugs (`/categories/{id}`). Public read, worker write.
-- `reports`: User-generated abuse reports (`/reports/{id}`). Authenticated creation only (`request.auth != null`), strict schema bounds (`details.size() <= 2000`, `status == 'open'`), read/update/delete completely forbidden to clients.
-- `admin_logs`: Immutable audit trail written strictly by Actions worker (`/admin_logs/{id}`). Client access forbidden (`allow read, write: if false;`).
-- `system_config/global_settings`: Publicly readable platform configuration thresholds (`allow read: if true; allow write: if false;`).
 
 ---
 
-## 3. Shared Generation Ordering & Reconciler Logic
+## 3. Provenance-Preserving Staging & Error-Classified Reconciler
 
-### 3.1 Single Shared Generation Ordering Decision Function
+### 3.1 Single Authoritative Staging Procedure
+To prevent artifact corruption and ensure exact provenance:
+1. Identify the exact target `catalogCommitSha`.
+2. Completely remove any existing staging directory: `rm -rf site/`.
+3. Construct `site/` exclusively from the target commit (using git archive or dedicated clean checkout).
+4. Place static pages (`index.html`, `admin.html`, `dashboard.html`, `product.html`, `explore.html`, `submit.html`), `assets/`, and compiled `data/` into `site/`.
+5. Recompute the catalog digest directly from the staged files: `stagedDigest = computeCatalogDigest('site/data')`.
+6. Assert `stagedDigest === gen.catalogDigest`. If mismatch, delete `site/` and abort staging immediately.
+7. Confirm `site/data/deployment-manifest.json` matches `{ generationId, generationSequence, catalogDigest }`.
+8. Do not copy from `main` or workspace files after staging completes.
+9. Preserve `site/` intact until `actions/upload-pages-artifact@v5.0.0` packages it.
 
-To guarantee consistent behavior across generation creation, recovery, pre-deployment guard, and finalization:
+### 3.2 Output Bridge Implementation (`scripts/processor/output-bridge.js`)
+A Node.js function returning an object does not populate Actions step outputs. The output bridge writes directly to `$GITHUB_OUTPUT`:
 
 ```javascript
-/**
- * Shared evaluation of generation ordering against active published state.
- * Returns: 'REJECT_STALE' | 'ALLOW_IDEMPOTENT' | 'HALT_CONFLICT' | 'ALLOW_NEW'
- */
-function evaluateGenerationOrdering(artifactSeq, artifactGenId, activeSeq, activeGenId) {
-  if (artifactSeq < activeSeq) {
-    return 'REJECT_STALE'; // Case 1: Stale generation
+import fs from 'node:fs';
+
+export function emitStepOutput(name, value) {
+  const outputPath = process.env.GITHUB_OUTPUT;
+  if (!outputPath) {
+    console.warn(`[WARN] GITHUB_OUTPUT not set. Step output '${name}' not exported.`);
+    return;
   }
-  if (artifactSeq === activeSeq && artifactGenId === activeGenId) {
-    return 'ALLOW_IDEMPOTENT'; // Case 2: Idempotent retry of active generation
+  const strValue = String(value);
+  if (strValue.includes('\n') || strValue.includes('\r')) {
+    throw new Error(`SECURITY_ERROR: Step output '${name}' contains newline characters`);
   }
-  if (artifactSeq === activeSeq && artifactGenId !== activeGenId) {
-    return 'HALT_CONFLICT'; // Case 3: Sequence conflict / split-brain
-  }
-  return 'ALLOW_NEW'; // Case 4: Valid forward progression (artifactSeq > activeSeq)
+  fs.appendFileSync(outputPath, `${name}=${strValue}\n`, 'utf8');
 }
 ```
 
-### 3.2 Recursive Canonical JSON Serialization & Digest Algorithm
+### 3.3 Executable Reconciler Logic with Error Classification & 2-Tier Finalization
 
 ```javascript
-import { execSync } from 'child_process';
-import crypto from 'crypto';
-import fs from 'fs';
-import path from 'path';
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { execSync } from 'node:child_process';
+import { emitStepOutput } from './output-bridge.js';
 
-/**
- * Deeply canonicalizes any JavaScript value for deterministic hashing:
- * - Sorts object keys in lexicographical Unicode order recursively.
- * - Preserves exact array ordering while recursively canonicalizing elements.
- * - Formats numbers and primitives stably; rejects NaN / Infinity.
- * - Eliminates undefined, functions, and symbols.
- */
-function canonicalizeJson(val) {
-  if (val === null || typeof val !== 'object') {
-    if (typeof val === 'number') {
-      if (!Number.isFinite(val)) throw new TypeError('Non-finite number in catalog payload');
-      return JSON.stringify(val);
-    }
-    return JSON.stringify(val);
-  }
-  if (Array.isArray(val)) {
-    return '[' + val.map(item => canonicalizeJson(item)).join(',') + ']';
-  }
-  const keys = Object.keys(val).sort();
-  return '{' + keys.map(k => JSON.stringify(k) + ':' + canonicalizeJson(val[k])).join(',') + '}';
+export function evaluateGenerationOrdering(artifactSeq, artifactGenId, activeSeq, activeGenId) {
+  if (artifactSeq < activeSeq) return 'REJECT_STALE';
+  if (artifactSeq === activeSeq && artifactGenId === activeGenId) return 'ALLOW_IDEMPOTENT';
+  if (artifactSeq === activeSeq && artifactGenId !== activeGenId) return 'HALT_CONFLICT';
+  return 'ALLOW_NEW';
 }
 
-/**
- * Computes deterministic SHA-256 digest over sorted static catalog files.
- * Uses unambiguous length-prefixed, null-byte framed file boundaries.
- * Format: "sha256:v1:" + hexDigest
- */
-function computeCatalogDigest(baseDir) {
-  const hash = crypto.createHash('sha256');
-  const files = [];
-
-  const mainCatalog = path.join(baseDir, 'data', 'catalog.json');
-  const categoriesFile = path.join(baseDir, 'data', 'categories.json');
-  if (fs.existsSync(mainCatalog)) files.push(mainCatalog);
-  if (fs.existsSync(categoriesFile)) files.push(categoriesFile);
-
-  const productsDir = path.join(baseDir, 'data', 'products');
-  if (fs.existsSync(productsDir)) {
-    const prodFiles = fs.readdirSync(productsDir)
-      .filter(f => f.endsWith('.json'))
-      .sort()
-      .map(f => path.join(productsDir, f));
-    files.push(...prodFiles);
-  }
-
-  // Sort files lexicographically by normalized POSIX relative path
-  files.sort((a, b) => path.relative(baseDir, a).replace(/\\/g, '/').localeCompare(path.relative(baseDir, b).replace(/\\/g, '/')));
-
-  for (const file of files) {
-    const relPosixPath = path.relative(baseDir, file).replace(/\\/g, '/');
-    const rawContent = fs.readFileSync(file, 'utf8');
-    const parsed = JSON.parse(rawContent);
-    const canonicalPayload = canonicalizeJson(parsed);
-    const payloadBuffer = Buffer.from(canonicalPayload, 'utf8');
-
-    // Unambiguous null-byte, length-prefixed framing: "FILE\0${relPath}\0${byteLength}\0"
-    const header = Buffer.from(`FILE\0${relPosixPath}\0${payloadBuffer.length}\0`, 'utf8');
-    hash.update(header);
-    hash.update(payloadBuffer);
-  }
-
-  return 'sha256:v1:' + hash.digest('hex');
-}
-```
-
-### 3.3 Executable Reconciler Logic with True Artifact Handoff & Pages `succeed` Check
-
-```javascript
 /**
  * Reconciles live deployed GitHub Pages state, recovers unpersisted Git commit SHAs,
- * handles missing Pages deployment IDs across Cases A-D, and executes Case B artifact handoff.
- * Returns: { deployNeeded: boolean, generationId?: string, generationSequence?: number, catalogCommitSha?: string, catalogDigest?: string }
+ * classifies commit inspection errors, and executes 2-tier finalization.
  */
 async function reconcilePublishedState(db, octokit, pagesUrl) {
   let handoffResult = { deployNeeded: false };
@@ -584,9 +442,7 @@ async function reconcilePublishedState(db, octokit, pagesUrl) {
     const res = await fetch(`${pagesUrl}/data/deployment-manifest.json?t=${Date.now()}`, {
       headers: { 'Cache-Control': 'no-cache' }
     });
-    if (res.ok) {
-      liveManifest = await res.json();
-    }
+    if (res.ok) liveManifest = await res.json();
   } catch (err) {
     console.warn('[Reconciler] Could not reach public Pages manifest.', err.message);
   }
@@ -601,22 +457,13 @@ async function reconcilePublishedState(db, octokit, pagesUrl) {
     );
 
     if (orderDecision === 'REJECT_STALE') {
-      console.warn(`[Reconciler] Case 1 (Stale): CDN manifest sequence (${liveManifest.generationSequence}) is older than latest published (${state.latestPublishedSequence}). Aborting finalization.`);
+      console.warn(`[Reconciler] Case 1 (Stale): CDN manifest sequence (${liveManifest.generationSequence}) < latest published (${state.latestPublishedSequence}). Aborting.`);
       return handoffResult;
     } else if (orderDecision === 'ALLOW_IDEMPOTENT') {
-      console.log(`[Reconciler] Case 2 (Idempotent): CDN matches currently published generation ${liveManifest.generationId} (seq ${liveManifest.generationSequence}).`);
+      console.log(`[Reconciler] Case 2 (Idempotent): CDN matches currently published generation ${liveManifest.generationId}.`);
     } else if (orderDecision === 'HALT_CONFLICT') {
-      console.error(`[Reconciler] CRITICAL SECURITY ALERT: Case 3 (Sequence Conflict). Manifest seq ${liveManifest.generationSequence} claimed by distinct generation ${liveManifest.generationId}, but Firestore has ${state.latestPublishedGenerationId}. Halting.`);
-      await db.collection('admin_logs').add({
-        action: 'DEPLOYMENT_SEQUENCE_CONFLICT',
-        manifestId: liveManifest.generationId,
-        storedId: state.latestPublishedGenerationId,
-        sequence: liveManifest.generationSequence,
-        timestamp: new Date()
-      });
-      return handoffResult; // Fail-closed
-    } else {
-      console.log(`[Reconciler] Case 4 (New Generation): CDN manifest seq ${liveManifest.generationSequence} advances state past ${state.latestPublishedSequence}.`);
+      console.error(`[Reconciler] CRITICAL SECURITY ALERT: Case 3 (Sequence Conflict). Manifest seq ${liveManifest.generationSequence} claimed by ${liveManifest.generationId}, but Firestore has ${state.latestPublishedGenerationId}. Halting.`);
+      return handoffResult;
     }
   }
 
@@ -629,16 +476,18 @@ async function reconcilePublishedState(db, octokit, pagesUrl) {
   for (const genDoc of pendingGenerations.docs) {
     const gen = genDoc.data();
 
-    // 4a. Full-History Git Search & Catalog Digest Verification for missing catalogCommitSha
+    // 4a. Error-Classified Commit Recovery for missing catalogCommitSha
     if (!gen.catalogCommitSha) {
       console.log(`[Reconciler] Generation ${gen.generationId} missing catalogCommitSha. Scanning origin/main history...`);
+      let recoveredSha = null;
+      let isSearchIncomplete = false;
+
+      // Primary: Unshallow Git log
       try {
         const rawLog = execSync('git log --format="%H" origin/main -- data/deployment-manifest.json', { encoding: 'utf8' }).trim();
         const candidateShas = rawLog ? rawLog.split('\n') : [];
-        let recoveredSha = null;
-
         for (const sha of candidateShas) {
-          if (!/^[0-9a-f]{40}$/i.test(sha)) continue; // Input validation
+          if (!/^[0-9a-f]{40}$/i.test(sha)) continue;
           try {
             execSync(`git merge-base --is-ancestor ${sha} origin/main`);
             const blobContent = execSync(`git show ${sha}:data/deployment-manifest.json`, { encoding: 'utf8' });
@@ -649,95 +498,99 @@ async function reconcilePublishedState(db, octokit, pagesUrl) {
               recoveredSha = sha;
               break;
             }
-          } catch (blobErr) { /* non-matching commit or not an ancestor */ }
+          } catch (e) { /* candidate did not match */ }
         }
+      } catch (localGitErr) {
+        console.warn(`[Reconciler] Local git log search failed: ${localGitErr.message}`);
+      }
 
-        // Fallback: Full Pagination Loop for GitHub Commits API
-        if (!recoveredSha) {
-          let page = 1;
-          let hasMore = true;
-          let isSearchComplete = true;
-
-          while (hasMore) {
-            try {
-              const apiCommits = await octokit.request('GET /repos/{owner}/{repo}/commits', {
-                owner: 'Rohitpvt',
-                repo: 'GitStore',
-                path: 'data/deployment-manifest.json',
-                sha: 'main',
-                per_page: 100,
-                page
-              });
-              if (!apiCommits.data || apiCommits.data.length === 0) break;
-
-              for (const item of apiCommits.data) {
-                if (!/^[0-9a-f]{40}$/i.test(item.sha)) continue;
-                try {
-                  const fileContentRes = await octokit.request('GET /repos/{owner}/{repo}/contents/{path}', {
-                    owner: 'Rohitpvt',
-                    repo: 'GitStore',
-                    path: 'data/deployment-manifest.json',
-                    ref: item.sha
-                  });
-                  const decoded = Buffer.from(fileContentRes.data.content, 'base64').toString('utf8');
-                  const manifest = JSON.parse(decoded);
-                  if (manifest.generationId === gen.generationId && 
-                      manifest.generationSequence === gen.generationSequence &&
-                      manifest.catalogDigest === gen.catalogDigest) {
-                    recoveredSha = item.sha;
-                    break;
-                  }
-                } catch (apiErr) { /* continue examining */ }
+      // Fallback: GitHub Commits API with Full Pagination & Granular Error Classification
+      if (!recoveredSha) {
+        let currentUrl = `https://api.github.com/repos/Rohitpvt/GitStore/commits?sha=main&path=data/deployment-manifest.json&per_page=100`;
+        while (currentUrl && !recoveredSha) {
+          try {
+            const apiCommits = await octokit.request(`GET ${currentUrl}`);
+            for (const item of apiCommits.data) {
+              if (!/^[0-9a-f]{40}$/i.test(item.sha)) continue;
+              try {
+                const fileContentRes = await octokit.request('GET /repos/{owner}/{repo}/contents/{path}', {
+                  owner: 'Rohitpvt',
+                  repo: 'GitStore',
+                  path: 'data/deployment-manifest.json',
+                  ref: item.sha
+                });
+                const decoded = Buffer.from(fileContentRes.data.content, 'base64').toString('utf8');
+                const manifest = JSON.parse(decoded);
+                if (manifest.generationId === gen.generationId && 
+                    manifest.generationSequence === gen.generationSequence &&
+                    manifest.catalogDigest === gen.catalogDigest) {
+                  recoveredSha = item.sha;
+                  break;
+                }
+              } catch (blobErr) {
+                if (blobErr.status === 404) {
+                  // CANDIDATE_NO_MANIFEST: Commit did not touch manifest; continue to next candidate
+                  continue;
+                } else if (blobErr.status === 403 || blobErr.status === 429) {
+                  // API_RATE_LIMIT: Search cannot complete; must not declare empty
+                  console.warn(`[Reconciler] Rate limit hit during commit inspection for SHA ${item.sha}.`);
+                  isSearchIncomplete = true;
+                  break;
+                } else if (blobErr.status >= 500) {
+                  // API_SERVER_ERROR: Server error; search incomplete
+                  console.warn(`[Reconciler] Upstream 5xx error during commit inspection for SHA ${item.sha}.`);
+                  isSearchIncomplete = true;
+                  break;
+                } else {
+                  console.warn(`[Reconciler] Error inspecting commit ${item.sha}: ${blobErr.message}`);
+                  continue;
+                }
               }
-              if (recoveredSha) break;
-              const linkHeader = apiCommits.headers['link'] || '';
-              hasMore = linkHeader.includes('rel="next"');
-              page++;
-            } catch (pageErr) {
-              console.warn(`[Reconciler] Commits API pagination failed on page ${page}:`, pageErr.message);
-              isSearchComplete = false;
-              break; // Network or rate limit; do not abandon
             }
-          }
 
-          if (!recoveredSha && !isSearchComplete) {
-            console.warn(`[Reconciler] Search incomplete due to API error. Retaining generation ${gen.generationId} as pending_retry.`);
-            await genDoc.ref.update({ reconciliationStatus: 'pending_retry', updatedAt: new Date() });
-            continue;
+            if (isSearchIncomplete || recoveredSha) break;
+
+            const linkHeader = apiCommits.headers['link'];
+            const nextMatch = linkHeader ? linkHeader.match(/<([^>]+)>;\s*rel="next"/) : null;
+            currentUrl = nextMatch ? nextMatch[1] : null;
+          } catch (pageErr) {
+            console.warn(`[Reconciler] Commits API pagination failed: ${pageErr.message}`);
+            isSearchIncomplete = true;
+            break;
           }
         }
+      }
 
-        if (recoveredSha) {
-          console.log(`[Reconciler] Successfully recovered catalogCommitSha ${recoveredSha} for generation ${gen.generationId}.`);
-          gen.catalogCommitSha = recoveredSha;
-          await genDoc.ref.update({
-            catalogCommitSha: recoveredSha,
-            reconciliationStatus: 'sha_recovered',
-            updatedAt: new Date()
-          });
-        } else {
-          console.warn(`[Reconciler] Exhaustive search confirmed no remote commit on origin/main matches generation ${gen.generationId}.`);
-          await genDoc.ref.update({
-            status: 'failed',
-            failureReason: 'commit_not_found_on_remote',
-            reconciliationStatus: 'abandoned',
-            retryEligibility: false,
-            updatedAt: new Date()
-          });
-          continue;
-        }
-      } catch (gitErr) {
-        console.error(`[Reconciler] Git inspection failed during SHA recovery:`, gitErr.message);
+      if (recoveredSha) {
+        console.log(`[Reconciler] Recovered catalogCommitSha ${recoveredSha} for generation ${gen.generationId}.`);
+        gen.catalogCommitSha = recoveredSha;
+        await genDoc.ref.update({
+          catalogCommitSha: recoveredSha,
+          reconciliationStatus: 'sha_recovered',
+          updatedAt: new Date()
+        });
+      } else if (isSearchIncomplete) {
+        console.warn(`[Reconciler] Search incomplete. Retaining generation ${gen.generationId} as pending_retry.`);
+        await genDoc.ref.update({ reconciliationStatus: 'pending_retry', updatedAt: new Date() });
+        continue;
+      } else {
+        console.warn(`[Reconciler] Exhaustive search confirmed EMPTY_SEARCH for generation ${gen.generationId}.`);
+        await genDoc.ref.update({
+          status: 'failed',
+          failureReason: 'commit_not_found_on_remote',
+          reconciliationStatus: 'abandoned',
+          retryEligibility: false,
+          updatedAt: new Date()
+        });
         continue;
       }
     }
 
-    // 4b. Missing Pages Deployment Status Handling via Dedicated Endpoint & Status 'succeed'
+    // 4b. Dedicated Pages Status Check ('succeed')
     let isPagesSucceed = false;
     let resolvedReference = gen.pagesDeploymentReference || gen.catalogCommitSha;
 
     try {
-      // Official endpoint: GET /repos/{owner}/{repo}/pages/deployments/{pages_deployment_id}
       const pagesRes = await octokit.request('GET /repos/{owner}/{repo}/pages/deployments/{pages_deployment_id}', {
         owner: 'Rohitpvt',
         repo: 'GitStore',
@@ -746,7 +599,6 @@ async function reconcilePublishedState(db, octokit, pagesUrl) {
 
       if (pagesRes.status === 200) {
         const deployData = pagesRes.data;
-        // Documented success status is 'succeed' (NOT 'built')
         if (deployData.status === 'succeed') {
           isPagesSucceed = true;
           await genDoc.ref.update({
@@ -754,158 +606,176 @@ async function reconcilePublishedState(db, octokit, pagesUrl) {
             lastObservedPagesStatus: 'succeed'
           });
         } else if (deployData.status === 'queued' || deployData.status === 'in_progress') {
-          console.log(`[Reconciler] Pages deployment for commit ${gen.catalogCommitSha} is currently ${deployData.status}.`);
-          await genDoc.ref.update({
-            reconciliationStatus: 'pages_dispatched',
-            lastObservedPagesStatus: deployData.status
-          });
-          continue; // Non-terminal; wait for next cycle
+          await genDoc.ref.update({ reconciliationStatus: 'pages_dispatched', lastObservedPagesStatus: deployData.status });
+          continue;
         } else if (deployData.status === 'errored') {
-          console.warn(`[Reconciler] Pages deployment errored for commit ${gen.catalogCommitSha}.`);
-          await genDoc.ref.update({
-            reconciliationStatus: 'pending_retry',
-            lastObservedPagesStatus: 'errored'
-          });
+          await genDoc.ref.update({ reconciliationStatus: 'pending_retry', lastObservedPagesStatus: 'errored' });
           continue;
         } else {
-          // Unknown status must NEVER count as success
           console.warn(`[Reconciler] Unrecognized Pages deployment status '${deployData.status}'. Treating as non-terminal.`);
           continue;
         }
       }
     } catch (pagesErr) {
       if (pagesErr.status === 404) {
-        // Case B Recovery: Commit exists on origin/main, but no Pages deployment exists
-        console.log(`[Reconciler] Case B: No Pages deployment found for commit ${gen.catalogCommitSha}. Executing recovery & artifact handoff.`);
+        // Case B Recovery: Clean Staging from exact commit
+        console.log(`[Reconciler] Case B: No Pages deployment found for commit ${gen.catalogCommitSha}. Executing recovery staging.`);
         try {
           if (!/^[0-9a-f]{40}$/i.test(gen.catalogCommitSha)) {
             throw new Error(`Invalid catalogCommitSha: ${gen.catalogCommitSha}`);
           }
-          // 1. Re-checkout git tree at exact catalogCommitSha
-          execSync(`git checkout ${gen.catalogCommitSha}`);
-          // 2. Validate catalog digest against stored digest
-          const computedDigest = computeCatalogDigest(process.cwd());
-          if (computedDigest !== gen.catalogDigest) {
-            console.error(`[Reconciler] Case B digest mismatch: computed ${computedDigest} !== stored ${gen.catalogDigest}. Abandoning.`);
-            await genDoc.ref.update({
-              status: 'failed',
-              failureReason: 'digest_mismatch_during_recovery',
-              reconciliationStatus: 'abandoned',
-              updatedAt: new Date()
-            });
-            execSync(`git checkout main`);
-            continue;
+          // Single authoritative staging procedure:
+          execSync(`rm -rf site/ && mkdir -p site/data site/assets`);
+          execSync(`git archive ${gen.catalogCommitSha} index.html admin.html dashboard.html submit.html product.html explore.html assets data | tar -x -C site/`);
+          
+          const stagedDigest = computeCatalogDigest('site');
+          if (stagedDigest !== gen.catalogDigest) {
+            throw new Error(`STAGED_DIGEST_MISMATCH: staged ${stagedDigest} !== expected ${gen.catalogDigest}`);
           }
-          // 3. Reconstruct site/ staging directory
-          execSync(`mkdir -p site/data site/assets`);
-          execSync(`cp index.html admin.html dashboard.html submit.html product.html site/`);
-          execSync(`cp -r assets/* site/assets/`);
-          execSync(`cp -r data/* site/data/`);
 
-          // 4. Update Firestore state
           await genDoc.ref.update({
             reconciliationStatus: 'pages_dispatched',
+            stagedDigest: stagedDigest,
             updatedAt: new Date()
           });
 
-          // 5. Explicit Artifact Handoff to GitHub Actions Workflow
           handoffResult = {
             deployNeeded: true,
             generationId: gen.generationId,
             generationSequence: gen.generationSequence,
             catalogCommitSha: gen.catalogCommitSha,
-            catalogDigest: gen.catalogDigest
+            catalogDigest: gen.catalogDigest,
+            capturedRevision: gen.capturedRevision
           };
-
-          execSync(`git checkout main`);
-          return handoffResult; // Return immediately to trigger artifact packaging & deployment
+          return handoffResult;
         } catch (recoverErr) {
-          console.error(`[Reconciler] Case B recovery failed:`, recoverErr.message);
-          execSync(`git checkout main`);
+          console.error(`[Reconciler] Case B recovery failed: ${recoverErr.message}`);
+          execSync(`rm -rf site/`);
           continue;
         }
       } else if (pagesErr.status === 401 || pagesErr.status === 403) {
-        console.error(`[Reconciler] Permissions error checking Pages deployments:`, pagesErr.message);
-        break; // Fatal credential issue; abort batch
+        console.error(`[Reconciler] Permissions error on Pages API: ${pagesErr.message}`);
+        break;
       } else {
-        console.warn(`[Reconciler] Transient Pages API check failure:`, pagesErr.message);
         continue;
       }
     }
 
-    // 4c. Verify public manifest & catalog digest match this generation
+    // 4c. Verify public manifest & digest
     const isManifestVerified = liveManifest && 
       (liveManifest.generationId === gen.generationId) && 
       (liveManifest.generationSequence === gen.generationSequence) &&
       (liveManifest.catalogDigest === gen.catalogDigest);
 
-    // 4d. Idempotent Finalization & Durable Revision Advancement inside Atomic Transaction
+    // 4d. 2-Tier Transactional Finalization
     if (isPagesSucceed && isManifestVerified) {
-      console.log(`[Reconciler] Healing generation ${gen.generationId} (Commit ${gen.catalogCommitSha}). Finalizing Firestore to published.`);
+      console.log(`[Reconciler] Healing generation ${gen.generationId}. Finalizing Firestore.`);
 
-      if (typeof gen.capturedRevision !== 'number') {
-        console.error(`[Reconciler] Corrupt generation record: capturedRevision is not a number. Aborting finalization.`);
-        continue;
-      }
+      try {
+        // TIER 1: Atomic Global State Anchor Transaction (3 writes)
+        await db.runTransaction(async (transaction) => {
+          // READ 1: catalog_state
+          const catalogStateRef = db.collection('system_config').doc('catalog_state');
+          const liveCatDoc = await transaction.get(catalogStateRef);
+          const liveCat = liveCatDoc.exists ? liveCatDoc.data() : { latestRequestedRevision: 0, latestPublishedRevision: 0 };
 
-      await db.runTransaction(async (transaction) => {
-        // Read current catalog state INSIDE transaction
-        const catalogStateRef = db.collection('system_config').doc('catalog_state');
-        const liveCatalogStateDoc = await transaction.get(catalogStateRef);
-        const liveCatalogState = liveCatalogStateDoc.exists ? liveCatalogStateDoc.data() : { latestRequestedRevision: 0, latestPublishedRevision: 0 };
+          // READ 2: deployment_state
+          const deployStateRef = db.collection('system_config').doc('deployment_state');
+          const liveDepDoc = await transaction.get(deployStateRef);
+          const liveDep = liveDepDoc.exists ? liveDepDoc.data() : { latestPublishedSequence: 0, latestPublishedGenerationId: null };
 
-        const currentPublishedRev = liveCatalogState.latestPublishedRevision || 0;
-        const currentRequestedRev = liveCatalogState.latestRequestedRevision || 0;
+          // READ 3: generation record
+          const genRef = db.collection('system_deployments').doc(gen.generationId);
+          const genFreshDoc = await transaction.get(genRef);
+          if (!genFreshDoc.exists) throw new Error('GENERATION_NOT_FOUND');
+          const freshGen = genFreshDoc.data();
 
-        // Monotonic check: Stale generations MUST ABORT the transaction completely
-        if (gen.capturedRevision < currentPublishedRev) {
-          throw new Error(`STALE_GENERATION_ABORT: capturedRevision (${gen.capturedRevision}) is older than publishedRevision (${currentPublishedRev}).`);
-        }
+          if (typeof freshGen.capturedRevision !== 'number') {
+            throw new Error(`INVALID_CAPTURED_REVISION: Not a number in ${gen.generationId}`);
+          }
 
-        const isDirty = (currentRequestedRev > gen.capturedRevision);
-        transaction.set(catalogStateRef, {
-          latestPublishedRevision: gen.capturedRevision,
-          isDirty,
-          lastPublishedAt: new Date(),
-          updatedAt: new Date()
-        }, { merge: true });
+          // Complete shared ordering decision
+          const orderDecision = evaluateGenerationOrdering(
+            freshGen.generationSequence,
+            freshGen.generationId,
+            liveDep.latestPublishedSequence,
+            liveDep.latestPublishedGenerationId
+          );
 
-        // Finalize submissions
-        for (const subId of gen.expectedProductIds) {
-          const subRef = db.collection('submissions').doc(subId);
-          transaction.update(subRef, {
+          if (orderDecision === 'REJECT_STALE') {
+            throw new Error(`STALE_GENERATION_ABORT: sequence ${freshGen.generationSequence} < latestPublishedSequence ${liveDep.latestPublishedSequence}`);
+          }
+          if (orderDecision === 'HALT_CONFLICT') {
+            throw new Error(`HALT_CONFLICT: sequence collision at ${freshGen.generationSequence}`);
+          }
+
+          // Revision monotonicity check
+          if (freshGen.capturedRevision < liveCat.latestPublishedRevision) {
+            throw new Error(`STALE_REVISION_ABORT: capturedRevision ${freshGen.capturedRevision} < latestPublishedRevision ${liveCat.latestPublishedRevision}`);
+          }
+          if (freshGen.capturedRevision > liveCat.latestRequestedRevision) {
+            throw new Error(`FUTURE_REVISION_ANOMALY: capturedRevision ${freshGen.capturedRevision} > latestRequestedRevision ${liveCat.latestRequestedRevision}`);
+          }
+
+          const nextPublishedRev = Math.max(liveCat.latestPublishedRevision, freshGen.capturedRevision);
+          const isDirty = liveCat.latestRequestedRevision > nextPublishedRev;
+
+          // WRITE 1: Advance deployment_state
+          transaction.set(deployStateRef, {
+            latestPublishedSequence: freshGen.generationSequence,
+            latestPublishedGenerationId: freshGen.generationId,
+            latestPublishedCommitSha: freshGen.catalogCommitSha,
+            latestPublishedCatalogDigest: freshGen.catalogDigest,
+            status: 'idle',
+            lastPublishedAt: new Date(),
+            updatedAt: new Date()
+          }, { merge: true });
+
+          // WRITE 2: Advance catalog_state
+          transaction.set(catalogStateRef, {
+            latestPublishedRevision: nextPublishedRev,
+            isDirty: isDirty,
+            lastPublishedGenerationId: freshGen.generationId,
+            lastPublishedAt: new Date(),
+            updatedAt: new Date()
+          }, { merge: true });
+
+          // WRITE 3: Finalize system_deployments record
+          transaction.update(genRef, {
             status: 'published',
-            'processingLease.leaseHolder': null,
+            reconciliationStatus: 'reconciled',
+            finalizedRevision: nextPublishedRev,
+            verifiedAt: new Date(),
+            finalizedAt: new Date(),
             updatedAt: new Date()
           });
-        }
-
-        // Finalize system deployment record
-        transaction.update(genDoc.ref, {
-          status: 'published',
-          reconciliationStatus: 'reconciled',
-          verifiedAt: new Date(),
-          finalizedAt: new Date()
         });
 
-        // Advance global published sequence monotonically
-        transaction.set(db.collection('system_config').doc('deployment_state'), {
-          latestPublishedSequence: gen.generationSequence,
-          latestPublishedGenerationId: gen.generationId,
-          latestPublishedCommitSha: gen.catalogCommitSha,
-          latestPublishedCatalogDigest: gen.catalogDigest,
-          status: 'idle',
-          lastPublishedAt: new Date(),
-          updatedAt: new Date()
-        }, { merge: true });
-      }).catch(err => {
-        if (err.message && err.message.includes('STALE_GENERATION_ABORT')) {
+        // TIER 2: Idempotent Submission Status Fan-Out (Batched writes, max 400 docs/batch)
+        const CHUNK_SIZE = 400;
+        for (let i = 0; i < gen.expectedProductIds.length; i += CHUNK_SIZE) {
+          const chunk = gen.expectedProductIds.slice(i, i + CHUNK_SIZE);
+          const batch = db.batch();
+          for (const subId of chunk) {
+            const subRef = db.collection('submissions').doc(subId);
+            batch.update(subRef, {
+              status: 'published',
+              publishedGenerationId: gen.generationId,
+              'processingLease.leaseHolder': null,
+              updatedAt: new Date()
+            });
+          }
+          await batch.commit();
+        }
+
+      } catch (err) {
+        if (err.message && (err.message.includes('STALE_GENERATION_ABORT') || err.message.includes('STALE_REVISION_ABORT'))) {
           console.warn(`[Reconciler] Stale finalization aborted safely. Marking generation ${gen.generationId} as stale_aborted.`);
-          genDoc.ref.update({ status: 'stale_aborted', reconciliationStatus: 'stale_aborted', updatedAt: new Date() });
+          await genDoc.ref.update({ status: 'stale_aborted', reconciliationStatus: 'stale_aborted', updatedAt: new Date() });
         } else {
           throw err;
         }
-      });
+      }
     }
   }
 
@@ -930,7 +800,6 @@ service cloud.firestore {
       return isAuthenticated() && request.auth.uid == userId;
     }
 
-    // Step-Up Freshness Gate: Requires GitHub provider authentication within 300s
     function isFreshlyAuthenticated() {
       return isAuthenticated() 
         && request.auth.token.firebase.sign_in_provider == 'github.com'
@@ -940,12 +809,70 @@ service cloud.firestore {
         && (request.auth.token.auth_time <= (request.time.toMillis() / 1000) + 5);
     }
 
+    // Action-specific payload validators
+    function validModerationPayload(action, payload) {
+      return payload is map && (
+        (action == 'APPROVE_SUBMISSION' && validApprovePayload(payload)) ||
+        (action == 'REJECT_SUBMISSION' && validRejectPayload(payload)) ||
+        (action == 'VERIFY_DEVELOPER' && validVerifyDevPayload(payload)) ||
+        (action == 'REVOKE_DEVELOPER' && validRevokeDevPayload(payload)) ||
+        (action == 'DELIST_PRODUCT' && validDelistPayload(payload)) ||
+        (action == 'FEATURE_PRODUCT' && validFeaturePayload(payload))
+      );
+    }
+
+    function validApprovePayload(payload) {
+      return payload.keys().hasOnly(['reviewNotes'])
+        && (!('reviewNotes' in payload) || (payload.reviewNotes is string && payload.reviewNotes.size() <= 1000));
+    }
+
+    function validRejectPayload(payload) {
+      return payload.keys().hasOnly(['rejectionReason', 'reviewNotes'])
+        && ('rejectionReason' in payload)
+        && payload.rejectionReason is string
+        && payload.rejectionReason.size() >= 10
+        && payload.rejectionReason.size() <= 1000
+        && (!('reviewNotes' in payload) || (payload.reviewNotes is string && payload.reviewNotes.size() <= 1000));
+    }
+
+    function validVerifyDevPayload(payload) {
+      return payload.keys().hasOnly(['verificationReason', 'evidenceUrl'])
+        && ('verificationReason' in payload)
+        && payload.verificationReason is string
+        && payload.verificationReason.size() >= 10
+        && payload.verificationReason.size() <= 500
+        && (!('evidenceUrl' in payload) || (payload.evidenceUrl is string && payload.evidenceUrl.size() <= 200));
+    }
+
+    function validRevokeDevPayload(payload) {
+      return payload.keys().hasOnly(['revocationReason'])
+        && ('revocationReason' in payload)
+        && payload.revocationReason is string
+        && payload.revocationReason.size() >= 10
+        && payload.revocationReason.size() <= 500;
+    }
+
+    function validDelistPayload(payload) {
+      return payload.keys().hasOnly(['delistReason', 'noticePeriodDays'])
+        && ('delistReason' in payload)
+        && payload.delistReason is string
+        && payload.delistReason.size() >= 10
+        && payload.delistReason.size() <= 1000
+        && (!('noticePeriodDays' in payload) || (payload.noticePeriodDays is number && payload.noticePeriodDays >= 0 && payload.noticePeriodDays <= 30));
+    }
+
+    function validFeaturePayload(payload) {
+      return payload.keys().hasOnly(['featuredRank', 'featureNotes'])
+        && ('featuredRank' in payload)
+        && payload.featuredRank is number
+        && payload.featuredRank >= 1
+        && payload.featuredRank <= 100
+        && (!('featureNotes' in payload) || (payload.featureNotes is string && payload.featureNotes.size() <= 500));
+    }
+
     // -------------------------------------------------------------------------
     // 1. Private User Documents (/users/{userId})
     // -------------------------------------------------------------------------
-    // Strictly private to the user. Public access is forbidden.
-    // Client cannot write or modify privileged fields (isAdmin, isVerifiedDeveloper,
-    // reputationScore, githubNumericId, email).
     match /users/{userId} {
       allow read: if isOwner(userId);
       allow create: if isOwner(userId)
@@ -962,8 +889,6 @@ service cloud.firestore {
     // -------------------------------------------------------------------------
     // 2. Public Developer Profiles (/public_profiles/{userId})
     // -------------------------------------------------------------------------
-    // Safe public projection. Publicly readable. Client write is restricted:
-    // privileged fields (isVerifiedDeveloper, publishedProductIds) are worker-only.
     match /public_profiles/{userId} {
       allow read: if true;
       allow create: if isOwner(userId)
@@ -982,8 +907,6 @@ service cloud.firestore {
     // -------------------------------------------------------------------------
     // 3. Submissions (/submissions/{submissionId})
     // -------------------------------------------------------------------------
-    // Client creation strictly excludes worker-managed fields:
-    // (validationResults, ownershipProof, processingLease, adminNotes, reviewedBy, reviewedAt, publishedProductId)
     match /submissions/{submissionId} {
       allow read: if isAuthenticated() && resource.data.developerUid == request.auth.uid;
       allow create: if isAuthenticated() 
@@ -1021,7 +944,6 @@ service cloud.firestore {
         && request.resource.data.productData.selectedAsset.sizeBytes > 0
         && request.resource.data.createdAt == request.time
         && request.resource.data.updatedAt == request.time;
-      // Developers can edit metadata ONLY when queued or rejected; cannot tamper with ownership/lease/status
       allow update: if isOwner(resource.data.developerUid)
         && (resource.data.status == 'queued' || resource.data.status == 'rejected')
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['productData', 'status', 'updatedAt'])
@@ -1044,13 +966,12 @@ service cloud.firestore {
         && request.resource.data.targetSubmissionId.size() <= 128
         && request.resource.data.status == 'pending'
         && request.resource.data.createdAt == request.time;
-      allow update, delete: if false; // Privileged batch worker only via Admin SDK
+      allow update, delete: if false;
     }
 
     // -------------------------------------------------------------------------
     // 5. Moderation Requests (/moderation_requests/{requestId})
     // -------------------------------------------------------------------------
-    // Strictly requires fresh GitHub step-up reauthentication (< 300s). Zero raw tokens.
     match /moderation_requests/{requestId} {
       allow read: if isAuthenticated() && resource.data.requestedByUid == request.auth.uid;
       allow create: if isFreshlyAuthenticated()
@@ -1065,14 +986,18 @@ service cloud.firestore {
           'APPROVE_SUBMISSION', 'REJECT_SUBMISSION', 'VERIFY_DEVELOPER',
           'REVOKE_DEVELOPER', 'DELIST_PRODUCT', 'FEATURE_PRODUCT'
         ]
-        && request.resource.data.targetId is string
-        && request.resource.data.targetId.size() > 0
-        && request.resource.data.targetDocumentPath is string
         && (
-          (request.resource.data.action in ['APPROVE_SUBMISSION', 'REJECT_SUBMISSION'] && request.resource.data.targetDocumentPath.matches('^submissions/[a-zA-Z0-9_-]+$'))
-          || (request.resource.data.action in ['VERIFY_DEVELOPER', 'REVOKE_DEVELOPER'] && (request.resource.data.targetDocumentPath.matches('^users/[a-zA-Z0-9_-]+$') || request.resource.data.targetDocumentPath.matches('^public_profiles/[a-zA-Z0-9_-]+$')))
-          || (request.resource.data.action in ['DELIST_PRODUCT', 'FEATURE_PRODUCT'] && request.resource.data.targetDocumentPath.matches('^products/[a-zA-Z0-9_-]+$'))
+          (request.resource.data.action in ['APPROVE_SUBMISSION', 'REJECT_SUBMISSION'] 
+            && request.resource.data.targetId.matches('^[a-zA-Z0-9_-]+$')
+            && request.resource.data.targetDocumentPath == 'submissions/' + request.resource.data.targetId)
+          || (request.resource.data.action in ['VERIFY_DEVELOPER', 'REVOKE_DEVELOPER']
+            && request.resource.data.targetId.matches('^[a-zA-Z0-9_-]+$')
+            && (request.resource.data.targetDocumentPath == 'users/' + request.resource.data.targetId || request.resource.data.targetDocumentPath == 'public_profiles/' + request.resource.data.targetId))
+          || (request.resource.data.action in ['DELIST_PRODUCT', 'FEATURE_PRODUCT']
+            && request.resource.data.targetId.matches('^prod_[0-9]+_[a-z0-9-]+$')
+            && request.resource.data.targetDocumentPath == 'products/' + request.resource.data.targetId)
         )
+        && validModerationPayload(request.resource.data.action, request.resource.data.payload)
         && request.resource.data.stepUpProof is map
         && request.resource.data.stepUpProof.keys().hasOnly([
           'providerId', 'authTime', 'actionNonce', 'targetDocumentPath', 'actionHash'
@@ -1087,7 +1012,7 @@ service cloud.firestore {
         && request.resource.data.stepUpProof.actionHash.size() == 64
         && request.resource.data.status == 'pending'
         && request.resource.data.createdAt == request.time;
-      allow update, delete: if false; // Privileged batch worker only via Admin SDK
+      allow update, delete: if false;
     }
 
     // -------------------------------------------------------------------------
@@ -1116,7 +1041,6 @@ service cloud.firestore {
     // -------------------------------------------------------------------------
     // 9. Abuse Reports (/reports/{reportId})
     // -------------------------------------------------------------------------
-    // Authenticated users only to prevent anonymous spam. Strict schema & size bounds.
     match /reports/{reportId} {
       allow create: if isAuthenticated()
         && request.resource.data.keys().hasOnly([
@@ -1134,7 +1058,7 @@ service cloud.firestore {
         && request.resource.data.details.size() <= 2000
         && request.resource.data.status == 'open'
         && request.resource.data.createdAt == request.time;
-      allow read, update, delete: if false; // Worker / Administrator only
+      allow read, update, delete: if false;
     }
 
     // -------------------------------------------------------------------------
@@ -1158,4 +1082,3 @@ service cloud.firestore {
     }
   }
 }
-```
