@@ -1,8 +1,9 @@
 # GitStore — Comprehensive Deployment & Operations Guide
 
-**Document Version:** 1.11.0  
-**Phase:** Phase 0.1.11 — Fan-Out Generation Fencing, Idempotent Retry Accounting & Schema Truthfulness  
+**Document Version:** 1.12.0  
+**Phase:** Phase 0.1.12 — Fan-Out Work-Plan Integrity, Lease Ownership & Fail-Closed Recovery  
 **Status:** IN_REVIEW — Awaiting Explicit User Approval  
+**Data Schema Version:** 1.12.0  
 **Target Environments:** GitHub (Pages & Actions) and Firebase (Auth, Firestore, App Check)
 
 ---
@@ -102,14 +103,14 @@ Before initiating deployment, ensure you possess:
 4. Publication Verification Architecture:
    - Deployments use the **least-privilege split-job architecture** (`build-and-commit` and `deploy-to-pages`) targeting the `github-pages` environment within the same trusted workflow run (Option A).
    - Actions are pinned to verified Node 24 releases using 40-character commit SHAs.
-   - The batch worker generates `data/deployment-manifest.json` containing `{ generationId, generationSequence, generatedAt, catalogDigest, productCount, schemaVersion: "1.9.0", environment: "github-pages" }`.
+   - The batch worker generates `data/deployment-manifest.json` containing `{ generationId, generationSequence, generatedAt, catalogDigest, productCount, schemaVersion: "1.12.0", environment: "github-pages" }`.
    - Single Authoritative Staging: The `site/` staging directory is constructed authoritatively by the processor script from the exact target commit. The digest of `site/data` is recomputed and verified (`stagedDigest === catalogDigest`). No post-staging copy steps occur in the workflow.
    - Step outputs are exported via direct append writes to `$GITHUB_OUTPUT`.
    - The worker commits to `main`, captures `catalogCommitSha` via `git rev-parse HEAD`, records the generation in Firestore `/system_deployments/{generationId}`, and queries the official dedicated GitHub Pages deployment endpoint `GET /repos/Rohitpvt/GitStore/pages/deployments/{pages_deployment_id}` for status `"status": "succeed"`.
    - In case of a worker crash post-push before Firestore update, the startup reconciler recovers the SHA via complete pagination of `origin/main` commits following `Link: rel="next"`, proves branch ancestry via `git merge-base --is-ancestor`, and matches the recursive canonical `catalogDigest`. Granular error classification prevents network errors or rate limits from triggering false empty searches.
    - In Case B (commit exists on remote, but no Pages deployment exists), the reconciler stages `site/` from the target commit, verifies `stagedDigest`, returns `{ deployNeeded: true, generationId, generationSequence, catalogCommitSha, catalogDigest, capturedRevision }`, and sets `deploy_needed=true` in `$GITHUB_OUTPUT`. Job 1 uploads the Pages artifact, and Job 2 runs conditionally to execute the pre-deployment guard and `actions/deploy-pages@v5.0.1`.
    - Public HTTP checks on `https://rohitpvt.github.io/GitStore/data/deployment-manifest.json` confirm `generationId`, `generationSequence`, and `catalogDigest`.
-   - 2-Tier Transactional Finalization & Bounded Subcollections: An atomic transaction reads `/system_config/catalog_state`, `/system_config/deployment_state`, and the generation record BEFORE any writes. Inside the transaction, it evaluates `evaluateGenerationOrdering` and catalog revision monotonicity. If `capturedRevision < currentPublishedRevision`, the transaction aborts with `stale_aborted` to prevent rollbacks. It commits the global publication anchor in 3 writes, while submission fan-out work is partitioned into bounded deterministic subcollections (`/system_deployments/{generationId}/fanout_batches/{batchId}`) capped at 400 IDs each (~13 KB << 1 MiB limit). Parent documents store only $O(1)$ scalar summary counters. Fan-out executes conditional transactional updates enforcing status eligibility (`approved` only; never resurrecting `rejected`, `delisted`, or `withdrawn` submissions) and strictly monotonic sequence advancement (`publishedGenerationSequence`), preventing stale fan-out overwrites across all concurrency interleavings.
+   - 2-Tier Transactional Finalization & Bounded Subcollections: Prior to Tier 1 publication, deterministic fan-out batches are prepared via `prepareFanoutBatches` (strict ID validation, canonical `workPlanDigest`, immutable work plans, stale batch cleanup, and deep element readback verification). An atomic transaction reads `/system_config/catalog_state`, `/system_config/deployment_state`, and the generation record BEFORE any writes. Inside the transaction, it verifies `fanoutPreparationStatus === 'prepared'`, evaluates `evaluateGenerationOrdering`, and enforces revision monotonicity. It commits the global publication anchor in 3 writes, while submission fan-out work is partitioned into bounded deterministic subcollections (`/system_deployments/{generationId}/fanout_batches/{batchId}`) capped at 400 IDs each (~55 KB << 1 MiB limit). Parent documents store only $O(1)$ scalar summary counters. Fan-out executes transactional updates with distributed 15-minute leases (`acquireBatchLease`), enforcing fail-closed product checks (missing doc, delisted, flagged items fail closed), strict integer moderation revisions (`approvedCatalogRevision <= capturedRevision`), and atomic child/parent manual-review recovery. Startup reconciliation uses bounded cursor pagination (`limit(10)`, `startAfter`) excluding manual review items.
 
 ---
 

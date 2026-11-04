@@ -1,8 +1,9 @@
 # GitStore — Architecture Specification
 
-**Document Version:** 1.11.0  
-**Phase:** Phase 0.1.11 — Fan-Out Generation Fencing, Idempotent Retry Accounting & Schema Truthfulness  
+**Document Version:** 1.12.0  
+**Phase:** Phase 0.1.12 — Fan-Out Work-Plan Integrity, Lease Ownership & Fail-Closed Recovery  
 **Status:** IN_REVIEW — Awaiting Explicit User Approval  
+**Data Schema Version:** 1.12.0  
 
 ---
 
@@ -16,9 +17,14 @@ The design of GitStore is governed by seven non-negotiable architectural invaria
 4. **Zero-Trust Client Boundary & Complete Field Integrity:** The client-side browser is treated as untrusted. No client-side code possesses the authority to grant permissions, verify developers, alter product publication statuses, claim processing leases, or bypass release validation. User profile documents (`/users/{uid}`) are strictly private; public developer metadata is isolated in an explicit public projection (`/public_profiles/{uid}`). In `/submissions/{submissionId}`, client creation is strictly restricted to developer-owned payload fields; worker-managed fields (`validationResults`, `ownershipProof`, `processingLease`, `adminNotes`, `reviewedBy`, `reviewedAt`, `approvedCatalogRevision`, `publishedProductId`) are excluded from client creation allowlists and initialized solely by trusted workers via the Firebase Admin SDK. In `/moderation_requests`, Firestore rules enforce action-specific nested payload schemas and derive target document paths directly from action types and target IDs. Internal collections (`/system_deployments`, `/system_config/deployment_state`, `/system_config/catalog_state`, `/admin_logs`, `/consumed_stepup_nonces`) default to deny for all client access.
 5. **Decoupled Privileged Administration via Option A with Nonce Replay Protection:** Normal browser clients never receive Firebase Admin SDK credentials, and client JavaScript cannot mint custom claims. All privileged administrative and moderation operations execute via the privileged **GitHub Actions Batch Worker**, verified authoritatively against **GitStore's own canonical GitHub repository** (`Rohitpvt/GitStore`) collaborator permissions (`role_name === 'admin'` or `'maintain'`). Privileged operations strictly require fresh, interactive GitHub reauthentication (`reauthenticateWithPopup`). **Zero raw OAuth access tokens are stored in Firestore.** The request stores an action-bound payload containing caller UID (`requestedByUid`), immutable numeric GitHub ID (`identities['github.com'][0]`), `auth_time`, action, target document path, action nonce, action-specific payload, and a client-generated `actionHash` (which serves as a client data-integrity checksum, not a cryptographic signature). To prevent nonce reuse across different request documents, worker processing atomically claims the request and reserves the nonce in a dedicated collection `/consumed_stepup_nonces/{nonceHash}` within a single Firestore transaction. The Security Rules enforce a strict 5-minute authentication freshness gate at creation time (`auth_time < 300s`), while worker execution operates on a 30-minute queue TTL from `createdAt`.
 6. **Node 24 GitHub Actions Pipeline, Clean Staging & Dedicated Pages Status (`succeed`):** Batch processing workflows execute on official GitHub Actions pinned to Node 24 runtimes (`actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1` [v7.0.1], `actions/setup-node@0a44ba7841725637a54e280ec667c276c6cc814e` [v7.1.0], `actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa` [v5.0.0], `actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e` [v5.0.1]). Runner execution requires GitHub Actions Runner `>= v2.327.1`. Native Git CLI operations (`git push`) succeed with default `persist-credentials: true` using the runner's git credential helper. Artifact staging follows a single authoritative procedure: the `site/` staging directory is constructed exclusively from the verified source commit, its digest is recomputed and verified (`stagedDigest === catalogDigest`), and no subsequent workflow step copies from `main`. Step outputs are exported via direct append writes to `$GITHUB_OUTPUT`. GitHub Pages deployment status is verified using the dedicated official endpoint `GET /repos/{owner}/{repo}/pages/deployments/{pages_deployment_id}` checking for `"status": "succeed"`. Fallback commit recovery follows the full GitHub Commits API pagination loop without arbitrary page caps, distinguishes rate-limit or network errors (`INCOMPLETE_SEARCH`) and corrupt manifest blobs (`CANDIDATE_CORRUPT_MANIFEST`) from true missing commits (`EMPTY_SEARCH`), and validates commit SHA formats before shell execution.
-7. **Global Fan-Out Generation Fencing, Pure Transaction Callbacks & Quota-Aware Scalability:** Deployment publication and submission status propagation follow a strict two-tier architecture:
+7. **Global Fan-Out Generation Fencing, Work-Plan Integrity, Lease Ownership & Quota-Aware Scalability:** Deployment publication and submission status propagation follow a strict two-tier architecture:
    - **Tier 1 Publication:** Verifies that deterministic fan-out batch preparation is complete (`fanoutPreparationStatus === 'prepared'`) and executes an atomic 3-write transaction across `/system_config/deployment_state`, `/system_config/catalog_state`, and `/system_deployments/{generationId}`. Stale generations abort immediately (`stale_aborted`).
-   - **Tier 2 Fan-Out Execution:** Fan-out work is partitioned into bounded child documents (`/system_deployments/{generationId}/fanout_batches/{batchId}`) capped at 400 IDs each (~55 KB << 1 MiB limit, strictly quota-aware). Mini-chunk transactions read `/system_config/deployment_state` at the same consistency boundary: if `genSeq < latestPublishedSequence`, fan-out aborts as stale (`STALE_GLOBAL_GENERATION_ABORT`), preventing older generations from ever modifying unreached records. Per-submission checks enforce `approvedCatalogRevision <= capturedRevision`, verify `/products/{productId}` to ensure `delisted` or `flagged` products are never reactivated or implied publishable, fail closed on equal-sequence conflicting IDs (`HALT_CONFLICT`), and acknowledge idempotent replays. Transaction callbacks are pure (zero external mutations); child batch completion and parent summary increments commit in a single atomic transaction. Bounded cursor pagination (`limit(10)`, `startAfter`) ensures memory safety across all subcollection queries.
+   - **Tier 2 Fan-Out Execution:** Fan-out work is partitioned into bounded child documents (`/system_deployments/{generationId}/fanout_batches/{batchId}`) capped at 400 IDs each (~55 KB << 1 MiB limit, strictly quota-aware).
+     - *Work-Plan Preparation Integrity (`prepareFanoutBatches`):* Strictly validates every input submission ID (failing closed as `INVALID_SUBMISSION_ID_ABORT` on malformed IDs), deterministically deduplicates and sorts IDs, generates canonical `workPlanDigest`, enforces immutability once prepared (`WORKPLAN_MUTATION_CONFLICT`), cleans up stale batch documents from prior aborted runs, writes batch documents with `batchDigest` without clobbering completed state or active leases, and performs deep element-by-element readback verification before marking `fanoutPreparationStatus: 'prepared'`.
+     - *Fail-Closed Product & Revision Validation:* Missing product documents fail closed (`skipped_product_not_found`). Delisted and flagged products are skipped and never published or reactivated. Mismatched product IDs fail closed. Submissions require a strictly valid positive integer `approvedCatalogRevision <= capturedRevision`; missing, null, malformed, or post-capture revisions fail closed (`skipped_invalid_approval_revision`, `skipped_post_capture_reapproval`).
+     - *Transactional Distributed Lease Protocol:* Batch leases are claimed exclusively inside a Firestore transaction (`acquireBatchLease`) using a unique worker execution ID (`runId_runAttempt_uuid`) and a 15-minute lease duration. Lease ownership and validity are asserted before processing each mini-chunk and again during the atomic batch completion transaction; expired or superseded leases fail closed (`LEASE_LOST_ABORT`).
+     - *Atomic Manual-Review Recovery:* Retries exceeding 5 or fatal conflicts (`HALT_CONFLICT`) trigger an atomic transaction updating both the failing child batch (`status: 'manual_review'`) and the parent generation (`submissionFanoutStatus: 'manual_review'`), clearing leases and emitting structured audit logs to `/admin_logs`.
+     - *Bounded Reconciler Pagination:* The startup reconciler discovers incomplete published generations via bounded cursor pagination (`limit(10)`, `orderBy('submissionFanoutStatus', 'asc')`, `orderBy('generationSequence', 'asc')`, `startAfter(lastGenDoc)`), preventing full-table memory exhaustion while cleanly excluding manual-review and completed generations.
 
 ---
 
@@ -325,43 +331,55 @@ To strictly respect Firestore's 1 MiB document limit, 500-write transaction limi
     ```
 
 - **Deterministic Batch Preparation (`prepareFanoutBatches`):**
-  - **Producer Process:** Reads approved submission IDs from the generation's captured catalog revision, deduplicates via Set, validates ID format (`^sub_[a-zA-Z0-9_-]{8,128}$`), sorts lexicographically to guarantee deterministic partition boundaries, slices into 400-ID chunks, and writes child batch documents with `{ merge: true }`.
-  - **Work-Plan Verification:** Reads back all created batch documents to verify count and integrity.
-  - **Publication Ordering Invariant:** `fanoutPreparationStatus: 'prepared'` is persisted only after full verification. **Tier 1 publication is strictly forbidden from committing until the fan-out work plan is fully prepared and verified.** A generation never publishes with a partial or unverified fan-out plan.
+  - **Fail-Closed Producer:** Reads approved submission IDs from the generation's captured catalog revision. Strictly validates every input submission ID format (`^sub_[a-zA-Z0-9_-]{8,128}$`). Never silently discards malformed IDs; throws `INVALID_SUBMISSION_ID_ABORT` immediately upon encountering any invalid ID.
+  - **Deterministic Sorting & Canonical Work-Plan Digest:** Deduplicates valid IDs via Set and sorts lexicographically, guaranteeing identical partition boundaries across all worker runs. Computes a canonical SHA-256 digest over the ordered ID list and generation ID: `workPlanDigest = sha256("workplan:v1:" + genId + ":" + sortedUniqueIds.join(','))`.
+  - **Work-Plan Immutability Guard:** If parent generation is already marked `fanoutPreparationStatus === 'prepared'`, the worker verifies that the stored `workPlanDigest` matches the computed digest. On mismatch, it throws `WORKPLAN_MUTATION_CONFLICT`. On match, it returns idempotently without mutating state.
+  - **Stale Batch Detection & Pruning:** Scans existing batch documents in `/system_deployments/{generationId}/fanout_batches`. Any documents with `batchIndex >= totalBatches` or non-standard IDs from prior aborted preparations are quarantined or deleted before new batch persistence.
+  - **Deep Element-by-Element Readback Verification:** After persisting child batch documents (with individual `batchDigest = sha256("batch:v1:" + genId + ":" + bIndex + ":" + chunkIds.join(','))`), the worker reads back EVERY batch document. It asserts `generationId`, `batchIndex`, `batchId`, `expectedCount`, `batchDigest`, and element-by-element equality of stored `submissionIds` arrays.
+  - **Publication Ordering Invariant:** `fanoutPreparationStatus: 'prepared'` and `workPlanDigest` are persisted on the parent generation only after full readback verification passes. **Tier 1 publication is strictly conditioned on `fanoutPreparationStatus === 'prepared'`.**
 
-- **Global Generation Fencing in Mini-Chunk Transactions:**
-  - Fan-out executes in transactional mini-chunks (50 documents per chunk).
-  - **Consistency Boundary Read:** Every mini-chunk transaction reads `/system_config/deployment_state` alongside submission documents before performing any writes:
-    1. *Stale Global Generation:* If $genSeq < latestPublishedSequence$, the transaction aborts with `STALE_GLOBAL_GENERATION_ABORT` and terminates immediately. **A newer global publication fences off every older fan-out, even for submissions the newer generation has not reached yet.**
-    2. *Premature Generation:* If $genSeq > latestPublishedSequence$, the transaction aborts with `UNPUBLISHED_GENERATION_ABORT`.
-    3. *Equal-Sequence Conflicting ID:* If $genSeq === latestPublishedSequence$ but $genId !== latestPublishedGenerationId$, the transaction fails closed with `HALT_CONFLICT`.
-    4. *Safe Execution:* Only when $genSeq === latestPublishedSequence$ and $genId === latestPublishedGenerationId$ does the transaction proceed.
-
-- **Per-Submission Verification & Product-Level Delisting Guard:**
-  - Inside the mini-chunk transaction, each submission is checked:
+- **Fail-Closed Product & Moderation Revision Validation:**
+  - Inside the mini-chunk transaction, each submission is strictly evaluated:
     1. **Submission Status Guard:** Must be `approved` or `published`.
-    2. **Post-Capture Moderation Revision Fence:** Verifies `currentSub.approvedCatalogRevision <= genData.capturedRevision`. If a submission was rejected after capture and subsequently re-approved (or modified), its `approvedCatalogRevision` will exceed `capturedRevision`, and it is skipped (`skipped_post_capture_reapproval`) to prevent publishing stale catalog snapshots.
-    3. **Product-Level Status Check:** Reads `/products/{targetProductId}`. If product status is `delisted` or `flagged`, the fan-out update is skipped (`skipped_product_delisted_or_flagged`). The fan-out update never restores a delisted/flagged product to active, nor does it mark submission metadata in a manner that implies active publication.
+    2. **Strict Moderation Revision Fence:** Verifies `typeof sub.approvedCatalogRevision === 'number' && Number.isInteger(sub.approvedCatalogRevision) && sub.approvedCatalogRevision > 0`. Submissions with missing, null, malformed, or non-positive approval revisions fail closed (`skipped_invalid_approval_revision`). Verifies `sub.approvedCatalogRevision <= genData.capturedRevision`. If a submission was modified or re-approved after generation capture, it is skipped (`skipped_post_capture_reapproval`) to prevent publishing stale catalog snapshots.
+    3. **Fail-Closed Product-Level Status Check:** Reads `/products/{targetProductId}`.
+       - Missing product document fails closed (`skipped_product_not_found`) and NEVER results in publication.
+       - Target product status `delisted` fails closed (`skipped_product_delisted`) and is never reactivated or published.
+       - Target product status `flagged` fails closed (`skipped_product_flagged`) and is never published.
+       - Target product ID mismatch fails closed (`skipped_invalid_product_id`).
+       - Product status MUST be `active` to permit publication.
     4. **Submission Monotonic Sequence & Conflict Guard:**
        - If $sub.publishedGenerationSequence > genSeq$: skip stale update (`skipped_newer_generation_already_applied`).
        - If $sub.publishedGenerationSequence === genSeq$ and $sub.publishedGenerationId !== genId$: fail closed with `HALT_CONFLICT`.
        - If $sub.publishedGenerationSequence === genSeq$ and $sub.publishedGenerationId === genId$ and $sub.status === 'published'$: idempotent no-op (`already_completed`).
        - If $sub.publishedGenerationSequence < genSeq$: execute write to update status, generation ID, sequence, and product ID.
 
+- **Transactional Distributed Lease Protocol:**
+  - Replaces racy check-then-set operations with atomic transactions (`acquireBatchLease`).
+  - Worker generates a unique execution identifier: `${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}_${crypto.randomUUID()}`.
+  - An atomic transaction reads the batch document. If the batch is `completed` or `manual_review`, or if an active lease (`leaseExpiresAt > now`) is held by a differing worker, acquisition fails gracefully.
+  - Upon acquisition, the transaction atomically sets `status: 'processing'`, `leaseOwner: workerExecutionId`, `leaseAcquiredAt`, and a 15-minute lease expiry `leaseExpiresAt: now + 15m`.
+  - **In-Flight Lease Verification:** Every mini-chunk transaction re-reads the batch document and asserts `leaseOwner === workerExecutionId` and `leaseExpiresAt > now`. If the lease was lost or expired, the worker aborts with `LEASE_LOST_ABORT` / `LEASE_EXPIRED_ABORT`.
+  - **Atomic Batch Completion:** The completion transaction verifies `leaseOwner === workerExecutionId` and `leaseExpiresAt >= now` before marking `completed`, clearing lease fields, and incrementing parent generation counters.
+  - **Concurrency Interplay:** GitHub Actions workflow-level concurrency group `github-pages` serializes routine execution, while the Firestore distributed lease protects against orphan runners, delayed terminations, manual re-runs, and split-brain executions.
+
 - **Pure Transaction Callbacks & Accurate Counter Accounting:**
   - Firestore transaction callbacks execute multiple times during contention. To prevent counter inflation and duplicate logging, **zero outer variables are mutated inside the callback**.
   - The callback computes `{ chunkCompleted, chunkSkipped }` locally and returns it.
   - Caller accumulates into batch counters **only after** `db.runTransaction` resolves successfully.
 
-- **Atomic Batch Completion & Parent Counter Synchronization:**
-  - When all mini-chunks in a child batch complete, a single atomic transaction updates the child batch to `status: 'completed'` and increments parent summary counters (`completedFanoutBatches: increment(1)`, `completedSubmissionCount: increment(completed + skipped)`).
-  - If the batch is already `completed`, the transaction returns immediately without re-incrementing parent counters.
-  - If a batch fails after 5 retries or hits a fatal conflict, an atomic transaction transitions the child batch to `status: 'manual_review'` and the parent generation to `submissionFanoutStatus: 'manual_review'`, and records an audit log to `/admin_logs`. No record is left lingering in `processing`.
+- **Atomic Child/Parent Manual-Review Recovery:**
+  - When batch retries reach 5 attempts or encounter fatal halt conflicts (`HALT_CONFLICT`), the worker triggers a single atomic transaction that transitions BOTH the failing child batch (`status: 'manual_review'`, lease cleared, `lastError`, `failedAt`) and the parent generation (`submissionFanoutStatus: 'manual_review'`, `reconciliationStatus: 'manual_review'`).
+  - An audit record is logged to `/admin_logs` (`SUBMISSION_FANOUT_MANUAL_REVIEW`).
+  - The startup reconciler query filters specifically for `['pending', 'in_progress', 'partial']`, permanently preventing broken manual-review batches from causing infinite retry storms.
+  - Administrators resolve manual reviews via the Step-Up authenticated moderation workflow (`/moderation_requests`).
 
-- **Bounded Batch Pagination & Concurrency Ownership:**
+- **Bounded Batch & Reconciler Pagination:**
   - Batch queries employ bounded pagination with `.limit(10)`, `.orderBy('batchIndex', 'asc')`, and `.startAfter(lastBatchDoc)`. Memory consumption is $O(1)$ regardless of subcollection size.
-  - Required composite indexes: `fanout_batches` (`status` ASC, `batchIndex` ASC; `leaseExpiresAt` ASC, `batchIndex` ASC).
-  - Concurrency ownership: GitHub Actions root-level concurrency group `concurrency: { group: 'github-pages', cancel-in-progress: false }` enforces single-worker execution, supplemented by atomic 15-minute leases (`leaseOwner`, `leaseExpiresAt`) on child batch documents.
+  - In `reconcilePublishedState`, parent generation discovery uses bounded cursor pagination (`limit(10)`, `startAfter(lastGenDoc)`), ordered deterministically by `submissionFanoutStatus` ASC and `generationSequence` ASC.
+  - Required composite indexes:
+    - `system_deployments` (`status` ASC, `submissionFanoutStatus` ASC, `generationSequence` ASC)
+    - `fanout_batches` (`status` ASC, `batchIndex` ASC; `leaseExpiresAt` ASC, `batchIndex` ASC)
 
 ---
 
@@ -423,3 +441,15 @@ During startup commit recovery, candidate commit inspections on the GitHub Commi
 ### ADR-22: Deterministic Fan-Out Batch Preparation, Work Plan Verification & Bounded Cursor Pagination
 - **Status:** Accepted (Phase 0.1.11 Reconciled)
 - **Decision:** Fan-out child batches are prepared deterministically via `prepareFanoutBatches` (deduplicating, validating, sorting lexicographically, and partitioning into max 400-ID documents). The parent generation stores `fanoutPreparationStatus: 'prepared'`, `totalFanoutBatches`, and `expectedSubmissionCount` only after reading back and verifying every child batch document. Tier 1 publication is strictly conditioned on `fanoutPreparationStatus === 'prepared'`. Subcollection queries execute bounded cursor pagination (`limit(10)`, `orderBy('batchIndex', 'asc')`, `startAfter`), and worker ownership is guaranteed by GitHub Actions concurrency group `github-pages` combined with 15-minute CAS leases on batch documents. Conservative document sizing ($400 \times 128\text{ B} \approx 55\text{ KB} \ll 1\text{ MiB}$) eliminates unbound claims while honoring Firestore quotas.
+
+### ADR-23: Work-Plan Digest Integrity, Stale Batch Quarantine & Transactional Distributed Lease Protocol
+- **Status:** Accepted (Phase 0.1.12 Reconciled)
+- **Decision:** Fan-out preparation validates every input submission ID, failing closed as `INVALID_SUBMISSION_ID_ABORT` without silent dropping. Deduplicated, lexicographically sorted IDs generate a canonical `workPlanDigest = sha256("workplan:v1:" + genId + ":" + sortedUniqueIds.join(','))`. Once marked `prepared`, the work plan is strictly immutable (`WORKPLAN_MUTATION_CONFLICT`). Stale batches from aborted prior attempts are cleaned up. Every persisted child batch is deeply verified element-by-element against its `batchDigest` before parent publication. Worker batch execution utilizes an atomic transaction lease protocol (`acquireBatchLease`) with unique `workerExecutionId` and 15-minute lease duration, asserted before mini-chunk processing and during atomic batch completion (`LEASE_LOST_ABORT`).
+
+### ADR-24: Fail-Closed Product Validation & Moderation Revision Verification in Fan-Out Pipeline
+- **Status:** Accepted (Phase 0.1.12 Reconciled)
+- **Decision:** Submissions processed during fan-out must satisfy fail-closed entity checks:
+  1. *Product Existence & Status:* Missing `/products/{targetProductId}` document fails closed (`skipped_product_not_found`) and never results in publication. Target products marked `delisted` or `flagged` fail closed and are never published or reactivated. Product ID mismatch fails closed. Only products with status `active` are eligible for publication.
+  2. *Approval Revision Integer Integrity:* `approvedCatalogRevision` must be a valid positive integer (`Number.isInteger(rev) && rev > 0`). Missing, null, malformed, or non-positive values fail closed (`skipped_invalid_approval_revision`).
+  3. *Captured Revision Boundary:* Submissions with `approvedCatalogRevision > capturedRevision` fail closed (`skipped_post_capture_reapproval`), ensuring post-capture approvals are deferred to subsequent generations.
+  4. *Atomic Manual-Review Transition:* Batches exceeding 5 attempts or hitting fatal conflicts atomically transition both child batch (`manual_review`, lease cleared) and parent generation (`manual_review`) in a single transaction, and startup reconciler excludes them from automatic retry loops.

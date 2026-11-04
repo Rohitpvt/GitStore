@@ -1,8 +1,8 @@
 # GitStore — Master Phase Plan & Development Control System
 
-**Document Version:** 1.11.0  
-**Last Updated:** 2026-11-04  
-**Current Project State:** Phase 0.1.11 (Fan-Out Generation Fencing, Idempotent Retry Accounting & Schema Truthfulness) — `IN_REVIEW` 🔍 | Awaiting User `APPROVED` Gate for Phase 1  
+**Document Version:** 1.12.0  
+**Last Updated:** 2026-11-05  
+**Current Project State:** Phase 0.1.12 (Fan-Out Work-Plan Integrity, Lease Ownership & Fail-Closed Recovery) — `IN_REVIEW` 🔍 | Awaiting User `APPROVED` Gate for Phase 1  
 **Project Lead:** Technical Project Manager, Software Architect, & QA Lead  
 **Governing Standard:** Strict Dual-Platform Confinement (**GitHub** & **Firebase** ONLY)
 
@@ -37,7 +37,8 @@ To ensure strict quality control and eliminate premature execution:
 | **Phase 0.1.8**| Node 24 Workflow Compatibility, Artifact Provenance & Transactional Deployment Integrity | `COMPLETED` ✅ | 100% (All 8 core audit items closed) | Hardened Baseline |
 | **Phase 0.1.9**| Workflow Validation, Recovery SHA Preservation & Durable Finalization Recovery | `COMPLETED` ✅ | 100% (All 4 core defects + metadata verified) | Hardened Baseline |
 | **Phase 0.1.10**| Fan-Out Ordering, Firestore Scalability & Recovery Error Integrity | `COMPLETED` ✅ | 100% (All 5 core problems resolved & verified) | Hardened Baseline |
-| **Phase 0.1.11**| Fan-Out Generation Fencing, Idempotent Retry Accounting & Schema Truthfulness | `IN_REVIEW` ⏳ | 100% (All 8 core defect areas resolved & verified) | User Review Pending |
+| **Phase 0.1.11**| Fan-Out Generation Fencing, Idempotent Retry Accounting & Schema Truthfulness | `COMPLETED` ✅ | 100% (All 8 core defect areas resolved & verified) | Hardened Baseline |
+| **Phase 0.1.12**| Fan-Out Work-Plan Integrity, Lease Ownership & Fail-Closed Recovery | `IN_REVIEW` ⏳ | 100% (All 7 core defect areas resolved & documented) | User Review Pending |
 | **Phase 1** | Frontend Core Foundation (Mock Storefront) | `NOT_STARTED` 🛑 | 0 / 5 Subphases | Requires Phase 0.1 Approval |
 | **Phase 2** | Firebase Foundation and Authentication | `NOT_STARTED` 🛑 | 0 / 4 Subphases | Requires Phase 1 Approval |
 | **Phase 3** | Developer Dashboard and Submission System | `NOT_STARTED` 🛑 | 0 / 4 Subphases | Requires Phase 2 Approval |
@@ -144,7 +145,7 @@ To ensure strict quality control and eliminate premature execution:
 ---
 
 ### Phase 0.1.11: Fan-Out Generation Fencing, Idempotent Retry Accounting & Schema Truthfulness
-- **Status:** `IN_REVIEW` ⏳ (All 8 Core Defect Areas Resolved & Documented; Awaiting User Gate)
+- **Status:** `COMPLETED` ✅ (All 8 Core Defect Areas Resolved & Documented; Formally Hardened)
 - **Objective:** Resolve the 8 critical architectural defects identified in the Phase 0.1.10 independent review:
   1. *Global Fan-Out Generation Fencing:* In `executeSubmissionFanout()`, read `/system_config/deployment_state` inside every mini-chunk transaction. If $genSeq < latestPublishedSequence$, abort fan-out as stale (`STALE_GLOBAL_GENERATION_ABORT`), strictly preventing older generations from modifying unreached submissions after a newer generation publishes. Fail closed on equal-sequence conflicting generation IDs (`HALT_CONFLICT`).
   2. *Post-Capture Moderation Revision Fence:* Add `approvedCatalogRevision` to `SubmissionDocument`. Mini-chunk transaction asserts `currentSub.approvedCatalogRevision <= genData.capturedRevision`, skipping submissions modified or re-approved after generation capture (`skipped_post_capture_reapproval`).
@@ -156,6 +157,21 @@ To ensure strict quality control and eliminate premature execution:
   8. *Schema Truthfulness & Scalability Bounds:* Replace absolute "infinite horizontal scalability" claims with quota-aware bounds (max 128-char submission ID, 400 IDs $\approx 55\text{ KB} \ll 1\text{ MiB}$ limit). Explicitly distinguish Rules structural bounds from trusted worker authoritative checks (SemVer 2.0.0, SPDX License List, platform non-duplication via `arePlatformsUnique`, release asset validation via GitHub REST API). Synchronize all 11 project document headers to Version 1.11.0, Phase 0.1.11 `IN_REVIEW`.
 - **Files Modified:** All 11 architecture, schema, security, and governance files across `docs/` and root repository.
 - **Definition of Done (DoD):** All 8 defect areas resolved, ADR-17 and ADR-20 updated, ADR-21 and ADR-22 added, 19-row verification matrix populated with truthful classifications, documentation synchronized to v1.11.0, zero application code written, working tree verified clean.
+
+---
+
+### Phase 0.1.12: Fan-Out Work-Plan Integrity, Lease Ownership & Fail-Closed Recovery
+- **Status:** `IN_REVIEW` ⏳ (All 7 Core Defect Areas Resolved & Documented; Awaiting User Gate)
+- **Objective:** Resolve the 7 remaining architectural, security, and concurrency issues identified in the Phase 0.1.11 independent review:
+  1. *Deterministic Fan-Out Preparation (`prepareFanoutBatches`):* Strict validation of every input submission ID without silent filtering, failing closed on any malformed ID as `INVALID_SUBMISSION_ID_ABORT`. Deterministic deduplication via Set and lexicographical sorting. Generation of canonical `workPlanDigest` over ordered IDs and generation ID. Strict work-plan immutability once marked `prepared` (`WORKPLAN_MUTATION_CONFLICT`). Detection and pruning of stale batches from prior aborted runs. Batch document creation with individual `batchDigest` without clobbering completed batches or active leases. Deep element-by-element readback verification asserting exact array contents, counts, and digests before marking `fanoutPreparationStatus: 'prepared'`.
+  2. *Fail-Closed Product Validation:* Missing product documents fail closed (`skipped_product_not_found`) and never result in publication. Delisted products fail closed (`skipped_product_delisted`) and are never reactivated. Flagged products fail closed (`skipped_product_flagged`) and are never published. Mismatched product IDs fail closed (`skipped_invalid_product_id`). Product status must be `active` to permit publication.
+  3. *Strict Moderation Revision Validation:* Submissions require a valid positive integer `approvedCatalogRevision` (`Number.isInteger(rev) && rev > 0`). Missing, null, malformed, or non-positive values fail closed (`skipped_invalid_approval_revision`). Boundary enforcement: `approvedCatalogRevision <= capturedRevision`; post-capture approvals fail closed (`skipped_post_capture_reapproval`).
+  4. *Transactional Distributed Lease Protocol:* Atomic batch lease acquisition inside Firestore transaction (`acquireBatchLease`) using unique worker execution ID (`${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}_${crypto.randomUUID()}`) and 15-minute lease duration. In-flight lease ownership verified before every mini-chunk and during atomic batch completion (`LEASE_LOST_ABORT`, `LEASE_EXPIRED_ABORT`).
+  5. *Atomic Manual-Review Recovery:* Retries reaching 5 attempts or fatal conflicts (`HALT_CONFLICT`) atomically transition BOTH the active child batch (`status: 'manual_review'`, lease cleared, `lastError`, `failedAt`) and the parent generation (`submissionFanoutStatus: 'manual_review'`, `reconciliationStatus: 'manual_review'`) in a single transaction, and log structured audit entry to `/admin_logs`.
+  6. *Bounded Startup Reconciler Pagination:* Reconciler discovers incomplete published generations via cursor pagination (`limit(10)`, `startAfter(lastGenDoc)`), ordered deterministically by `submissionFanoutStatus` ASC and `generationSequence` ASC, preventing memory exhaustion and excluding manual-review records.
+  7. *Schema and Manifest Version Synchronization:* Data Schema Version `1.12.0`, Document Version `1.12.0`, and deployment manifest `schemaVersion: "1.12.0"` synchronized across all 11 documentation files.
+- **Files Modified:** All 11 architecture, schema, security, and governance files across `docs/` and root repository.
+- **Definition of Done (DoD):** All 7 defect areas resolved, ADR-21 and ADR-22 updated, ADR-23 and ADR-24 added, 20-scenario verification matrix populated with truthful classifications, documentation synchronized to v1.12.0, zero application code written, working tree verified clean.
 
 ---
 

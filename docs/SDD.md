@@ -1,8 +1,9 @@
 # GitStore — System Design Document (SDD)
 
-**Document Version:** 1.11.0  
-**Phase:** Phase 0.1.11 — Fan-Out Generation Fencing, Idempotent Retry Accounting & Schema Truthfulness  
+**Document Version:** 1.12.0  
+**Phase:** Phase 0.1.12 — Fan-Out Work-Plan Integrity, Lease Ownership & Fail-Closed Recovery  
 **Status:** IN_REVIEW — Awaiting Explicit User Approval  
+**Data Schema Version:** 1.12.0  
 
 ---
 
@@ -31,7 +32,7 @@ flowchart TD
         GHIssues["GitHub Issue Forms\n(.github/ISSUE_TEMPLATE)"]
         GHReleases["Public GitHub Releases\n(External User Repositories)"]
         GHREST["GitHub REST API v3\n(Canonical Repo Collaborator Check,\nUpstream Repo, Tag & Asset Validation,\nPages Deployment Status via Commit SHA: succeed)"]
-        GHWorker["GitHub Actions Batch Worker (Node 24)\n(Scheduled every 10 min + Manual Dispatch)\n- Actions: checkout@v7.0.1, setup-node@v7, upload@v5, deploy@v5\n- Single Authoritative Staging (stagedDigest check)\n- Explicit $GITHUB_OUTPUT Bridge\n- Bounded Subcollection Fan-Out & Stale Abort"]
+        GHWorker["GitHub Actions Batch Worker (Node 24)\n(Scheduled every 10 min + Manual Dispatch)\n- Actions: checkout@v7.0.1, setup-node@v7, upload@v5, deploy@v5\n- Single Authoritative Staging (stagedDigest check)\n- Explicit $GITHUB_OUTPUT Bridge\n- Work-Plan Digest & Transactional Lease Fan-Out"]
     end
 
     %% Client Interactions
@@ -253,7 +254,7 @@ GitStore/
 │       ├── pre-deploy-guard.js     # Pre-deployment shared generation ordering assertion
 │       ├── finalize-publishing.js  # 2-tier finalization transaction & stale abort
 │       └── catalog-compiler.js     # Static JSON generator, single staging & digest hasher
-├── docs/                           # Complete 13 Architectural Documents (v1.11.0)
+├── docs/                           # Complete 13 Architectural Documents (v1.12.0)
 ├── index.html                      # Homepage
 ├── explore.html                    # Product Discovery & Search
 ├── product.html                    # Dynamic Product Detail Viewer
