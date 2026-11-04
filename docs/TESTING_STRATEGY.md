@@ -1,7 +1,7 @@
 # GitStore — Comprehensive Testing Strategy
 
-**Document Version:** 1.9.0  
-**Phase:** Phase 0.1.9 — Workflow Validation, Recovery SHA Preservation & Durable Finalization Recovery  
+**Document Version:** 1.11.0  
+**Phase:** Phase 0.1.11 — Fan-Out Generation Fencing, Idempotent Retry Accounting & Schema Truthfulness  
 **Status:** IN_REVIEW — Awaiting Explicit User Approval  
 
 ---
@@ -175,27 +175,31 @@ describe('Deterministic Recursive Canonical Digest Tests', () => {
 - **Output Export:** Execute `emitStepOutput('deploy_needed', 'true')` and `emitStepOutput('commit_needed', 'false')` with mock `GITHUB_OUTPUT` file. Read file; assert content matches expected lines.
 - **Newline Injection Defense:** Call `emitStepOutput('key', 'val\nattack=true')`. Assert throws security error.
 
-### 5.6 2-Tier Transactional Finalization, Bounded Subcollections & Concurrency Tests
-- **Tier 1 (Atomic Anchor):**
+### 5.6 2-Tier Transactional Finalization, Bounded Subcollections & Global-Fenced Concurrency Tests
+- **Tier 1 (Atomic Publication Anchor):**
   - Transaction reads `catalog_state`, `deployment_state`, and `system_deployments/{id}` before any writes.
-  - Evaluates `evaluateGenerationOrdering`.
+  - Assert: Requires `freshGen.fanoutPreparationStatus === 'prepared'` before permitting publication; aborts with `PREPARATION_INCOMPLETE_ABORT` if missing.
+  - Evaluates `evaluateGenerationOrdering` and revision monotonicity.
   - Assert: Exactly 3 writes committed in transaction; marks `status: 'published'`, `reconciliationStatus: 'fanout_pending'`, `submissionFanoutStatus: 'pending'`, `completedSubmissionCount: 0`, `completedFanoutBatches: 0`.
 - **Stale Abort:** If candidate `capturedRevision < catalogState.latestPublishedRevision`, transaction throws immediately. Generation marked `stale_aborted`.
-- **Bounded Storage & 1 MiB Document Size Invariant:**
+- **Bounded Storage & Quota-Aware Document Limit:**
   - Mock generation with 10,000 published submissions.
-  - Assert: Submissions partitioned into 25 deterministic subcollection batches (`batch_00000` to `batch_00024`), each containing at most 400 IDs (~13 KB).
+  - Assert: Submissions partitioned into 25 deterministic subcollection batches (`batch_00000` to `batch_00024`), each containing at most 400 IDs (conservative size: $400 \times 128\text{ B} \approx 55\text{ KB} \ll 1\text{ MiB}$ limit).
   - Assert: Parent generation document retains only $O(1)$ scalar counters (`expectedSubmissionCount: 10000`, `totalFanoutBatches: 25`, etc.), remaining strictly bounded and far below the 1 MiB limit (< 2 KB).
-- **Conditional Monotonic Submission Fan-Out Tests (9 Concurrency Scenarios):**
-  1. *A and B fan-out simultaneously:* Test concurrent execution of Generation A (seq 10) and B (seq 11). Assert monotonic transactions ensure Generation B's `publishedGenerationSequence: 11` is committed on all documents, never regressed by A.
-  2. *A resumes after B has completed:* Worker resumes fan-out for Generation A. All submissions already bear sequence 11. Assert A skips every document (`skipped_stale_generation`); B's publication state is 100% preserved.
-  3. *A resumes after B published but before B completes fan-out:* Interleaved execution. Assert submissions updated by A to 10 are subsequently updated by B to 11; B ultimately wins.
+- **Pure Transaction Callback Tests:**
+  - Inject contention into `db.runTransaction` causing 3 retries before final commit.
+  - Assert: Outer counters (`batchCompleted`, `batchSkipped`) are NOT mutated during failed attempts; incremented strictly once upon final commit.
+- **Global Fan-Out Generation Fence & Concurrency Tests (9 Scenarios):**
+  1. *A and B fan-out simultaneously:* Test concurrent execution of Generation A (seq 10) and B (seq 11). Assert Generation B commits first; A retries, reads `/system_config/deployment_state`, observes $10 < 11$, and aborts with `STALE_GLOBAL_GENERATION_ABORT` with zero writes.
+  2. *A resumes after B has completed:* Worker resumes fan-out for Generation A. A reads `/system_config/deployment_state` (seq 11), aborts fan-out immediately; B's publication state is 100% preserved.
+  3. *A resumes after B published but before B completes fan-out:* Interleaved execution. A's mini-chunk transaction reads `/system_config/deployment_state` at the consistency boundary, observes global sequence 11 > 10, and aborts with `STALE_GLOBAL_GENERATION_ABORT` before modifying any unreached submissions. Older generation A is completely fenced off.
   4. *Admin rejects submission after A captured revision:* Mock admin setting `status: 'rejected'` while A deploys. Assert A's fan-out transaction detects ineligible status and skips document (`skipped_status_ineligible`), never resurrecting rejected submission to `published`.
-  5. *Admin delists product during A's deployment:* Mock admin setting `status: 'delisted'`. Assert fan-out transaction skips document, keeping product delisted.
-  6. *Worker crashes after a batch commits:* Batch commits in Firestore, but worker crashes before batch completion record. Upon reboot, worker re-runs batch; transactions detect `already_completed` (no-op); batch completes idempotently without double-incrementing counters.
-  7. *Worker crashes before cursor / batch completion write:* Assert idempotent replay skips already-updated submissions and commits clean batch state.
-  8. *Duplicate fan-out worker execution:* Run duplicate workers against same batch. Assert exact state convergence with zero conflicting writes.
-  9. *Submission already associated with newer published generation:* Mock submission with `publishedGenerationSequence: 42`. Incoming generation has sequence 40. Assert update rejected and skipped.
-- **Max Retries & Manual Review Fallback:** After 5 consecutive failed attempts on any batch, transitions to `status: 'manual_review'` and records alert in `/admin_logs`.
+  5. *Admin delists product during A's deployment:* Mock admin setting `/products/{productId}` status to `'delisted'`. Assert fan-out transaction skips document, keeping product delisted and never reactivating.
+  6. *Post-capture reapproval fence:* Mock submission rejected and subsequently re-approved with `approvedCatalogRevision: 16` while deploying generation captured at revision 15. Assert fan-out transaction skips document (`skipped_post_capture_reapproval`), preventing publication of stale snapshot.
+  7. *Equal-sequence conflicting ID:* Mock submission or global state with identical sequence but different generation ID. Assert transaction throws `HALT_CONFLICT` and fails closed.
+  8. *Worker crashes after batch completion:* Child batch completion and parent counter increment commit in a single atomic transaction. Assert retry evaluates `already_completed` (no-op) with zero counter inflation.
+  9. *Bounded cursor pagination test:* Query 50 batches using `.limit(10)` and `.startAfter()`. Assert 5 complete pages are retrieved and processed sequentially without unbounded memory usage.
+- **Max Retries & Manual Review Fallback:** After 5 consecutive failed attempts on any batch or on fatal `HALT_CONFLICT`, atomically transitions child batch to `status: 'manual_review'` and parent to `manual_review`, and records alert in `/admin_logs`.
 
 ---
 

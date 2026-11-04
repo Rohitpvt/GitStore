@@ -1,7 +1,7 @@
 # GitStore — Security Architecture & Threat Model
 
-**Document Version:** 1.9.0  
-**Phase:** Phase 0.1.9 — Workflow Validation, Recovery SHA Preservation & Durable Finalization Recovery  
+**Document Version:** 1.11.0  
+**Phase:** Phase 0.1.11 — Fan-Out Generation Fencing, Idempotent Retry Accounting & Schema Truthfulness  
 **Status:** IN_REVIEW — Awaiting Explicit User Approval  
 
 ---
@@ -124,13 +124,21 @@ GitHub removed Node 20 from hosted Actions runners on September 23, 2026. All ac
 
 **Native Git CLI Credential Behavior:** Official documentation confirms that `actions/checkout` v7.0.1 securely isolates stored credentials in `$RUNNER_TEMP` (preventing accidental repository artifact leaks) while configuring the Git credential helper to permit native Git commands (`git fetch`, `git push origin main`) to execute seamlessly when `persist-credentials: true` (default) with `permissions: contents: write`.
 
-### 4.3 Exhaustive Nested `productData` Schema Validation
-Both Firestore Security Rules (`isValidProductData`) and the batch worker enforce complete structural validation:
-- **Basic Info:** `name` (3-60 chars), `slug` (canonical regex `^[a-z0-9]+(-[a-z0-9]+)*$`, 3-30 chars), `repoUrl` (GitHub HTTPS URL <= 200 chars), `repoOwner` (1-39 chars), `repoName` (1-100 chars), `releaseTag` (1-50 chars), `shortDescription` (10-200 chars), `fullDescription` (20-10000 chars), `category` (strict enum), `version` (1-32 chars), `license` (1-50 chars).
-- **Selected Asset:** Map keys strictly allowlisted to `['name', 'extension', 'sizeBytes', 'downloadUrl', 'assetId']`. All 5 keys mandatory. `sizeBytes` strictly bounded between 1 and 524,288,000 bytes (500 MiB). `downloadUrl` must be an HTTPS GitHub release asset URL. `assetId` must be a positive integer.
-- **Media:** `iconUrl` (optional HTTPS URL <= 500 chars), `screenshots` list (max 6 items; each element validated as HTTPS URL <= 500 chars).
-- **Platforms:** `supportedPlatforms` list (1-6 items; elements strictly validated against enum `['windows', 'macos', 'linux', 'android', 'ios', 'web']`).
-- **Enforcement:** Enforced on `create` and `update` in Firestore Rules, preventing arbitrary nested key injection or schema corruption.
+### 4.3 Exhaustive Nested `productData` Schema Validation & Authoritative Worker Verification
+Validation is strictly separated between client-facing Firestore Security Rules and server-side trusted worker execution:
+- **Structural Rules Enforcement (`isValidProductData`):**
+  - **Basic Info:** `name` (3-60 chars), `slug` (canonical regex `^[a-z0-9]+(-[a-z0-9]+)*$`, 3-30 chars), `repoUrl` (GitHub HTTPS URL <= 200 chars), `repoOwner` (1-39 chars), `repoName` (1-100 chars), `releaseTag` (1-50 chars), `shortDescription` (10-200 chars), `fullDescription` (20-10000 chars), `category` (strict enum).
+  - **Repository Consistency:** Strict assertion `p.repoUrl == 'https://github.com/' + p.repoOwner + '/' + p.repoName` directly in Security Rules.
+  - **Version Format:** Bounded string in Rules (1-32 chars, regex `^[0-9A-Za-z.+-]+$`).
+  - **License Format:** Bounded string in Rules (1-50 chars).
+  - **Selected Asset:** Map allowlist `['name', 'extension', 'sizeBytes', 'downloadUrl', 'assetId']`. All 5 mandatory. `sizeBytes` (1 to 524,288,000 bytes = 500 MiB). `downloadUrl` (GitHub release download URL pattern). `assetId` (positive integer).
+  - **Media:** `iconUrl` (optional HTTPS URL <= 500 chars), `screenshots` list (max 6 items, each HTTPS URL <= 500 chars).
+  - **Platforms:** `supportedPlatforms` list (1-6 items, `hasOnly(['windows', 'macos', 'linux', 'android', 'ios', 'web'])`, plus explicit uniqueness check via `arePlatformsUnique`).
+- **Authoritative Trusted Worker Verification:**
+  - **SemVer 2.0.0 Validation:** The trusted worker authoritatively parses `version` against the full SemVer 2.0.0 specification (`MAJOR.MINOR.PATCH[-PRERELEASE][+BUILD]`), rejecting malformed versions.
+  - **SPDX License List Verification:** The trusted worker validates `license` against the official SPDX License List catalog (e.g. MIT, Apache-2.0, GPL-3.0-only, BSD-3-Clause, etc.), rejecting arbitrary strings.
+  - **Set Uniqueness:** The worker validates `new Set(supportedPlatforms).size === supportedPlatforms.length`.
+  - **Release Asset Proof:** The worker queries the GitHub REST API (`GET /repos/{owner}/{repo}/releases/tags/{tag}`) to authoritatively verify that `selectedAsset.assetId` and `selectedAsset.downloadUrl` are genuine GitHub Release assets belonging to the declared repository, preventing client URL spoofing.
 
 ---
 
@@ -173,27 +181,28 @@ GitStore operates under an absolute non-execution invariant:
 
 ---
 
-## 9. Comprehensive 18-Row Verification Matrix
+## 9. Comprehensive 19-Row Verification Matrix
 
-In accordance with Phase 0.1.10 specifications, all 18 critical controls are classified across the 5 standard columns:
+In accordance with Phase 0.1.11 specifications, all 19 critical architecture controls are classified across the standard columns:
 
-| Area | Design status | Evidence | Runtime status | Remaining action |
+| Control | Architecture status | Evidence | Runtime status | Remaining action |
 |---|---|---|---|---|
-| **Stale fan-out protection** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Conditional update enforces `genData.generationSequence > (currentSub.publishedGenerationSequence \|\| 0)`) | `PENDING_INTEGRATION_TEST` | Test on Firestore emulator with interleaved generation sequences in Phase 2. |
-| **Newer generation preservation** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Stale generation fan-out aborts document write when newer sequence is detected; newer state preserved) | `PENDING_INTEGRATION_TEST` | Test resumption of older generation after newer generation completes in Phase 4. |
-| **Post-capture moderation changes** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Status guard requires `status in ['approved', 'published']`; never resurrects `rejected`, `delisted`, `withdrawn` submissions) | `PENDING_INTEGRATION_TEST` | Test admin rejection interleaved during deployment in Phase 4. |
-| **Duplicate fan-out execution** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Idempotent transactions match `publishedGenerationSequence` and `publishedGenerationId`, returning no-op) | `PENDING_INTEGRATION_TEST` | Test concurrent duplicate worker execution in Phase 4. |
-| **Parent deployment document size** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Unbounded `expectedSubmissionIds` removed; parent doc holds strictly $O(1)$ scalar counters << 1 MiB) | `PENDING_INTEGRATION_TEST` | Verify parent document size remains constant with 10k submissions in Phase 4. |
-| **Bounded fan-out batch documents** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Subcollection `/system_deployments/{generationId}/fanout_batches/{batchId}` capped at 400 IDs = ~13 KB << 1 MiB) | `PENDING_INTEGRATION_TEST` | Test batch document chunking and 1 MiB threshold adherence in Phase 4. |
-| **Unique expected submission IDs** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Deterministic batch partitioning deduplicates submission IDs prior to subcollection batch writes) | `PENDING_INTEGRATION_TEST` | Test deduplication during batch generation in Phase 4. |
-| **Batch discovery and pagination** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Ordered query on `batchIndex asc` with composite indexes supports clean cursor-less pagination) | `PENDING_INTEGRATION_TEST` | Test batch pagination query and resumption across runner boundaries in Phase 4. |
-| **401 error handling** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (HTTP 401 classified as fatal `API_AUTH_ERROR`; halts loop, retains `pending_retry`, alerts administrator) | `PENDING_INTEGRATION_TEST` | Mock HTTP 401 on Commits API and verify immediate abort in Phase 4. |
-| **Network error handling** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Timeouts, connection resets, DNS failures classified as `NETWORK_ERROR`; sets `isSearchIncomplete = true`, retains `pending_retry`) | `PENDING_INTEGRATION_TEST` | Mock ECONNRESET and verify generation retained in `pending_retry` in Phase 4. |
-| **Empty-search correctness** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (`EMPTY_SEARCH` declared ONLY on 100% complete pagination with zero network errors, zero auth errors, zero corrupt blobs) | `PENDING_INTEGRATION_TEST` | Test exhaustive pagination with zero matches marking `abandoned` in Phase 4. |
-| **Malformed-manifest handling** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (JSON SyntaxError classified as `CANDIDATE_CORRUPT_MANIFEST`; sets `hasCorruptCandidates = true`, routes to `manual_review`) | `PENDING_INTEGRATION_TEST` | Mock invalid JSON in manifest blob and verify routing to `manual_review` in Phase 4. |
-| **ProductData nested field types** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Firestore Rules `isValidProductData` enforces strict types, lengths, and regexes for all 16 fields) | `PENDING_INTEGRATION_TEST` | Test rules evaluation with invalid field types on emulator in Phase 2. |
-| **Screenshot element validation** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (`isValidScreenshots` checks array size <= 6 and validates each present element as HTTPS URL <= 500 chars) | `PENDING_INTEGRATION_TEST` | Test rules rejection with non-URL or non-string screenshot elements in Phase 2. |
-| **Supported platform enum validation** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (`isValidPlatforms` enforces list size 1-6 and `hasOnly(['windows', 'macos', 'linux', 'android', 'ios', 'web'])`) | `PENDING_INTEGRATION_TEST` | Test rules rejection of invalid platform names in Phase 2. |
-| **SelectedAsset field validation** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (`isValidSelectedAsset` validates all 5 keys: `name`, `extension`, `sizeBytes` <= 500 MiB, `downloadUrl`, `assetId`) | `PENDING_INTEGRATION_TEST` | Test rules rejection when missing keys or sizeBytes > 500 MiB in Phase 2. |
-| **Checkout action runtime and SHA** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Official `actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1` [v7.0.1], `node24`, runner `>= v2.327.1`) | `PENDING_INTEGRATION_TEST` | Test action execution on Node 24 Actions runner in Phase 4. |
-| **GitHub credential persistence** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Default `persist-credentials: true` configures git credential helper; native `git push` verified functional) | `PENDING_INTEGRATION_TEST` | Test authenticated `git push origin main` in `build-and-commit` job in Phase 4. |
+| **Global fan-out generation fence** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Mini-chunk transaction reads `/system_config/deployment_state` at same consistency boundary; aborts with `STALE_GLOBAL_GENERATION_ABORT` if `genSeq < latestPublishedSequence`) | `PENDING_INTEGRATION_TEST` | Test on Firestore emulator with interleaved generation sequences in Phase 2. |
+| **Equal-sequence conflicting ID** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Explicit `HALT_CONFLICT` check when sequence matches but generation IDs differ, failing closed both globally and per-submission) | `PENDING_INTEGRATION_TEST` | Test conflicting generation sequence collision handling on emulator in Phase 2. |
+| **Stale generation after newer publication** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Global deployment state check inside mini-chunk transaction prevents older generation from modifying unreached records once newer generation publishes) | `PENDING_INTEGRATION_TEST` | Test older generation resumption after newer generation publishes in Phase 4. |
+| **Post-capture reapproval** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Per-submission moderation revision fence: `approvedCatalogRevision <= capturedRevision`; submissions modified/re-approved after capture are safely skipped) | `PENDING_INTEGRATION_TEST` | Test re-approval race condition during live deployment in Phase 4. |
+| **Product delisting eligibility** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Transaction reads `/products/{productId}`; skips fan-out activation if product status is `delisted` or `flagged`) | `PENDING_INTEGRATION_TEST` | Test product delisting during publication in Phase 2. |
+| **Transaction callback purity** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Zero outer variable mutations or logging inside callback; returns outcome object, caller accumulates only after commit succeeds) | `PENDING_INTEGRATION_TEST` | Test transaction contention retries with artificial conflict injection in Phase 2. |
+| **Accurate fan-out counters** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Counts accumulated only post-commit; parent summary counters updated atomically via single completion transaction) | `PENDING_INTEGRATION_TEST` | Verify parent summary counters match sum of child batch counts in Phase 4. |
+| **Deterministic batch producer** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (`prepareFanoutBatches` deduplicates, validates, sorts lexicographically, chunks into max 400 IDs, and verifies child docs) | `PENDING_INTEGRATION_TEST` | Test batch generation with 1,000 synthetic submission IDs in Phase 4. |
+| **Partial batch creation recovery** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Batch producer uses idempotent `set(..., { merge: true })` and full verification read-back, resuming seamlessly on worker restart) | `PENDING_INTEGRATION_TEST` | Test simulated worker interruption during batch creation in Phase 4. |
+| **Fan-out preparation-complete marker** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Parent generation persists `fanoutPreparationStatus: 'prepared'` only after verification; Tier 1 publication strictly blocked if pending) | `PENDING_INTEGRATION_TEST` | Verify Tier 1 publication aborts if preparation marker is missing in Phase 4. |
+| **Atomic batch completion and parent counters** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Child batch status `completed` and parent summary increments committed in a single atomic `db.runTransaction`) | `PENDING_INTEGRATION_TEST` | Test crash simulation before/after completion commit in Phase 4. |
+| **Child batch manual-review transition** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Retry exhaustion or fatal conflict transitions child batch to `manual_review` and parent to `manual_review` together, logging to `/admin_logs`) | `PENDING_INTEGRATION_TEST` | Test 5-retry exhaustion routing to manual review in Phase 4. |
+| **Bounded batch pagination** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Cursor pagination with `.limit(10)`, `.orderBy('batchIndex', 'asc')`, and `.startAfter(lastBatchDoc)`) | `PENDING_INTEGRATION_TEST` | Test cursor pagination across 50 batches on emulator in Phase 4. |
+| **Batch concurrency ownership** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Root GitHub Actions concurrency group `github-pages` plus atomic 15-minute lease CAS check on batch documents) | `PENDING_INTEGRATION_TEST` | Test overlapping workflow lease rejection in Phase 4. |
+| **SemVer validation claims** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Firestore Rules enforce bounded string pattern; trusted worker authoritatively parses SemVer 2.0.0 specification) | `PENDING_INTEGRATION_TEST` | Test SemVer parsing edge cases in worker test suite in Phase 2. |
+| **SPDX validation claims** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Firestore Rules enforce bounded string length; trusted worker authoritatively matches against official SPDX License List) | `PENDING_INTEGRATION_TEST` | Test invalid license string rejection in worker in Phase 2. |
+| **Duplicate platform handling** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Firestore Rules enforce `arePlatformsUnique` index comparison for 1-6 items; worker verifies exact set uniqueness) | `PENDING_INTEGRATION_TEST` | Test duplicate platform rejection in Rules on emulator in Phase 2. |
+| **Repository and asset relationship** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (Rules enforce `repoUrl == 'https://github.com/' + repoOwner + '/' + repoName`; worker verifies assets via GitHub Releases API) | `PENDING_INTEGRATION_TEST` | Test spoofed downloadUrl rejection via GitHub API mock in Phase 2. |
+| **Document metadata consistency** | `DESIGNED` | `DOCUMENTATION_VERIFIED` (All 11 project and documentation headers synchronized to Version 1.11.0, Phase 0.1.11 `IN_REVIEW`) | `PENDING_INTEGRATION_TEST` | Automated documentation header validation script in CI in Phase 2. |

@@ -1,7 +1,7 @@
 # GitStore — Comprehensive Deployment & Operations Guide
 
-**Document Version:** 1.9.0  
-**Phase:** Phase 0.1.9 — Workflow Validation, Recovery SHA Preservation & Durable Finalization Recovery  
+**Document Version:** 1.11.0  
+**Phase:** Phase 0.1.11 — Fan-Out Generation Fencing, Idempotent Retry Accounting & Schema Truthfulness  
 **Status:** IN_REVIEW — Awaiting Explicit User Approval  
 **Target Environments:** GitHub (Pages & Actions) and Firebase (Auth, Firestore, App Check)
 
@@ -356,25 +356,27 @@ The batch worker and reconciler execute deterministic Firestore queries backed b
      .orderBy('generationSequence', 'asc');
    ```
 
-3. **Pending Fan-Out Batches for a Generation:**
-   Queries uncompleted bounded batches within a specific generation:
+3. **Pending Fan-Out Batches for a Generation (Bounded Cursor Pagination):**
+   Queries uncompleted bounded batches within a specific generation using explicit page size limits:
    ```javascript
    db.collection('system_deployments')
      .doc(generationId)
      .collection('fanout_batches')
      .where('status', 'in', ['pending', 'processing'])
-     .orderBy('batchIndex', 'asc');
+     .orderBy('batchIndex', 'asc')
+     .limit(10);
    ```
 
-4. **Retryable Fan-Out Batches:**
-   Queries failed batches that have not exceeded the 5-attempt retry threshold:
+4. **Retryable Fan-Out Batches with Lease Expiry:**
+   Queries failed or expired batches where lease has expired and attempts have not exceeded 5:
    ```javascript
    db.collection('system_deployments')
      .doc(generationId)
      .collection('fanout_batches')
-     .where('status', '==', 'pending')
+     .where('status', 'in', ['pending', 'processing'])
      .where('fanoutAttempts', '<', 5)
-     .orderBy('batchIndex', 'asc');
+     .orderBy('batchIndex', 'asc')
+     .limit(10);
    ```
 
 5. **System-Wide Manual Review Batches:**

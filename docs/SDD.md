@@ -1,7 +1,7 @@
 # GitStore — System Design Document (SDD)
 
-**Document Version:** 1.9.0  
-**Phase:** Phase 0.1.9 — Workflow Validation, Recovery SHA Preservation & Durable Finalization Recovery  
+**Document Version:** 1.11.0  
+**Phase:** Phase 0.1.11 — Fan-Out Generation Fencing, Idempotent Retry Accounting & Schema Truthfulness  
 **Status:** IN_REVIEW — Awaiting Explicit User Approval  
 
 ---
@@ -253,7 +253,7 @@ GitStore/
 │       ├── pre-deploy-guard.js     # Pre-deployment shared generation ordering assertion
 │       ├── finalize-publishing.js  # 2-tier finalization transaction & stale abort
 │       └── catalog-compiler.js     # Static JSON generator, single staging & digest hasher
-├── docs/                           # Complete 13 Architectural Documents (v1.9.0)
+├── docs/                           # Complete 13 Architectural Documents (v1.11.0)
 ├── index.html                      # Homepage
 ├── explore.html                    # Product Discovery & Search
 ├── product.html                    # Dynamic Product Detail Viewer

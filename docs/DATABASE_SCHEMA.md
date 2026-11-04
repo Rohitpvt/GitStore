@@ -1,7 +1,7 @@
 # GitStore — Cloud Firestore Database Schema & Data Architecture
 
-**Document Version:** 1.9.0  
-**Phase:** Phase 0.1.9 — Workflow Validation, Recovery SHA Preservation & Durable Finalization Recovery  
+**Document Version:** 1.11.0  
+**Phase:** Phase 0.1.11 — Fan-Out Generation Fencing, Idempotent Retry Accounting & Schema Truthfulness  
 **Status:** IN_REVIEW — Awaiting Explicit User Approval  
 **Database:** Google Cloud Firestore (Native Mode)
 
@@ -19,9 +19,11 @@ GitStore employs **Cloud Firestore** as its operational and transactional data b
    This mathematically prevents collisions even if two repositories under the same owner use the identical slug `viewer`.
 3. **No Fake / Placeholder Firebase Accounts:** GitHub Issue submissions do **not** create placeholder Firebase Auth accounts. Unclaimed submissions record `submitterGithubId` (immutable numeric GitHub ID) and `claimStatus: 'unclaimed'`. They are claimed securely via an asynchronous `/claim_requests` queue when the developer authenticates via Firebase.
 4. **Step-Up Proof Integrity, ActionHash Checksum & Nonce Replay Protection:** Administrative commands write to `/moderation_requests`. Moderation requests strictly require fresh GitHub step-up reauthentication (`reauthenticateWithPopup`). **Zero raw OAuth access tokens are stored in Firestore.** The request stores an action-bound payload containing caller UID (`requestedByUid`), immutable numeric GitHub ID (`identities['github.com'][0]`), `auth_time`, action, target document path, action nonce, action-specific payload, and a client-generated `actionHash` (which serves as a client data-integrity checksum, not a cryptographic signature). To prevent nonce reuse across different request documents, worker processing atomically claims the request and reserves the nonce in a dedicated collection `/consumed_stepup_nonces/{nonceHash}` within a single Firestore transaction. The Security Rules enforce a strict 5-minute authentication freshness gate at creation time (`auth_time < 300s`), while worker execution operates on a 30-minute queue TTL from `createdAt`. The worker validates the target document path against an explicit action-to-collection mapping and validates action-specific payload schemas.
-5. **Node 24 GitHub Actions Pipeline & Provenance-Preserving Staging:** Batch operations run on official GitHub Actions pinned to Node 24 releases (`actions/checkout@v5.0.0`, `actions/setup-node@v7.1.0`, `actions/upload-pages-artifact@v5.0.0`, `actions/deploy-pages@v5.0.1`). Artifact staging follows a single authoritative procedure: the `site/` staging directory is constructed exclusively from the verified source commit, its digest is recomputed and verified (`stagedDigest === catalogDigest`), and no subsequent workflow step copies from `main`. Step outputs are exported via direct append writes to `$GITHUB_OUTPUT`.
+5. **Node 24 GitHub Actions Pipeline & Provenance-Preserving Staging:** Batch operations run on official GitHub Actions pinned to Node 24 releases (`actions/checkout@v7.0.1`, `actions/setup-node@v7.1.0`, `actions/upload-pages-artifact@v5.0.0`, `actions/deploy-pages@v5.0.1`). Artifact staging follows a single authoritative procedure: the `site/` staging directory is constructed exclusively from the verified source commit, its digest is recomputed and verified (`stagedDigest === catalogDigest`), and no subsequent workflow step copies from `main`. Step outputs are exported via direct append writes to `$GITHUB_OUTPUT`.
 6. **12-State Deployment Recovery State Machine & Dedicated Pages Status (`succeed`):** Deployments transition across a formal 12-state state machine. Catalog integrity is proven via a deterministic SHA-256 `catalogDigest` computed recursively over canonicalized catalog files (length-prefixed, null-byte framed `sha256:v1:...`, excluding manifest). GitHub Pages deployment status is verified using the dedicated official endpoint `GET /repos/{owner}/{repo}/pages/deployments/{pages_deployment_id}` (where parameter accepts numeric deployment ID or commit SHA reference) checking for the documented success status `"status": "succeed"` (distinct from generic deployments and builds). In Case B recovery, the reconciler restores the Git tree, validates the digest, reconstructs `site/`, and explicitly exports `deployNeeded = true` to trigger artifact packaging and Pages deployment. Fallback commit recovery follows the full GitHub Commits API pagination loop without arbitrary page caps, distinguishes rate-limit or network errors (`INCOMPLETE_SEARCH`) from true missing commits (`EMPTY_SEARCH`), and validates commit SHA formats before shell execution.
-7. **Transactional Generation Ordering & 2-Tier Finalization:** When finalizing deployment state, the worker executes an atomic transaction that reads current versions of `/system_config/catalog_state`, `/system_config/deployment_state`, and `/system_deployments/{generationId}` BEFORE any writes. Inside the transaction, it evaluates the shared ordering decision (`evaluateGenerationOrdering`) and catalog revision monotonicity (`capturedRevision >= latestPublishedRevision` and `capturedRevision <= latestRequestedRevision`). Stale generations abort immediately (`stale_aborted`) without modifying published sequence, published revision, commit SHA, or submission statuses. To strictly respect the Firestore 500-write limit, finalization uses a 2-tier architecture: the 3-write atomic transaction establishes the global canonical state, followed by idempotent batched writes (max 400 docs/batch) to fan out published statuses to submissions.
+7. **Global Generation Fencing, Pure Transaction Callbacks & 2-Tier Finalization:** When finalizing deployment state, the worker executes a 2-tier process governed by strict generation fences:
+   - **Tier 1 Publication Transaction:** Reads current versions of `/system_config/catalog_state`, `/system_config/deployment_state`, and `/system_deployments/{generationId}` BEFORE any writes. Inside the transaction, it verifies that child batch preparation is fully complete (`fanoutPreparationStatus === 'prepared'`), evaluates generation ordering (`evaluateGenerationOrdering`), and enforces catalog revision monotonicity. Stale generations abort immediately (`stale_aborted`) with zero state modifications.
+   - **Tier 2 Submission Fan-Out Execution:** Fan-out work is partitioned into bounded child documents (`/system_deployments/{generationId}/fanout_batches/{batchId}`) capped at 400 IDs each (~55 KB << 1 MiB). Mini-chunk transactions read `/system_config/deployment_state` inside the transaction boundary; if `genSeq < latestPublishedSequence`, the fan-out aborts as stale (`STALE_GLOBAL_GENERATION_ABORT`), preventing older generations from ever modifying unreached records. Per-submission checks enforce `approvedCatalogRevision <= capturedRevision`, verify that products are not `delisted` or `flagged` in `/products/{productId}`, fail closed on equal-sequence conflicting generation IDs (`HALT_CONFLICT`), and acknowledge idempotent replays. Transaction callbacks are strictly pure (zero outer counter mutations), and child batch completion atomically updates parent summary counters in a single transaction.
 8. **Decoupled Storefront Access:** Storefront reads bypass Firestore completely during normal user browsing, consuming static JSON compiled by GitHub Actions and served by GitHub Pages.
 
 ---
@@ -121,26 +123,26 @@ interface SubmissionDocument {
   productData: {
     name: string;                    // 3–60 chars
     slug: string;                    // 3–30 chars (lowercase a-z, 0-9, hyphens)
-    repoUrl: string;                 // Must match https://github.com/owner/repo
-    repoOwner: string;
-    repoName: string;
-    releaseTag: string;
+    repoUrl: string;                 // Must match exact "https://github.com/" + repoOwner + "/" + repoName
+    repoOwner: string;               // 1-39 chars (valid GitHub handle)
+    repoName: string;                // 1-100 chars (valid GitHub repo name)
+    releaseTag: string;              // 1-50 chars
     selectedAsset: {
-      name: string;
-      extension: string;
-      sizeBytes: number;
-      downloadUrl: string;
-      assetId: number;
+      name: string;                  // 1-128 chars
+      extension: string;             // 1-16 chars
+      sizeBytes: number;             // Positive integer <= 524,288,000 (500 MiB)
+      downloadUrl: string;           // GitHub Release browser download URL (Authoritatively verified against GitHub API)
+      assetId: number;               // Numeric asset ID (Authoritatively verified against GitHub API)
     };
-    shortDescription: string;        // Max 200 chars
-    fullDescription: string;         // Max 10000 chars (Markdown)
-    category: string;
-    iconUrl: string;
-    screenshots: string[];           // Max 6 URLs
-    supportedPlatforms: string[];    // At least 1 (windows, macos, linux, android, web)
-    version: string;
-    license: string;
-    liveDemoUrl?: string | null;
+    shortDescription: string;        // 10-200 chars
+    fullDescription: string;         // 20-10000 chars (Markdown)
+    category: string;                // Strict category enum
+    iconUrl: string;                 // Optional HTTPS URL <= 500 chars
+    screenshots: string[];           // Max 6 HTTPS URLs (each <= 500 chars)
+    supportedPlatforms: string[];    // Bounded list: 1-6 unique items subset of ['windows', 'macos', 'linux', 'android', 'ios', 'web']
+    version: string;                 // Bounded string in Rules (1-32 chars); Authoritatively validated as SemVer 2.0.0 by worker
+    license: string;                 // Bounded string in Rules (1-50 chars); Authoritatively validated against official SPDX catalog by worker
+    liveDemoUrl?: string | null;     // Optional HTTPS URL <= 500 chars
   };
 
   // State Management & Processing Lease (Worker-Managed via Admin SDK)
@@ -175,6 +177,7 @@ interface SubmissionDocument {
   adminNotes?: string | null;        // Worker-Managed via Admin SDK
   reviewedBy?: string | null;        // Worker-Managed via Admin SDK
   reviewedAt?: FirebaseFirestore.Timestamp | null; // Worker-Managed via Admin SDK
+  approvedCatalogRevision?: number | null; // Monotonic catalog revision at which submission was approved (Worker-Managed via Admin SDK; used by Moderation Revision Fence)
   publishedProductId?: string | null; // Worker-Managed via Admin SDK
   publishedGenerationId?: string | null; // Worker-Managed via Admin SDK
   publishedGenerationSequence?: number | null; // Monotonic sequence of generation that published this submission (Worker-Managed via Admin SDK)
@@ -364,6 +367,7 @@ interface SystemDeploymentDocument {
   lastObservedPagesStatus: 'succeed' | 'queued' | 'in_progress' | 'errored' | null;
 
   // Bounded & Independently Recoverable Submission Fan-Out Summary State (O(1) Document Size)
+  fanoutPreparationStatus: 'pending' | 'prepared'; // Work-plan preparation marker (must be 'prepared' before Tier 1 publication)
   submissionFanoutStatus: 'pending' | 'in_progress' | 'completed' | 'partial' | 'failed' | 'manual_review';
   expectedSubmissionCount: number;   // Total expected submissions across all batches (O(1) scalar)
   completedSubmissionCount: number;  // Confirmed successfully processed/skipped submissions (O(1) scalar)
@@ -384,7 +388,7 @@ interface SystemDeploymentDocument {
 ### 2.11 Subcollection: `fanout_batches` (Bounded Submission Fan-Out Storage)
 - **Path:** `/system_deployments/{generationId}/fanout_batches/{batchId}`
 - **Document ID:** Deterministic zero-padded batch ID (`batch_00000`, `batch_00001`, ..., `batch_NNNNN`).
-- **Description:** Stores partitioned chunks of expected submission IDs (maximum 400 IDs per document, occupying ~13 KB, strictly obeying Firestore's 1 MiB document limit). Eliminates unbounded arrays from the parent generation document, enabling infinite horizontal scalability.
+- **Description:** Stores partitioned chunks of expected submission IDs (maximum 400 IDs per document, occupying ~55 KB at max 128 chars/ID, strictly ~5.3% of Firestore's 1 MiB limit). Replaces unbounded arrays on the parent generation document with bounded, quota-aware child documents.
 - **Client Access:** `allow read, write: if false;` (Internal subcollection; Admin SDK only).
 
 ```typescript
@@ -392,16 +396,20 @@ interface FanoutBatchDocument {
   generationId: string;              // Parent generation ID
   batchIndex: number;                // 0-indexed sequential batch counter
   batchId: string;                   // Deterministic ID (e.g., "batch_00000")
-  submissionIds: string[];           // Bounded array: max 400 /submissions/{id} document IDs (~13 KB << 1 MiB)
+  submissionIds: string[];           // Bounded array: max 400 /submissions/{id} document IDs (conservative size: 400 * 128 B = 51.2 KB + JSON overhead ~55 KB << 1 MiB limit)
   status: 'pending' | 'processing' | 'completed' | 'manual_review';
   expectedCount: number;             // submissionIds.length (<= 400)
   completedCount: number;            // Confirmed updated or idempotently verified submissions
-  skippedCount: number;              // Submissions skipped due to newer generation sequence or ineligible status
+  skippedCount: number;              // Submissions skipped due to newer generation sequence, revision fence, or product delisting
   fanoutAttempts: number;            // Number of execution attempts for this specific batch
+  leaseOwner: string | null;         // Worker run ID holding active processing lease (or null)
+  leaseExpiresAt: FirebaseFirestore.Timestamp | null; // Atomic 15-minute lease expiry timestamp
   lastAttemptAt?: FirebaseFirestore.Timestamp | null;
   lastError?: string | null;
+  failedAt?: FirebaseFirestore.Timestamp | null;
   createdAt: FirebaseFirestore.Timestamp;
   completedAt?: FirebaseFirestore.Timestamp | null;
+  updatedAt: FirebaseFirestore.Timestamp;
 }
 ```
 
@@ -840,6 +848,11 @@ async function reconcilePublishedState(db, octokit, pagesUrl) {
             throw new Error(`FUTURE_REVISION_ANOMALY: capturedRevision ${freshGen.capturedRevision} > latestRequestedRevision ${liveCat.latestRequestedRevision}`);
           }
 
+          // Invariant: Fan-out work plan must be fully prepared and verified before Tier 1 publication commits!
+          if (freshGen.fanoutPreparationStatus !== 'prepared') {
+            throw new Error(`PREPARATION_INCOMPLETE_ABORT: Generation ${freshGen.generationId} fan-out batches must be prepared and verified before Tier 1 publication.`);
+          }
+
           const nextPublishedRev = Math.max(liveCat.latestPublishedRevision, freshGen.capturedRevision);
           const isDirty = liveCat.latestRequestedRevision > nextPublishedRev;
 
@@ -884,6 +897,8 @@ async function reconcilePublishedState(db, octokit, pagesUrl) {
         if (err.message && (err.message.includes('STALE_GENERATION_ABORT') || err.message.includes('STALE_REVISION_ABORT'))) {
           console.warn(`[Reconciler] Stale finalization aborted safely. Marking generation ${gen.generationId} as stale_aborted.`);
           await genDoc.ref.update({ status: 'stale_aborted', reconciliationStatus: 'stale_aborted', updatedAt: new Date() });
+        } else if (err.message && err.message.includes('PREPARATION_INCOMPLETE_ABORT')) {
+          console.warn(`[Reconciler] Fan-out preparation incomplete for generation ${gen.generationId}. Retaining generation in pending.`);
         } else {
           throw err;
         }
@@ -908,24 +923,113 @@ async function reconcilePublishedState(db, octokit, pagesUrl) {
 }
 
 /**
+ * Deterministically prepares bounded fan-out child batch documents for a generation's work plan.
+ * Must execute and verify complete batch creation BEFORE Tier 1 publication commits.
+ *
+ * Invariants Enforced (Phase 0.1.11):
+ * 1. Deterministic Extraction & Deduplication: Obtains expected submission IDs captured for the generation,
+ *    deduplicating via Set and validating each ID format.
+ * 2. Lexicographical Sorting: Sorts IDs deterministically before partitioning to guarantee identical partition boundaries.
+ * 3. Bounded Partitioning: Slices IDs into deterministic batches of max 400 IDs (batch_00000, batch_00001, ...).
+ * 4. Idempotent Child Batch Persistence: Uses set with merge to create or resume batch documents without destroying state.
+ * 5. Full Work-Plan Verification: Reads back all created batch documents to verify count and integrity.
+ * 6. Atomic Preparation Marker: Updates parent generation with fanoutPreparationStatus: 'prepared',
+ *    totalFanoutBatches, and expectedSubmissionCount only after verification passes.
+ * 7. Crash Recovery: If interrupted before marking 'prepared', worker re-runs preparation idempotently.
+ */
+export async function prepareFanoutBatches(db, genDocRef, genData, rawSubmissionIds) {
+  const genId = genData.generationId;
+
+  // 1. Deduplicate deterministically and validate IDs
+  const uniqueIds = Array.from(new Set(rawSubmissionIds)).filter(id => {
+    return typeof id === 'string' && id.length >= 8 && id.length <= 128 && /^sub_[a-zA-Z0-9_-]+$/.test(id);
+  });
+
+  // 2. Lexicographical sorting
+  uniqueIds.sort();
+
+  // 3. Partition into bounded chunks of max 400 IDs
+  const BATCH_SIZE = 400;
+  const totalBatches = Math.ceil(uniqueIds.length / BATCH_SIZE);
+  const batchesCol = genDocRef.collection('fanout_batches');
+
+  for (let bIndex = 0; bIndex < totalBatches; bIndex++) {
+    const chunkIds = uniqueIds.slice(bIndex * BATCH_SIZE, (bIndex + 1) * BATCH_SIZE);
+    const batchId = `batch_${String(bIndex).padStart(5, '0')}`;
+    const batchRef = batchesCol.doc(batchId);
+
+    await batchRef.set({
+      generationId: genId,
+      batchIndex: bIndex,
+      batchId: batchId,
+      submissionIds: chunkIds,
+      status: 'pending',
+      expectedCount: chunkIds.length,
+      completedCount: 0,
+      skippedCount: 0,
+      fanoutAttempts: 0,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      createdAt: FirebaseFirestore.FieldValue.serverTimestamp(),
+      updatedAt: FirebaseFirestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+  }
+
+  // 4. Verify every expected child batch exists and verify contents
+  for (let bIndex = 0; bIndex < totalBatches; bIndex++) {
+    const batchId = `batch_${String(bIndex).padStart(5, '0')}`;
+    const bSnap = await batchesCol.doc(batchId).get();
+    if (!bSnap.exists) {
+      throw new Error(`FANOUT_PREPARATION_VERIFICATION_FAILED: Batch ${batchId} missing for generation ${genId}`);
+    }
+    const bData = bSnap.data();
+    const expectedLength = uniqueIds.slice(bIndex * BATCH_SIZE, (bIndex + 1) * BATCH_SIZE).length;
+    if (bData.submissionIds.length !== expectedLength) {
+      throw new Error(`FANOUT_PREPARATION_VERIFICATION_FAILED: Batch ${batchId} count mismatch (expected ${expectedLength}, found ${bData.submissionIds.length})`);
+    }
+  }
+
+  // 5. Persist verified preparation state on parent generation
+  await genDocRef.update({
+    fanoutPreparationStatus: 'prepared',
+    totalFanoutBatches: totalBatches,
+    expectedSubmissionCount: uniqueIds.length,
+    updatedAt: FirebaseFirestore.FieldValue.serverTimestamp()
+  });
+
+  console.log(`[Fanout Preparation] Successfully prepared and verified ${totalBatches} batches (${uniqueIds.length} submissions) for generation ${genId}.`);
+}
+
+/**
  * Executes or resumes generation-aware, conditional submission status fan-out
  * using bounded subcollection batches (/system_deployments/{generationId}/fanout_batches/{batchId}).
  *
- * Invariants Enforced (Phase 0.1.10):
- * 1. Bounded Document Size: Submission IDs are stored exclusively in subcollection documents (max 400 IDs each).
- *    Parent generation document keeps only O(1) summary counters, strictly obeying Firestore 1 MiB limits.
- * 2. Status Eligibility Guard: Submissions must be in 'approved' or 'published' status. Submissions rejected,
- *    delisted, or withdrawn by an administrator or developer are never resurrected to published.
- * 3. Monotonic Generation Sequence: A submission is only updated if incoming genData.generationSequence
- *    is strictly greater than its current publishedGenerationSequence. Stale older generations
- *    cannot overwrite newer generation state.
- * 4. Idempotent Replay: If publishedGenerationSequence matches, the update is recognized as already completed.
- * 5. Bounded Transactional Mini-Chunks: Submissions within a batch are processed via atomic transactions
- *    in chunks of 50 documents, guaranteeing state isolation without transaction timeouts.
+ * Invariants Enforced (Phase 0.1.11):
+ * 1. Global Deployment Fence: Mini-chunk transaction reads /system_config/deployment_state.
+ *    - If genSeq < latestPublishedSequence: abort as STALE_GLOBAL_GENERATION_ABORT (older generation cannot touch records).
+ *    - If genSeq > latestPublishedSequence: abort as UNPUBLISHED_GENERATION_ABORT.
+ *    - If genSeq === latestPublishedSequence && genId !== latestPublishedGenerationId: fail closed as HALT_CONFLICT.
+ * 2. Moderation Revision Fence: Verifies currentSub.approvedCatalogRevision <= genData.capturedRevision.
+ *    Submissions re-approved or modified after generation capture are skipped (never published with stale state).
+ * 3. Product-Level Status Check: Reads /products/{productId}. Delisted or flagged products are skipped
+ *    and never reactivated or implied publishable.
+ * 4. Submission Monotonic Sequence Guard & Conflict Resolution:
+ *    - If sub.publishedGenerationSequence > genSeq: skip stale update.
+ *    - If sub.publishedGenerationSequence === genSeq && sub.publishedGenerationId !== genId: fail closed as HALT_CONFLICT.
+ *    - If sub.publishedGenerationSequence === genSeq && sub.publishedGenerationId === genId && sub.status === 'published': idempotent no-op.
+ * 5. Pure Transaction Callbacks: No external counter mutation or irreversible logging inside db.runTransaction callback.
+ *    Computes chunk outcomes locally, returns them, and accumulates into outer counts ONLY after commit succeeds.
+ * 6. Bounded Cursor Pagination: Reads fanout_batches via .orderBy('batchIndex', 'asc').limit(PAGE_SIZE).startAfter(lastDoc).
+ * 7. Atomic Batch Completion: Marks child batch 'completed' and increments parent summary counters in a SINGLE atomic transaction.
+ * 8. Resilient Manual Review: When batch retries reach 5 or fail fatally, atomically transitions child batch
+ *    to 'manual_review' and parent to 'manual_review', logging to /admin_logs.
+ * 9. Worker Concurrency Ownership: Root GitHub Actions concurrency group ('github-pages') serializes runs,
+ *    backed by 15-minute lease (leaseOwner, leaseExpiresAt) on batch documents.
  */
 async function executeSubmissionFanout(db, genDocRef, genData) {
   const genId = genData.generationId;
   const genSeq = genData.generationSequence;
+  const capturedRev = genData.capturedRevision;
   let attempts = (genData.fanoutAttempts || 0) + 1;
 
   await genDocRef.update({
@@ -935,130 +1039,222 @@ async function executeSubmissionFanout(db, genDocRef, genData) {
     updatedAt: new Date()
   });
 
-  // Query pending and processing fan-out batches for this generation
-  const batchesQuery = await genDocRef.collection('fanout_batches')
-    .where('status', 'in', ['pending', 'processing'])
-    .orderBy('batchIndex', 'asc')
-    .get();
-
-  if (batchesQuery.empty) {
-    // Check if all batches are completed
-    const completedBatchesSnap = await genDocRef.collection('fanout_batches')
-      .where('status', '==', 'completed')
-      .get();
-
-    if (completedBatchesSnap.size === (genData.totalFanoutBatches || 0) && (genData.totalFanoutBatches || 0) > 0) {
-      await genDocRef.update({
-        submissionFanoutStatus: 'completed',
-        reconciliationStatus: 'reconciled',
-        status: 'finalized',
-        finalizedAt: new Date(),
-        updatedAt: new Date()
-      });
-      console.log(`[Fanout] All ${genData.totalFanoutBatches} batches completed for generation ${genId}. Finalized.`);
-    }
-    return;
-  }
+  const BATCH_PAGE_SIZE = 10;
+  let lastBatchDoc = null;
+  let hasMoreBatches = true;
 
   try {
-    for (const batchDoc of batchesQuery.docs) {
-      const batchData = batchDoc.data();
-      const submissionIds = batchData.submissionIds || [];
-      const batchAttempts = (batchData.fanoutAttempts || 0) + 1;
+    while (hasMoreBatches) {
+      let batchQuery = genDocRef.collection('fanout_batches')
+        .where('status', 'in', ['pending', 'processing'])
+        .orderBy('batchIndex', 'asc')
+        .limit(BATCH_PAGE_SIZE);
 
-      // Mark batch processing
-      await batchDoc.ref.update({
-        status: 'processing',
-        fanoutAttempts: batchAttempts,
-        lastAttemptAt: new Date(),
-        updatedAt: new Date()
-      });
-
-      let batchCompleted = 0;
-      let batchSkipped = 0;
-      const MINI_CHUNK_SIZE = 50;
-
-      // Process submission IDs in transactional mini-chunks
-      for (let i = 0; i < submissionIds.length; i += MINI_CHUNK_SIZE) {
-        const chunkIds = submissionIds.slice(i, i + MINI_CHUNK_SIZE);
-
-        await db.runTransaction(async (transaction) => {
-          // Read all submissions in the mini-chunk
-          const subRefs = chunkIds.map(id => db.collection('submissions').doc(id));
-          const subSnapshots = await Promise.all(subRefs.map(ref => transaction.get(ref)));
-
-          for (let j = 0; j < subSnapshots.length; j++) {
-            const snap = subSnapshots[j];
-            const subId = chunkIds[j];
-            const ref = subRefs[j];
-
-            if (!snap.exists) {
-              console.warn(`[Fanout] Submission ${subId} not found in database. Skipping.`);
-              batchSkipped++;
-              continue;
-            }
-
-            const currentSub = snap.data();
-
-            // 1. Status Eligibility Guard: Never resurrect non-approved / rejected / delisted / withdrawn submissions
-            const permittedStatuses = ['approved', 'published'];
-            if (!permittedStatuses.includes(currentSub.status)) {
-              console.warn(`[Fanout] Submission ${subId} status is '${currentSub.status}' (ineligible for publication). Skipping.`);
-              batchSkipped++;
-              continue;
-            }
-
-            // 2. Monotonic Generation Sequence Check
-            const currentPublishedSeq = currentSub.publishedGenerationSequence || 0;
-
-            if (currentPublishedSeq > genSeq) {
-              // Current submission is already associated with a NEWER generation!
-              console.warn(`[Fanout] Submission ${subId} already published by newer sequence ${currentPublishedSeq} > ${genSeq}. Rejecting stale fan-out update.`);
-              batchSkipped++;
-              continue;
-            }
-
-            if (currentPublishedSeq === genSeq && currentSub.publishedGenerationId === genId && currentSub.status === 'published') {
-              // Idempotent replay: already published by this exact generation
-              batchCompleted++;
-              continue;
-            }
-
-            // 3. Valid Monotonic Publication Update
-            const targetProductId = currentSub.targetProductId || `prod_${currentSub.repoNumericId}_${currentSub.productData?.slug || ''}`;
-            transaction.update(ref, {
-              status: 'published',
-              publishedGenerationId: genId,
-              publishedGenerationSequence: genSeq,
-              publishedProductId: targetProductId,
-              'processingLease.leaseHolder': null,
-              updatedAt: new Date()
-            });
-            batchCompleted++;
-          }
-        });
+      if (lastBatchDoc) {
+        batchQuery = batchQuery.startAfter(lastBatchDoc);
       }
 
-      // Mark batch completed
-      await batchDoc.ref.update({
-        status: 'completed',
-        completedCount: batchCompleted,
-        skippedCount: batchSkipped,
-        completedAt: new Date(),
-        updatedAt: new Date()
-      });
+      const batchesPageSnap = await batchQuery.get();
 
-      // Update parent summary counters atomically
-      await genDocRef.update({
-        completedSubmissionCount: FirebaseFirestore.FieldValue.increment(batchCompleted),
-        completedFanoutBatches: FirebaseFirestore.FieldValue.increment(1),
-        updatedAt: new Date()
-      });
+      if (batchesPageSnap.empty) {
+        hasMoreBatches = false;
+        break;
+      }
+
+      for (const batchDoc of batchesPageSnap.docs) {
+        const batchData = batchDoc.data();
+        const batchId = batchData.batchId;
+        const submissionIds = batchData.submissionIds || [];
+        const batchAttempts = (batchData.fanoutAttempts || 0) + 1;
+
+        // Lease Acquisition & Ownership Check
+        const workerRunId = process.env.GITHUB_RUN_ID || 'local_worker';
+        const now = Date.now();
+        const leaseExpired = batchData.leaseExpiresAt ? batchData.leaseExpiresAt.toMillis() < now : true;
+
+        if (batchData.status === 'processing' && !leaseExpired && batchData.leaseOwner !== workerRunId) {
+          console.log(`[Fanout] Batch ${batchId} is actively leased by worker ${batchData.leaseOwner}. Skipping.`);
+          continue;
+        }
+
+        // Set 15-minute lease
+        const leaseExpiry = new Date(now + 15 * 60 * 1000);
+        await batchDoc.ref.update({
+          status: 'processing',
+          leaseOwner: workerRunId,
+          leaseExpiresAt: leaseExpiry,
+          fanoutAttempts: batchAttempts,
+          lastAttemptAt: new Date(),
+          updatedAt: new Date()
+        });
+
+        let batchCompleted = 0;
+        let batchSkipped = 0;
+        const MINI_CHUNK_SIZE = 50;
+
+        // Process submission IDs in transactional mini-chunks with pure callbacks
+        for (let i = 0; i < submissionIds.length; i += MINI_CHUNK_SIZE) {
+          const chunkIds = submissionIds.slice(i, i + MINI_CHUNK_SIZE);
+
+          const chunkResult = await db.runTransaction(async (transaction) => {
+            // Pure callback: local outcome counters ONLY
+            let chunkCompleted = 0;
+            let chunkSkipped = 0;
+
+            // 1. Read Global Deployment State at same consistency boundary
+            const deployStateRef = db.collection('system_config').doc('deployment_state');
+            const deployStateDoc = await transaction.get(deployStateRef);
+            const deployState = deployStateDoc.exists ? deployStateDoc.data() : { latestPublishedSequence: 0, latestPublishedGenerationId: null };
+
+            // Global Fence Evaluation
+            if (genSeq < deployState.latestPublishedSequence) {
+              throw new Error(`STALE_GLOBAL_GENERATION_ABORT: Generation ${genId} (seq ${genSeq}) < published sequence ${deployState.latestPublishedSequence}. Aborting fan-out.`);
+            }
+            if (genSeq > deployState.latestPublishedSequence) {
+              throw new Error(`UNPUBLISHED_GENERATION_ABORT: Generation ${genId} (seq ${genSeq}) > published sequence ${deployState.latestPublishedSequence}. Awaiting publication.`);
+            }
+            if (genSeq === deployState.latestPublishedSequence && genId !== deployState.latestPublishedGenerationId) {
+              throw new Error(`HALT_CONFLICT: Sequence collision at ${genSeq}. Generation ${genId} != published generation ${deployState.latestPublishedGenerationId}.`);
+            }
+
+            // 2. Read submissions in mini-chunk
+            const subRefs = chunkIds.map(id => db.collection('submissions').doc(id));
+            const subSnapshots = await Promise.all(subRefs.map(ref => transaction.get(ref)));
+
+            // 3. Collect product IDs to check product-level status
+            const productIdsToCheck = [];
+            for (let j = 0; j < subSnapshots.length; j++) {
+              const snap = subSnapshots[j];
+              if (snap.exists) {
+                const data = snap.data();
+                const prodId = data.targetProductId || `prod_${data.repoNumericId}_${data.productData?.slug || ''}`;
+                productIdsToCheck.push(prodId);
+              } else {
+                productIdsToCheck.push(null);
+              }
+            }
+
+            const productRefs = productIdsToCheck.map(pId => pId ? db.collection('products').doc(pId) : null);
+            const productSnapshots = await Promise.all(productRefs.map(pRef => pRef ? transaction.get(pRef) : Promise.resolve(null)));
+
+            // 4. Evaluate each submission deterministically
+            for (let j = 0; j < subSnapshots.length; j++) {
+              const snap = subSnapshots[j];
+              const subId = chunkIds[j];
+              const ref = subRefs[j];
+              const prodSnap = productSnapshots[j];
+
+              if (!snap.exists) {
+                chunkSkipped++;
+                continue;
+              }
+
+              const currentSub = snap.data();
+
+              // Submission Status Guard
+              if (currentSub.status !== 'approved' && currentSub.status !== 'published') {
+                chunkSkipped++;
+                continue;
+              }
+
+              // Post-Capture Moderation Revision Fence
+              if (currentSub.approvedCatalogRevision && currentSub.approvedCatalogRevision > capturedRev) {
+                chunkSkipped++;
+                continue;
+              }
+
+              // Product-Level Status Check
+              if (prodSnap && prodSnap.exists) {
+                const prodData = prodSnap.data();
+                if (prodData.status === 'delisted' || prodData.status === 'flagged') {
+                  chunkSkipped++;
+                  continue;
+                }
+              }
+
+              // Monotonic Generation Sequence & Conflict Check
+              const currentPublishedSeq = currentSub.publishedGenerationSequence || 0;
+
+              if (currentPublishedSeq > genSeq) {
+                chunkSkipped++;
+                continue;
+              }
+
+              if (currentPublishedSeq === genSeq) {
+                if (currentSub.publishedGenerationId !== genId) {
+                  throw new Error(`HALT_CONFLICT: Submission ${subId} published sequence collision at ${genSeq}. Conflicting generation ${currentSub.publishedGenerationId}.`);
+                }
+                if (currentSub.status === 'published') {
+                  chunkCompleted++;
+                  continue;
+                }
+              }
+
+              // Valid Monotonic Advance
+              const targetProductId = currentSub.targetProductId || `prod_${currentSub.repoNumericId}_${currentSub.productData?.slug || ''}`;
+              transaction.update(ref, {
+                status: 'published',
+                publishedGenerationId: genId,
+                publishedGenerationSequence: genSeq,
+                publishedProductId: targetProductId,
+                'processingLease.leaseHolder': null,
+                updatedAt: new Date()
+              });
+              chunkCompleted++;
+            }
+
+            return { chunkCompleted, chunkSkipped };
+          });
+
+          // Accumulate counts ONLY AFTER transaction commit succeeds
+          batchCompleted += chunkResult.chunkCompleted;
+          batchSkipped += chunkResult.chunkSkipped;
+        }
+
+        // Atomic Batch Completion & Parent Counter Synchronization (Single Transaction)
+        await db.runTransaction(async (tx) => {
+          const freshBatchSnap = await tx.get(batchDoc.ref);
+          if (!freshBatchSnap.exists) throw new Error(`Batch ${batchId} missing`);
+          const freshBatchData = freshBatchSnap.data();
+
+          if (freshBatchData.status === 'completed') {
+            return; // Idempotent no-op
+          }
+
+          const freshGenSnap = await tx.get(genDocRef);
+          if (!freshGenSnap.exists) throw new Error(`Parent generation ${genId} missing`);
+
+          tx.update(batchDoc.ref, {
+            status: 'completed',
+            completedCount: batchCompleted,
+            skippedCount: batchSkipped,
+            leaseOwner: null,
+            leaseExpiresAt: null,
+            completedAt: new Date(),
+            updatedAt: new Date()
+          });
+
+          tx.update(genDocRef, {
+            completedSubmissionCount: FirebaseFirestore.FieldValue.increment(batchCompleted + batchSkipped),
+            completedFanoutBatches: FirebaseFirestore.FieldValue.increment(1),
+            updatedAt: new Date()
+          });
+        });
+
+        console.log(`[Fanout] Atomically completed batch ${batchId} (${batchCompleted} completed, ${batchSkipped} skipped).`);
+      }
+
+      if (batchesPageSnap.size < BATCH_PAGE_SIZE) {
+        hasMoreBatches = false;
+      } else {
+        lastBatchDoc = batchesPageSnap.docs[batchesPageSnap.docs.length - 1];
+      }
     }
 
-    // Check if all batches are now completed
+    // Finalize Generation if All Batches are Confirmed Completed
     const remainingBatchesSnap = await genDocRef.collection('fanout_batches')
-      .where('status', 'in', ['pending', 'processing'])
+      .where('status', 'in', ['pending', 'processing', 'manual_review'])
+      .limit(1)
       .get();
 
     if (remainingBatchesSnap.empty) {
@@ -1069,21 +1265,27 @@ async function executeSubmissionFanout(db, genDocRef, genData) {
         finalizedAt: new Date(),
         updatedAt: new Date()
       });
-      console.log(`[Fanout] All batches finalized for generation ${genId}.`);
+      console.log(`[Fanout] All fan-out batches completed for generation ${genId}. Finalized.`);
     }
 
   } catch (err) {
     console.error(`[Fanout] Error processing fan-out for generation ${genId}: ${err.message}`);
-    if (attempts >= 5) {
-      console.error(`[Fanout] Max retries (5) exceeded. Transitioning generation ${genId} to manual_review.`);
-      await genDocRef.update({
-        submissionFanoutStatus: 'manual_review',
-        reconciliationStatus: 'manual_review',
-        lastFanoutError: err.message,
-        updatedAt: new Date()
+
+    if (attempts >= 5 || (err.message && err.message.includes('HALT_CONFLICT'))) {
+      console.error(`[Fanout] Fatal error or max retries reached. Transitioning generation ${genId} to manual_review.`);
+
+      // Atomically mark generation and active batch to manual_review
+      await db.runTransaction(async (tx) => {
+        tx.update(genDocRef, {
+          submissionFanoutStatus: 'manual_review',
+          reconciliationStatus: 'manual_review',
+          lastFanoutError: err.message,
+          updatedAt: new Date()
+        });
       });
+
       await db.collection('admin_logs').add({
-        action: 'SUBMISSION_FANOUT_FAILED',
+        action: 'SUBMISSION_FANOUT_MANUAL_REVIEW',
         generationId: genId,
         attempts: attempts,
         error: err.message,
@@ -1211,6 +1413,8 @@ service cloud.firestore {
         && p.repoOwner.matches('^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$')
         && p.repoName is string && p.repoName.size() >= 1 && p.repoName.size() <= 100
         && p.repoName.matches('^[A-Za-z0-9_.-]+$')
+        // Strict consistency between repoUrl and repoOwner/repoName
+        && p.repoUrl == 'https://github.com/' + p.repoOwner + '/' + p.repoName
         && p.releaseTag is string && p.releaseTag.size() >= 1 && p.releaseTag.size() <= 50
         && p.shortDescription is string && p.shortDescription.size() >= 10 && p.shortDescription.size() <= 200
         && p.fullDescription is string && p.fullDescription.size() >= 20 && p.fullDescription.size() <= 10000
@@ -1218,14 +1422,17 @@ service cloud.firestore {
           'developer-tools', 'utilities', 'productivity', 'graphics-media',
           'games', 'education', 'security', 'other'
         ]
+        // Version: Structural format check in Rules (1-32 chars); authoritative SemVer 2.0.0 validated by worker
         && p.version is string && p.version.size() >= 1 && p.version.size() <= 32
+        && p.version.matches('^[0-9A-Za-z.+-]+$')
+        // License: Structural format check in Rules (1-50 chars); authoritative SPDX catalog validated by worker
         && p.license is string && p.license.size() >= 1 && p.license.size() <= 50
         // Selected Asset Map (all 5 fields validated)
         && isValidSelectedAsset(p.selectedAsset)
         // Media (iconUrl + screenshots list elements)
         && p.iconUrl is string && (p.iconUrl == '' || (p.iconUrl.size() <= 500 && p.iconUrl.matches('^https://.*')))
         && isValidScreenshots(p.screenshots)
-        // Platforms (enum list validation)
+        // Platforms (enum list validation with explicit non-duplication check)
         && isValidPlatforms(p.supportedPlatforms)
         // Optional liveDemoUrl
         && (!('liveDemoUrl' in p) || p.liveDemoUrl == null || (p.liveDemoUrl is string && p.liveDemoUrl.size() <= 500 && p.liveDemoUrl.matches('^https://.*')));
@@ -1257,7 +1464,17 @@ service cloud.firestore {
       return platforms is list
         && platforms.size() >= 1
         && platforms.size() <= 6
-        && platforms.hasOnly(['windows', 'macos', 'linux', 'android', 'ios', 'web']);
+        && platforms.hasOnly(['windows', 'macos', 'linux', 'android', 'ios', 'web'])
+        && arePlatformsUnique(platforms);
+    }
+
+    function arePlatformsUnique(p) {
+      return p.size() == 1
+        || (p.size() == 2 && p[0] != p[1])
+        || (p.size() == 3 && p[0] != p[1] && p[0] != p[2] && p[1] != p[2])
+        || (p.size() == 4 && p[0] != p[1] && p[0] != p[2] && p[0] != p[3] && p[1] != p[2] && p[1] != p[3] && p[2] != p[3])
+        || (p.size() == 5 && p[0] != p[1] && p[0] != p[2] && p[0] != p[3] && p[0] != p[4] && p[1] != p[2] && p[1] != p[3] && p[1] != p[4] && p[2] != p[3] && p[2] != p[4] && p[3] != p[4])
+        || (p.size() == 6 && p[0] != p[1] && p[0] != p[2] && p[0] != p[3] && p[0] != p[4] && p[0] != p[5] && p[1] != p[2] && p[1] != p[3] && p[1] != p[4] && p[1] != p[5] && p[2] != p[3] && p[2] != p[4] && p[2] != p[5] && p[3] != p[4] && p[3] != p[5] && p[4] != p[5]);
     }
 
     // -------------------------------------------------------------------------
@@ -1497,6 +1714,14 @@ To ensure efficient queries for batch workers, reconcilers, and administration w
       "queryScope": "COLLECTION",
       "fields": [
         { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "batchIndex", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "fanout_batches",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "leaseExpiresAt", "order": "ASCENDING" },
         { "fieldPath": "batchIndex", "order": "ASCENDING" }
       ]
     },

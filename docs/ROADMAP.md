@@ -1,7 +1,7 @@
 # GitStore — Strategic Implementation Roadmap
 
-**Document Version:** 1.10.0  
-**Phase:** Phase 0.1.10 — Fan-Out Ordering, Firestore Scalability & Recovery Error Integrity  
+**Document Version:** 1.11.0  
+**Phase:** Phase 0.1.11 — Fan-Out Generation Fencing, Idempotent Retry Accounting & Schema Truthfulness  
 **Status:** IN_REVIEW — Awaiting Explicit User Approval  
 **Single Source of Execution Truth:** [`PHASE_PLAN.md`](./PHASE_PLAN.md)
 
@@ -25,7 +25,8 @@ gantt
     Phase 0.1.7: Replay Protection & Field Integrity :done, p0_1_7, 2026-11-03, 1d
     Phase 0.1.8: Node 24, Staging & 2-Tier Finalization :done, p0_1_8, 2026-11-04, 1d
     Phase 0.1.9: Permissions, SHA & Fan-Out Recovery :done, p0_1_9, 2026-11-04, 1d
-    Phase 0.1.10: Fan-Out Ordering & Scalability :active, p0_1_10, 2026-11-04, 1d
+    Phase 0.1.10: Fan-Out Ordering & Scalability :done, p0_1_10, 2026-11-04, 1d
+    Phase 0.1.11: Fan-Out Fencing & Schema Truthfulness :active, p0_1_11, 2026-11-04, 1d
     section Phase 1 & 2
     Phase 1: Frontend Core Foundation (Mock):p1, 2026-11-05, 7d
     Phase 2: Firebase Foundation & Auth     :p2, after p1, 6d
@@ -55,7 +56,16 @@ gantt
 | **Phase 0.1.7**| Replay Protection, Firestore Field Integrity & Deployment State Consistency | GitHub Pages dedicated status endpoint (`status === 'succeed'`), Case B real artifact handoff to `$GITHUB_OUTPUT`, submission client create allowlist without worker fields, `/consumed_stepup_nonces` atomic single-use reservation ledger, truthful client checksum classification of `actionHash`, canonical target doc validation, mixed-provider reauth test scenario, durable revision transactions with stale abort (`capturedRevision < currentPublishedRevision`), single shared generation ordering function, complete commit pagination loop without depth limits. | `COMPLETED` ✅ |
 | **Phase 0.1.8**| Node 24 Workflow Compatibility, Artifact Provenance & Transactional Deployment Integrity | Node 24 Actions runner migration (`checkout@v5.0.0`, `setup-node@v7.1.0`, `upload-pages-artifact@v5.0.0`, `deploy-pages@v5.0.1`), authoritative Case B staging eliminating corrupting workflow shell copy, `$GITHUB_OUTPUT` output bridge with delimiter escaping, 2-tier finalization architecture (3-write state anchor reading all state before writes + batched submission writes in chunks of 400) respecting 500-write limit, action-specific moderation payload schemas in Security Rules and processor logic, canonical `requestedByUid` naming, commit recovery granular error classification (`CANDIDATE_NO_MANIFEST` vs `API_RATE_LIMIT`), Pages API `status === 'succeed'` with HTTP manifest verification. | `COMPLETED` ✅ |
 | **Phase 0.1.9**| Workflow Validation, Recovery SHA Preservation & Durable Finalization Recovery | Purged unsupported `metadata: read` from workflow YAML, separated `commit_needed` from `deploy_needed` ensuring Case B preserves recovered commit SHA, durable 2-tier finalization with independent submission fan-out state (`submissionFanoutStatus`, cursor resumption, `expectedSubmissionIds`, 5-attempt fallback to `manual_review`), unified canonical catalog digest input contract (`computeCatalogDigest(catalogDataRoot)`), verified action release metadata (`upload-pages-artifact@v5.0.0` uses `actions/upload-artifact@v7.0.1`), technical justification for retaining checkout v5 over v6, and actual repository file inventory. | `COMPLETED` ✅ |
-| **Phase 0.1.10**| Fan-Out Ordering, Firestore Scalability & Recovery Error Integrity | Enforced conditional monotonic submission fan-out (`publishedGenerationSequence`, status eligibility guard) across 9 concurrency scenarios, eliminated unbounded array by partitioning fan-out into bounded subcollections (`fanout_batches`, max 400 IDs, parent doc $O(1)$ size << 1 MiB), implemented strict commit inspection error classifier (`classifyCommitInspectionError`, quarantine corrupt manifests, zero-error `EMPTY_SEARCH`), enforced complete nested `productData` validation in Rules and worker, and upgraded to `actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1` (`v7.0.1`) verifying runner credential persistence. | `IN_REVIEW` ⏳ (Awaiting Gate) |
+| **Phase 0.1.10**| Fan-Out Ordering, Firestore Scalability & Recovery Error Integrity | Enforced conditional monotonic submission fan-out (`publishedGenerationSequence`, status eligibility guard) across 9 concurrency scenarios, eliminated unbounded array by partitioning fan-out into bounded subcollections (`fanout_batches`, max 400 IDs, parent doc $O(1)$ size << 1 MiB), implemented strict commit inspection error classifier (`classifyCommitInspectionError`, quarantine corrupt manifests, zero-error `EMPTY_SEARCH`), enforced complete nested `productData` validation in Rules and worker, and upgraded to `actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1` (`v7.0.1`) verifying runner credential persistence. | `COMPLETED` ✅ |
+| **Phase 0.1.11**| Fan-Out Generation Fencing, Idempotent Retry Accounting & Schema Truthfulness | Implemented global fan-out generation fence inside mini-chunk transaction reading `/system_config/deployment_state` (aborting stale generations, failing closed on equal-sequence conflicting IDs via `HALT_CONFLICT`), post-capture moderation revision fence (`approvedCatalogRevision <= capturedRevision`), product delisting status check (`delisted`/`flagged` never reactivated), pure transaction callbacks with post-commit accumulation, deterministic batch producer (`prepareFanoutBatches` verified before Tier 1 publication), atomic batch completion and parent counter synchronization, bounded cursor pagination (`limit(10)`, `startAfter`), and schema truthfulness (SemVer 2.0.0, SPDX list, platform uniqueness via `arePlatformsUnique`, release asset API verification). | `IN_REVIEW` ⏳ (Awaiting Gate) |
+| **Phase 1** | Frontend Core Foundation | Responsive Vanilla HTML5/CSS3/ES6 static storefront using mock catalogs. | `NOT_STARTED` 🛑 |
+| **Phase 2** | Firebase Foundation and Auth | GitHub OAuth, Passwordless Magic Links, App Check (reCAPTCHA Enterprise), security rules. | `NOT_STARTED` 🛑 |
+| **Phase 3** | Dev Dashboard & Submission System | Multi-format submission wizard, state polling, async claim queue. | `NOT_STARTED` 🛑 |
+| **Phase 4** | GitHub Integration & Batch Processing | Actions batch processor, issue parser, 15m lease mutex, static compilation. | `NOT_STARTED` 🛑 |
+| **Phase 5** | Admin Moderation & Public Publishing | Decoupled moderation queue with action-bound proof, developer verification, Two-Phase catalog compilation. | `NOT_STARTED` 🛑 |
+| **Phase 6** | Security, Integration & QA | Security rules testing (emulator), E2E testing, pre-launch Pages policy gate. | `NOT_STARTED` 🛑 |
+| **Phase 7** | Controlled Beta Launch | Staging deployment, initial developer onboarding, production release. | `NOT_STARTED` 🛑 |
+| **Phase 8** | Post-Launch Improvements | Multi-language catalog index, dark/light toggle, automated release changelogs. | `NOT_STARTED` 🛑 |
 | **Phase 1** | Frontend Core Foundation | Responsive Vanilla HTML5/CSS3/ES6 static storefront using mock catalogs. | `NOT_STARTED` 🛑 |
 | **Phase 2** | Firebase Foundation and Auth | GitHub OAuth, Passwordless Magic Links, App Check (reCAPTCHA Enterprise), security rules. | `NOT_STARTED` 🛑 |
 | **Phase 3** | Dev Dashboard & Submission System | Multi-format submission wizard, state polling, async claim queue. | `NOT_STARTED` 🛑 |

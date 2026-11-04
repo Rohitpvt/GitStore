@@ -8,7 +8,7 @@ GitStore requires **zero binary hosting**, operates on **two platforms only** (G
 
 ---
 
-## 🚀 Key Architectural Pillars (Hardened in Phase 0.1.10)
+## 🚀 Key Architectural Pillars (Hardened in Phase 0.1.11)
 
 1. **Strict Two-Platform Confinement:**
    - **GitHub:** GitHub Pages (Static Storefront), GitHub Actions (Privileged Batch Processing Engine), GitHub Issues (Ingestion Queue), GitHub Releases (Direct Binary Distribution).
@@ -48,13 +48,14 @@ GitStore requires **zero binary hosting**, operates on **two platforms only** (G
    - Permissions strictly purged of unsupported keys (`metadata: read` removed; `contents: write` for build/commit; `pages: write`, `id-token: write`, `contents: read` for deploy).
    - Decision separation: `commit_needed` is separated from `deploy_needed`. Case B recovery skips the commit step entirely, preserving the recovered commit SHA unchanged via a dedicated `resolve-sha` step.
    - Evaluates deployment status using dedicated endpoint `GET /repos/{owner}/{repo}/pages/deployments/{pages_deployment_id}` checking for `status === "succeed"`. Unknown status halts execution immediately.
-9. **Bounded Fan-Out Subcollections, Conditional Monotonic Fan-Out & 2-Tier Finalization:**
-   - Finalization is separated into a 2-tier architecture respecting Firestore's 1 MiB document limit and 500-write limits:
-     - **Tier 1 (State Anchor Transaction):** Reads `/system_config/catalog_state`, `/system_config/deployment_state`, and `/system_deployments/{generationId}` BEFORE writes. Asserts `evaluateGenerationOrdering` and monotonic revision check (`capturedRevision >= activeRevision`). Atomically commits exactly 3 state documents and sets `submissionFanoutStatus: 'pending'`.
-     - **Tier 2 (Bounded Subcollection Fan-Out):** Fan-out work is partitioned into bounded subcollection documents (`/system_deployments/{generationId}/fanout_batches/{batchId}`) containing at most 400 IDs each (~13 KB << 1 MiB limit). Parent generation document retains strictly $O(1)$ scalar summary counters (`expectedSubmissionCount`, `completedSubmissionCount`, `totalFanoutBatches`, `completedFanoutBatches`).
-     - **Conditional Monotonic Update:** Fan-out updates execute in transactional mini-chunks of 50 documents, strictly enforcing status eligibility (`status in ['approved', 'published']`; never resurrecting rejected, delisted, or withdrawn submissions) and monotonic sequence advancement (`genData.generationSequence > (currentSub.publishedGenerationSequence || 0)`), preventing stale fan-out overwrites across all 9 concurrency scenarios.
-     - **Startup Reconciler Resumption:** Reconciler discovers incomplete fan-out via `status == 'published' && submissionFanoutStatus in ['pending', 'in_progress', 'partial']` and safely resumes remaining batches. After 5 failed attempts on any batch, transitions to `manual_review` and logs an alert.
-   - If `capturedRevision < currentPublishedRevision`, the transaction throws immediately and aborts (`stale_aborted`) without touching published revision, records, or submission statuses.
+9. **Bounded Fan-Out Subcollections, Global Generation Fencing & Atomic Completion:**
+   - Finalization is separated into a 2-tier architecture respecting Firestore quotas and document bounds:
+     - **Tier 1 (State Anchor Transaction):** Reads `/system_config/catalog_state`, `/system_config/deployment_state`, and `/system_deployments/{generationId}` BEFORE writes. Requires `fanoutPreparationStatus === 'prepared'`. Atomically commits exactly 3 state documents. Stale generations abort immediately (`stale_aborted`).
+     - **Tier 2 (Bounded Subcollection Fan-Out):** Work is partitioned into bounded subcollection documents (`/system_deployments/{generationId}/fanout_batches/{batchId}`) containing at most 400 IDs each (~55 KB conservative size, ~5.37% of 1 MiB limit). Parent generation document retains strictly $O(1)$ scalar summary counters (`expectedSubmissionCount`, `completedSubmissionCount`, `totalFanoutBatches`, `completedFanoutBatches`).
+     - **Global Generation Fence:** Mini-chunk transactions read `/system_config/deployment_state` at the same consistency boundary. If $genSeq < latestPublishedSequence$, fan-out aborts as stale (`STALE_GLOBAL_GENERATION_ABORT`), strictly preventing older generations from modifying unreached records once a newer generation publishes. Fails closed on equal-sequence conflicting IDs (`HALT_CONFLICT`).
+     - **Post-Capture Moderation Revision Fence & Product Delisting Guard:** Asserts `approvedCatalogRevision <= capturedRevision` and checks `/products/{productId}` status (`delisted`/`flagged` products never reactivated).
+     - **Pure Transaction Callbacks & Atomic Completion:** Callbacks mutate zero outer variables; child batch completion and parent summary increments commit in a single atomic transaction. Exhausted retries (5 attempts) transition child batch and parent to `manual_review` together, logging to `/admin_logs`.
+     - **Bounded Cursor Pagination & Concurrency Ownership:** Batches are queried via `.limit(10)`, `.orderBy('batchIndex', 'asc')`, and `.startAfter(lastDoc)`. Root Actions concurrency group `github-pages` plus 15-minute CAS batch leases serialize worker execution.
 10. **Single Shared Generation Ordering Function & Split-Job Workflow:**
     - Unified ordering logic across generation creation, Case B recovery, pre-deployment guard, and finalization into one shared function `evaluateGenerationOrdering(artifactSeq, artifactGenId, activeSeq, activeGenId)`.
     - Split-job workflow: `build-and-commit` (`contents: write`) and `deploy-to-pages` (`pages: write`, `id-token: write`, `contents: read` targeting `environment: github-pages`).
@@ -65,6 +66,9 @@ GitStore requires **zero binary hosting**, operates on **two platforms only** (G
 12. **Binary Non-Execution & Provenance:**
     - GitStore never executes or sandboxes third-party binaries.
     - Download links point directly to cryptographic assets in authors' public GitHub Releases.
+13. **Schema Truthfulness & Authoritative Validation Separation:**
+    - Firestore Security Rules enforce practical structural bounds (`version` regex, `license` length, `arePlatformsUnique` index equality for 1-6 platforms, and `repoUrl == 'https://github.com/' + repoOwner + '/' + repoName`).
+    - Trusted batch worker executes authoritative validations: parsing full SemVer 2.0.0 specifications, matching licenses against official SPDX catalogs, checking platform set uniqueness, and verifying release assets directly against the GitHub Releases API.
 
 ---
 
@@ -105,10 +109,10 @@ GitStore/
 │       ├── github-verifier.js      # REST API repository & asset validator
 │       ├── pre-deploy-guard.js     # Pre-deployment shared ordering assertion
 │       └── catalog-compiler.js     # Static JSON generator & recursive canonical digest
-├── docs/                           # Master Architectural Specifications (v1.10.0)
-│   ├── ARCHITECTURE.md             # Core system design, interface contracts, ADR-01 through ADR-20
+├── docs/                           # Master Architectural Specifications (v1.11.0)
+│   ├── ARCHITECTURE.md             # Core system design, interface contracts, ADR-01 through ADR-22
 │   ├── DATABASE_SCHEMA.md          # Complete Firestore schema, bounded fanout batches, reconciler logic & security rules
-│   ├── SECURITY.md                 # Threat model, RBAC, action-bound step-up auth, 18-row verification matrix
+│   ├── SECURITY.md                 # Threat model, RBAC, action-bound step-up auth, 19-row verification matrix
 │   ├── SUBMISSION_PIPELINE.md      # Ingestion lifecycle, 12-state state machine, 12 failure scenarios
 │   ├── AUTHENTICATION.md           # GitHub OAuth, magic links, App Check quotas, step-up proof
 │   ├── DEPLOYMENT_GUIDE.md         # Operations guide, split-job workflow, secrets, pre-deploy guard
@@ -137,25 +141,25 @@ All technical specifications are organized within the [`docs/`](./docs) director
 
 | Document | Purpose | Version | Status |
 |---|---|---|---|
-| [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) | High-level architecture, contracts, ADR-01 to ADR-20 | 1.10.0 | `IN_REVIEW` ⏳ |
-| [`docs/DATABASE_SCHEMA.md`](./docs/DATABASE_SCHEMA.md) | Firestore collections, security rules, bounded fanout batches, reconciler logic | 1.10.0 | `IN_REVIEW` ⏳ |
-| [`docs/SECURITY.md`](./docs/SECURITY.md) | Threat model, action-bound step-up proof, 18-row verification matrix | 1.10.0 | `IN_REVIEW` ⏳ |
-| [`docs/SUBMISSION_PIPELINE.md`](./docs/SUBMISSION_PIPELINE.md) | 12-state machine, ownership tiers, 12 failure scenarios | 1.10.0 | `IN_REVIEW` ⏳ |
-| [`docs/AUTHENTICATION.md`](./docs/AUTHENTICATION.md) | OAuth, magic links, App Check quotas, step-up proof | 1.10.0 | `IN_REVIEW` ⏳ |
-| [`docs/DEPLOYMENT_GUIDE.md`](./docs/DEPLOYMENT_GUIDE.md) | Node 24 workflow, secrets, pre-deploy guard, query catalog | 1.10.0 | `IN_REVIEW` ⏳ |
-| [`docs/TESTING_STRATEGY.md`](./docs/TESTING_STRATEGY.md) | Testing pyramid, digest test vectors, emulator tests | 1.10.0 | `IN_REVIEW` ⏳ |
-| [`docs/COST_AND_LIMITS.md`](./docs/COST_AND_LIMITS.md) | Free-tier limits, hard-stop behavior, zero-cost analysis | 1.10.0 | `IN_REVIEW` ⏳ |
-| [`docs/PRD.md`](./docs/PRD.md) | Product vision, target personas, functional requirements | 1.10.0 | `IN_REVIEW` ⏳ |
-| [`docs/SDD.md`](./docs/SDD.md) | System design, sequence diagrams, component breakdowns | 1.10.0 | `IN_REVIEW` ⏳ |
-| [`docs/PHASE_PLAN.md`](./docs/PHASE_PLAN.md) | Master development roadmap & phase control system | 1.10.0 | `IN_REVIEW` ⏳ |
-| [`docs/ROADMAP.md`](./docs/ROADMAP.md) | Strategic Gantt chart & execution timeline | 1.10.0 | `IN_REVIEW` ⏳ |
+| [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) | High-level architecture, contracts, ADR-01 to ADR-22 | 1.11.0 | `IN_REVIEW` ⏳ |
+| [`docs/DATABASE_SCHEMA.md`](./docs/DATABASE_SCHEMA.md) | Firestore collections, security rules, bounded fanout batches, reconciler logic | 1.11.0 | `IN_REVIEW` ⏳ |
+| [`docs/SECURITY.md`](./docs/SECURITY.md) | Threat model, action-bound step-up proof, 19-row verification matrix | 1.11.0 | `IN_REVIEW` ⏳ |
+| [`docs/SUBMISSION_PIPELINE.md`](./docs/SUBMISSION_PIPELINE.md) | 12-state machine, ownership tiers, 12 failure scenarios | 1.11.0 | `IN_REVIEW` ⏳ |
+| [`docs/AUTHENTICATION.md`](./docs/AUTHENTICATION.md) | OAuth, magic links, App Check quotas, step-up proof | 1.11.0 | `IN_REVIEW` ⏳ |
+| [`docs/DEPLOYMENT_GUIDE.md`](./docs/DEPLOYMENT_GUIDE.md) | Node 24 workflow, secrets, pre-deploy guard, query catalog | 1.11.0 | `IN_REVIEW` ⏳ |
+| [`docs/TESTING_STRATEGY.md`](./docs/TESTING_STRATEGY.md) | Testing pyramid, digest test vectors, emulator tests | 1.11.0 | `IN_REVIEW` ⏳ |
+| [`docs/COST_AND_LIMITS.md`](./docs/COST_AND_LIMITS.md) | Free-tier limits, hard-stop behavior, zero-cost analysis | 1.11.0 | `IN_REVIEW` ⏳ |
+| [`docs/PRD.md`](./docs/PRD.md) | Product vision, target personas, functional requirements | 1.11.0 | `IN_REVIEW` ⏳ |
+| [`docs/SDD.md`](./docs/SDD.md) | System design, sequence diagrams, component breakdowns | 1.11.0 | `IN_REVIEW` ⏳ |
+| [`docs/PHASE_PLAN.md`](./docs/PHASE_PLAN.md) | Master development roadmap & phase control system | 1.11.0 | `IN_REVIEW` ⏳ |
+| [`docs/ROADMAP.md`](./docs/ROADMAP.md) | Strategic Gantt chart & execution timeline | 1.11.0 | `IN_REVIEW` ⏳ |
 | [`docs/UI_DESIGN_SYSTEM.md`](./docs/UI_DESIGN_SYSTEM.md) | Obsidian Dark Neo-Brutalist tokens & layout specs | 1.0.0 | `APPROVED` ✅ |
 
 ---
 
 ## 🚦 Project Status & Execution Governance
 
-- **Current Active Phase:** **Phase 0.1.10 — Fan-Out Ordering, Firestore Scalability & Recovery Error Integrity** (`IN_REVIEW` ⏳).
+- **Current Active Phase:** **Phase 0.1.11 — Fan-Out Generation Fencing, Idempotent Retry Accounting & Schema Truthfulness** (`IN_REVIEW` ⏳).
 - **Execution Rule:** GitStore operates under strict phase-gate control. Implementation work on **Phase 1 (Frontend Core Foundation)** requires explicit user `APPROVED` sign-off.
 - **Repository:** [`https://github.com/Rohitpvt/GitStore.git`](https://github.com/Rohitpvt/GitStore.git)
 - **Primary Branch:** `main`

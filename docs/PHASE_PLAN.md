@@ -1,8 +1,8 @@
 # GitStore — Master Phase Plan & Development Control System
 
-**Document Version:** 1.10.0  
+**Document Version:** 1.11.0  
 **Last Updated:** 2026-11-04  
-**Current Project State:** Phase 0.1.10 (Fan-Out Ordering, Firestore Scalability & Recovery Error Integrity) — `IN_REVIEW` 🔍 | Awaiting User `APPROVED` Gate for Phase 1  
+**Current Project State:** Phase 0.1.11 (Fan-Out Generation Fencing, Idempotent Retry Accounting & Schema Truthfulness) — `IN_REVIEW` 🔍 | Awaiting User `APPROVED` Gate for Phase 1  
 **Project Lead:** Technical Project Manager, Software Architect, & QA Lead  
 **Governing Standard:** Strict Dual-Platform Confinement (**GitHub** & **Firebase** ONLY)
 
@@ -36,7 +36,8 @@ To ensure strict quality control and eliminate premature execution:
 | **Phase 0.1.7**| Replay Protection, Firestore Field Integrity & Deployment State Consistency | `COMPLETED` ✅ | 100% (All 10 core objectives closed) | Hardened Baseline |
 | **Phase 0.1.8**| Node 24 Workflow Compatibility, Artifact Provenance & Transactional Deployment Integrity | `COMPLETED` ✅ | 100% (All 8 core audit items closed) | Hardened Baseline |
 | **Phase 0.1.9**| Workflow Validation, Recovery SHA Preservation & Durable Finalization Recovery | `COMPLETED` ✅ | 100% (All 4 core defects + metadata verified) | Hardened Baseline |
-| **Phase 0.1.10**| Fan-Out Ordering, Firestore Scalability & Recovery Error Integrity | `IN_REVIEW` ⏳ | 100% (All 5 core problems resolved & verified) | User Review Pending |
+| **Phase 0.1.10**| Fan-Out Ordering, Firestore Scalability & Recovery Error Integrity | `COMPLETED` ✅ | 100% (All 5 core problems resolved & verified) | Hardened Baseline |
+| **Phase 0.1.11**| Fan-Out Generation Fencing, Idempotent Retry Accounting & Schema Truthfulness | `IN_REVIEW` ⏳ | 100% (All 8 core defect areas resolved & verified) | User Review Pending |
 | **Phase 1** | Frontend Core Foundation (Mock Storefront) | `NOT_STARTED` 🛑 | 0 / 5 Subphases | Requires Phase 0.1 Approval |
 | **Phase 2** | Firebase Foundation and Authentication | `NOT_STARTED` 🛑 | 0 / 4 Subphases | Requires Phase 1 Approval |
 | **Phase 3** | Developer Dashboard and Submission System | `NOT_STARTED` 🛑 | 0 / 4 Subphases | Requires Phase 2 Approval |
@@ -130,7 +131,7 @@ To ensure strict quality control and eliminate premature execution:
 ---
 
 ### Phase 0.1.10: Fan-Out Ordering, Firestore Scalability & Recovery Error Integrity
-- **Status:** `IN_REVIEW` ⏳ (All 5 Core Problems Resolved & Documented; Awaiting User Gate)
+- **Status:** `COMPLETED` ✅ (All 5 Core Problems Resolved & Documented; Hardened Baseline)
 - **Objective:** Resolve the 5 critical architectural and operational problems identified in the Phase 0.1.9 independent review:
   1. *Prevent Stale Submission Fan-Out:* Implement generation-aware, state-aware conditional fan-out in `executeSubmissionFanout()`. Use Firestore transactions enforcing: status eligibility (`status in ['approved', 'published']`; never resurrecting rejected, delisted, or withdrawn submissions), strictly monotonic generation sequence advancement (`genData.generationSequence > (currentSub.publishedGenerationSequence || 0)`), and idempotent replays across all 9 concurrency scenarios.
   2. *Remove Unbounded Submission ID Array:* Eliminate unbounded `expectedSubmissionIds: string[]` from the `/system_deployments/{generationId}` parent document, retaining strictly $O(1)$ scalar summary counters (`expectedSubmissionCount`, `completedSubmissionCount`, `submissionFanoutStatus`, `totalFanoutBatches`, `completedFanoutBatches`, `fanoutAttempts`). Store partitioned chunks in bounded subcollection `/system_deployments/{generationId}/fanout_batches/{batchId}` capped at 400 IDs each (~13 KB << 1 MiB limit).
@@ -139,6 +140,22 @@ To ensure strict quality control and eliminate premature execution:
   5. *Evaluate & Upgrade to `actions/checkout@v7.0.1`:* Pinned to official verified SHA `3d3c42e5aac5ba805825da76410c181273ba90b1`. Runs natively on Node 24 (`runs.using: 'node24'`, runner `>= v2.327.1`). Verified official documentation confirming native Git CLI operations (`git push origin main`) succeed with default `persist-credentials: true` via runner git credential helper, superseding outdated claims regarding `.git/config` breakage.
 - **Files Modified:** All 11 architecture, schema, security, and governance files across `docs/` and root repository.
 - **Definition of Done (DoD):** All 5 problems resolved, ADR-17 and ADR-18 updated, ADR-19 and ADR-20 added, 18-row verification matrix populated with truthful classifications, documentation synchronized to v1.10.0, zero application code written, working tree verified clean.
+
+---
+
+### Phase 0.1.11: Fan-Out Generation Fencing, Idempotent Retry Accounting & Schema Truthfulness
+- **Status:** `IN_REVIEW` ⏳ (All 8 Core Defect Areas Resolved & Documented; Awaiting User Gate)
+- **Objective:** Resolve the 8 critical architectural defects identified in the Phase 0.1.10 independent review:
+  1. *Global Fan-Out Generation Fencing:* In `executeSubmissionFanout()`, read `/system_config/deployment_state` inside every mini-chunk transaction. If $genSeq < latestPublishedSequence$, abort fan-out as stale (`STALE_GLOBAL_GENERATION_ABORT`), strictly preventing older generations from modifying unreached submissions after a newer generation publishes. Fail closed on equal-sequence conflicting generation IDs (`HALT_CONFLICT`).
+  2. *Post-Capture Moderation Revision Fence:* Add `approvedCatalogRevision` to `SubmissionDocument`. Mini-chunk transaction asserts `currentSub.approvedCatalogRevision <= genData.capturedRevision`, skipping submissions modified or re-approved after generation capture (`skipped_post_capture_reapproval`).
+  3. *Product-Level Publication Eligibility Check:* Read `/products/{productId}` in mini-chunk transaction; skip fan-out activation if product status is `delisted` or `flagged`, ensuring product status is never overridden by submission metadata.
+  4. *Pure Transaction Callbacks & Accurate Counter Accounting:* Purge external variable mutations and logging from `db.runTransaction` callbacks. Return outcome object `{ chunkCompleted, chunkSkipped }`, accumulating into caller counters only after commit succeeds.
+  5. *Deterministic Batch Producer (`prepareFanoutBatches`):* Deduplicate expected submission IDs via Set, validate IDs, sort lexicographically, partition into chunks of max 400 IDs, write child documents with merge, read back to verify all batches exist and match counts, and set `fanoutPreparationStatus: 'prepared'`. Invariant: Tier 1 publication transaction must verify `fanoutPreparationStatus === 'prepared'` before advancing generation to `published`.
+  6. *Atomic Batch Completion & Parent Counter Synchronization:* Child batch transition to `status: 'completed'` and parent summary increments (`completedFanoutBatches += 1`, `completedSubmissionCount += completed + skipped`) execute in a single atomic transaction. On 5 retry failures or fatal errors, atomically transition child batch to `status: 'manual_review'` and parent to `submissionFanoutStatus: 'manual_review'`, logging to `/admin_logs`.
+  7. *Bounded Cursor Pagination & Concurrency Ownership:* Replace unpaginated `.get()` with cursor pagination (`.limit(10)`, `.orderBy('batchIndex', 'asc')`, `.startAfter(lastDoc)`). Worker ownership guaranteed by GitHub Actions root concurrency group `github-pages` plus atomic 15-minute CAS batch leases (`leaseOwner`, `leaseExpiresAt`).
+  8. *Schema Truthfulness & Scalability Bounds:* Replace absolute "infinite horizontal scalability" claims with quota-aware bounds (max 128-char submission ID, 400 IDs $\approx 55\text{ KB} \ll 1\text{ MiB}$ limit). Explicitly distinguish Rules structural bounds from trusted worker authoritative checks (SemVer 2.0.0, SPDX License List, platform non-duplication via `arePlatformsUnique`, release asset validation via GitHub REST API). Synchronize all 11 project document headers to Version 1.11.0, Phase 0.1.11 `IN_REVIEW`.
+- **Files Modified:** All 11 architecture, schema, security, and governance files across `docs/` and root repository.
+- **Definition of Done (DoD):** All 8 defect areas resolved, ADR-17 and ADR-20 updated, ADR-21 and ADR-22 added, 19-row verification matrix populated with truthful classifications, documentation synchronized to v1.11.0, zero application code written, working tree verified clean.
 
 ---
 
