@@ -1,8 +1,8 @@
 # GitStore — Master Phase Plan & Development Control System
 
-**Document Version:** 1.12.0  
-**Last Updated:** 2026-11-05  
-**Current Project State:** Phase 0.1.12 (Fan-Out Work-Plan Integrity, Lease Ownership & Fail-Closed Recovery) — `IN_REVIEW` 🔍 | Awaiting User `APPROVED` Gate for Phase 1  
+**Document Version:** 1.13.0  
+**Last Updated:** 2026-11-06  
+**Current Project State:** Phase 0.1.13 (Work-Plan Concurrency, Lease Renewal & Reconciliation Correctness) — `IN_REVIEW` 🔍 | Awaiting User `APPROVED` Gate for Phase 1  
 **Project Lead:** Technical Project Manager, Software Architect, & QA Lead  
 **Governing Standard:** Strict Dual-Platform Confinement (**GitHub** & **Firebase** ONLY)
 
@@ -37,8 +37,9 @@ To ensure strict quality control and eliminate premature execution:
 | **Phase 0.1.8**| Node 24 Workflow Compatibility, Artifact Provenance & Transactional Deployment Integrity | `COMPLETED` ✅ | 100% (All 8 core audit items closed) | Hardened Baseline |
 | **Phase 0.1.9**| Workflow Validation, Recovery SHA Preservation & Durable Finalization Recovery | `COMPLETED` ✅ | 100% (All 4 core defects + metadata verified) | Hardened Baseline |
 | **Phase 0.1.10**| Fan-Out Ordering, Firestore Scalability & Recovery Error Integrity | `COMPLETED` ✅ | 100% (All 5 core problems resolved & verified) | Hardened Baseline |
-| **Phase 0.1.11**| Fan-Out Generation Fencing, Idempotent Retry Accounting & Schema Truthfulness | `COMPLETED` ✅ | 100% (All 8 core defect areas resolved & verified) | Hardened Baseline |
+| **Phase 0.1.11**| Fan-Out Generation Fencing, Idempotent Retry Accounting & Schema Truthfulness | `IN_REVIEW` ⏳ | 100% (All 8 core defect areas resolved & verified) | User Review Pending |
 | **Phase 0.1.12**| Fan-Out Work-Plan Integrity, Lease Ownership & Fail-Closed Recovery | `IN_REVIEW` ⏳ | 100% (All 7 core defect areas resolved & documented) | User Review Pending |
+| **Phase 0.1.13**| Work-Plan Concurrency, Lease Renewal & Reconciliation Correctness | `IN_REVIEW` ⏳ | 100% (All 7 core defect areas resolved & documented) | Active In Review |
 | **Phase 1** | Frontend Core Foundation (Mock Storefront) | `NOT_STARTED` 🛑 | 0 / 5 Subphases | Requires Phase 0.1 Approval |
 | **Phase 2** | Firebase Foundation and Authentication | `NOT_STARTED` 🛑 | 0 / 4 Subphases | Requires Phase 1 Approval |
 | **Phase 3** | Developer Dashboard and Submission System | `NOT_STARTED` 🛑 | 0 / 4 Subphases | Requires Phase 2 Approval |
@@ -145,7 +146,7 @@ To ensure strict quality control and eliminate premature execution:
 ---
 
 ### Phase 0.1.11: Fan-Out Generation Fencing, Idempotent Retry Accounting & Schema Truthfulness
-- **Status:** `COMPLETED` ✅ (All 8 Core Defect Areas Resolved & Documented; Formally Hardened)
+- **Status:** `IN_REVIEW` ⏳ (All 8 Core Defect Areas Resolved & Documented; Awaiting Explicit User Approval)
 - **Objective:** Resolve the 8 critical architectural defects identified in the Phase 0.1.10 independent review:
   1. *Global Fan-Out Generation Fencing:* In `executeSubmissionFanout()`, read `/system_config/deployment_state` inside every mini-chunk transaction. If $genSeq < latestPublishedSequence$, abort fan-out as stale (`STALE_GLOBAL_GENERATION_ABORT`), strictly preventing older generations from modifying unreached submissions after a newer generation publishes. Fail closed on equal-sequence conflicting generation IDs (`HALT_CONFLICT`).
   2. *Post-Capture Moderation Revision Fence:* Add `approvedCatalogRevision` to `SubmissionDocument`. Mini-chunk transaction asserts `currentSub.approvedCatalogRevision <= genData.capturedRevision`, skipping submissions modified or re-approved after generation capture (`skipped_post_capture_reapproval`).
@@ -172,6 +173,21 @@ To ensure strict quality control and eliminate premature execution:
   7. *Schema and Manifest Version Synchronization:* Data Schema Version `1.12.0`, Document Version `1.12.0`, and deployment manifest `schemaVersion: "1.12.0"` synchronized across all 11 documentation files.
 - **Files Modified:** All 11 architecture, schema, security, and governance files across `docs/` and root repository.
 - **Definition of Done (DoD):** All 7 defect areas resolved, ADR-21 and ADR-22 updated, ADR-23 and ADR-24 added, 20-scenario verification matrix populated with truthful classifications, documentation synchronized to v1.12.0, zero application code written, working tree verified clean.
+
+---
+
+### Phase 0.1.13: Work-Plan Concurrency, Lease Renewal & Reconciliation Correctness
+- **Status:** `IN_REVIEW` ⏳ (All 7 Core Defect Areas Resolved & Documented; Active In Review)
+- **Objective:** Resolve the 7 remaining architectural, security, and concurrency issues identified in the Phase 0.1.12 independent review:
+  1. *Concurrency-Safe Work-Plan Preparation (`prepareFanoutBatches`):* Never relies on stale `genData` passed into the function; reads fresh generation documents inside an atomic 15-minute preparation ownership transaction (`acquirePreparationLock`). Prevents concurrent workers from preparing conflicting work plans for the same generation via `fanoutPreparationStatus: 'preparing'`, `preparationOwner`, and `preparationExpiresAt`. Expired preparation locks are safely reclaimable by subsequent workers. Enforces mandatory canonical 64-character hex `workPlanDigest` (`/^[0-9a-f]{64}$/`); missing or malformed digests fail closed as `PREPARED_DIGEST_MISSING_OR_INVALID_ABORT`. Even on idempotent retries where a generation is already marked `prepared`, it deeply verifies the persisted child batch plan before returning. Tier 1 publication strictly cannot proceed while preparation is incomplete or held by another worker.
+  2. *Active Batch Content Protection & Completed Immutability:* Never modifies `submissionIds` or `batchDigest` while a batch is actively leased. Existing batch documents are read and asserted; if an active batch contains work-plan content differing from the expected plan, it fails closed as `ACTIVE_BATCH_MUTATION_CONFLICT` (never silently rewriting an active batch). Completed batches (`status === 'completed'`) remain strictly immutable; any digest mismatch fails closed as `COMPLETED_BATCH_CORRUPT_CONFLICT`.
+  3. *Bounded Preparation Cleanup & Deep Verification:* Replaces unrestricted `.get()` in stale batch cleanup and readback verification with bounded cursor pagination (`limit(50)`, `orderBy('batchIndex', 'asc')`, `startAfter(lastDoc)`). Cleanup never removes active or completed batches, operating idempotently. Deep readback verification is paginated in bounded chunks, ensuring the parent `fanoutPreparationStatus: 'prepared'` marker is persisted ONLY after every expected child batch is cryptographically verified.
+  4. *Option A Transactional Heartbeat Lease Renewal Protocol (`renewBatchLease`):* Workers acquire an initial 15-minute lease via `acquireBatchLease()`. Before processing each mini-chunk, if less than 5 minutes remain on the lease, the worker transactionally asserts lease ownership (`leaseOwner === workerExecutionId`), verifies unexpired lease status, enforces a 60-minute maximum allowable lease window ceiling from `leaseAcquiredAt` (failing closed as `MAX_LEASE_WINDOW_EXCEEDED`), and extends `leaseExpiresAt` by 15 minutes. Any renewal failure (superseded worker or timeout) causes immediate worker abort (`LEASE_RENEWAL_LOST_ABORT`) without committing batch state.
+  5. *Atomic Manual-Review Recovery with Deterministic Audit Logging:* Exhausted retries (5 attempts) or fatal sequence conflicts (`HALT_CONFLICT`) trigger a single atomic Firestore transaction (`db.runTransaction`) that reads all affected documents before writes, transitions the active child batch (`status: 'manual_review'`, lease cleared), transitions the parent generation (`submissionFanoutStatus: 'manual_review'`), and writes an immutable audit record to `/admin_logs` using a deterministic document ID (`fanout_mr_${genId}_${batchId}_attempt_${attempts}`). This guarantees idempotency on transaction retries and ensures manual-review recovery cannot succeed without its audit record.
+  6. *Stable Immutable Reconciler Pagination:* The startup reconciler discovers incomplete published generations via cursor pagination ordered strictly by immutable `generationSequence` ASC (`where('status', '==', 'published')`, `where('submissionFanoutStatus', 'in', ['pending', 'in_progress', 'partial'])`, `orderBy('generationSequence', 'asc')`, `limit(10)`, `startAfter(lastGenDoc)`). Because `generationSequence` is immutable, status field mutations during traversal do not shift cursor positioning. Multi-run scheduled sweeps recover any partial work without skip hazards, providing reliable eventual convergence without claiming false "exactly-once" processing.
+  7. *Governance & Version Synchronization:* Corrects governance defect by maintaining Phase 0.1.11 and Phase 0.1.12 as `IN_REVIEW` ⏳ until explicit user acceptance. Synchronizes Data Schema Version `1.13.0`, Document Version `1.13.0`, deployment manifest `schemaVersion: "1.13.0"`, ADR range `ADR-01 to ADR-26`, and the 18-scenario formal verification matrix across all 11 documentation files.
+- **Files Modified:** All 11 architecture, schema, security, and governance files across `docs/` and root repository.
+- **Definition of Done (DoD):** All 7 defect areas resolved, ADR-25 and ADR-26 added, 18-scenario verification matrix populated with truthful classifications, documentation synchronized to v1.13.0, zero application code written, working tree verified clean.
 
 ---
 

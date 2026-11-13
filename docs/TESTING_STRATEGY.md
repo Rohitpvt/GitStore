@@ -1,9 +1,9 @@
 # GitStore — Comprehensive Testing Strategy
 
-**Document Version:** 1.12.0  
-**Phase:** Phase 0.1.12 — Fan-Out Work-Plan Integrity, Lease Ownership & Fail-Closed Recovery  
+**Document Version:** 1.13.0  
+**Phase:** Phase 0.1.13 — Work-Plan Concurrency, Lease Renewal & Reconciliation Correctness  
 **Status:** IN_REVIEW — Awaiting Explicit User Approval  
-**Data Schema Version:** 1.12.0  
+**Data Schema Version:** 1.13.0  
 
 ---
 
@@ -183,29 +183,36 @@ describe('Deterministic Recursive Canonical Digest Tests', () => {
   - Evaluates `evaluateGenerationOrdering` and revision monotonicity.
   - Assert: Exactly 3 writes committed in transaction; marks `status: 'published'`, `reconciliationStatus: 'fanout_pending'`, `submissionFanoutStatus: 'pending'`, `completedSubmissionCount: 0`, `completedFanoutBatches: 0`.
 - **Deterministic Work-Plan Preparation Tests (`prepareFanoutBatches`):**
+  - *Concurrency-Safe Preparation Lock:* Two workers attempt preparation concurrently. Assert Worker 1 claims atomic 15-minute preparation lock (`acquirePreparationLock`), while Worker 2 fails with `PREPARATION_LOCKED_BY_OTHER_WORKER`.
   - *Fail-Closed Input Validation:* Pass malformed ID strings (`"INVALID!ID"`, empty strings, non-strings). Assert throws `INVALID_SUBMISSION_ID_ABORT` immediately without silent dropping.
-  - *Deterministic Deduplication & Digesting:* Pass array with duplicate IDs. Assert duplicates deduplicated via Set; sorted lexicographically; canonical `workPlanDigest` computed; batch child documents created with individual `batchDigest`.
-  - *Work-Plan Immutability Guard:* Re-run preparation against already prepared generation with altered ID list. Assert throws `WORKPLAN_MUTATION_CONFLICT`.
-  - *Stale Batch Pruning:* Inject leftover `batch_00005` from prior aborted attempt. Assert preparation scan prunes stale batch with `batchIndex >= totalBatches`.
-  - *Deep Readback Verification:* Assert all batches read back and verified element-by-element against expected IDs and `batchDigest`.
+  - *Deterministic Deduplication & Digesting:* Pass array with duplicate IDs. Assert duplicates deduplicated via Set; sorted lexicographically; canonical 64-char hex `workPlanDigest` computed and verified against `/^[0-9a-f]{64}$/`. Missing/malformed digest throws `PREPARED_DIGEST_MISSING_OR_INVALID_ABORT`.
+  - *Idempotent Retry Deep Verification:* Re-run preparation against already prepared generation. Assert stored `workPlanDigest` verified and deep paginated readback verification executed across all child batches.
+  - *Protected Active Batch Contents:* Re-run preparation while a child batch is actively leased. If stored plan matches, assert active batch preserved untouched. If stored plan differs, assert throws `ACTIVE_BATCH_MUTATION_CONFLICT`.
+  - *Completed Batch Immutability:* Re-run preparation against batch already `completed`. If digest matches, assert untouched. If digest differs, assert throws `COMPLETED_BATCH_CORRUPT_CONFLICT`.
+  - *Bounded Stale Batch Cleanup:* Inject leftover batches with `batchIndex >= totalBatches`. Assert paginated cleanup (`limit(50)`) removes unleased stale batches without deleting active or completed batches.
+  - *Bounded Readback Verification:* Assert all batches read back and verified element-by-element across bounded pages (`limit(50)`).
 - **Fail-Closed Product & Moderation Revision Tests:**
   - *Missing Product Doc:* Mock submission referencing non-existent `/products/{id}`. Assert skipped (`skipped_product_not_found`) and never marked `published`.
   - *Delisted / Flagged Product:* Mock product with status `'delisted'` or `'flagged'`. Assert skipped; product never reactivated; submission remains un-published.
   - *Product ID Mismatch:* Mock submission where targetProductId does not match product document ID. Assert skipped (`skipped_invalid_product_id`).
   - *Approval Revision Integrity:* Pass submission with missing, null, string, or negative `approvedCatalogRevision`. Assert skipped (`skipped_invalid_approval_revision`).
   - *Post-Capture Revision Fence:* Mock submission with `approvedCatalogRevision > capturedRevision`. Assert skipped (`skipped_post_capture_reapproval`).
-- **Transactional Distributed Lease Tests:**
+- **Transactional Distributed Lease & Heartbeat Renewal Tests:**
   - *Concurrent Acquisition:* Two workers concurrently call `acquireBatchLease()`. Assert exactly one worker acquires lease; second worker receives `{ acquired: false }` and skips cleanly.
+  - *Option A Heartbeat Renewal by Current Owner:* Worker calls `renewBatchLease()` with < 5m remaining. Assert atomic ownership verified, lease extended by 15m, `lastHeartbeatAt` updated.
+  - *Heartbeat Renewal by Superseded Owner:* Worker A lease expires; Worker B acquires lease. Worker A calls `renewBatchLease()`; assert transaction aborts with `LEASE_RENEWAL_LOST_ABORT`.
+  - *Maximum Lease Window Ceiling:* Continuous execution exceeding 60m from `leaseAcquiredAt` triggers `MAX_LEASE_WINDOW_EXCEEDED`, aborting batch processing.
   - *In-Flight Lease Verification:* Test mini-chunk transaction checking lease ownership. If lease expired or held by differing worker, assert throws `LEASE_LOST_ABORT` / `LEASE_EXPIRED_ABORT`.
   - *Atomic Batch Completion:* Worker attempts completion transaction. Assert lease ownership verified; child batch marked `completed`, lease cleared, parent counters incremented atomically.
-  - *Old Worker Rejection:* Simulate Worker A whose lease expired and was claimed by Worker B. Worker A attempts completion; assert transaction rolls back with `LEASE_LOST_ABORT`.
 - **Atomic Manual-Review Recovery Tests:**
-  - Inject 5 consecutive failures or `HALT_CONFLICT`. Assert single atomic transaction transitions BOTH child batch (`status: 'manual_review'`, lease cleared) and parent generation (`submissionFanoutStatus: 'manual_review'`), appending log to `/admin_logs`.
+  - Inject 5 consecutive failures or `HALT_CONFLICT`. Assert single atomic transaction (`db.runTransaction`) reads all docs before writes, transitions child batch (`status: 'manual_review'`, lease cleared), transitions parent generation (`submissionFanoutStatus: 'manual_review'`), and writes deterministic audit doc `/admin_logs/fanout_mr_{genId}_{batchId}_attempt_5`.
+  - *Audit Retry Idempotency:* Assert re-running the transaction does not produce duplicate `/admin_logs` records.
 - **Bounded Reconciler Pagination Tests:**
-  - Mock 45 incomplete published generations. Assert reconciler queries via cursor pagination (`limit(10)`, `startAfter`), ordered by `submissionFanoutStatus` ASC and `generationSequence` ASC, fetching 5 clean pages without memory exhaustion.
-  - Assert generations in `manual_review` are excluded from discovery query.
-- **20-Scenario Formal Verification Suite:**
-  - All 20 scenarios specified in `docs/SECURITY.md` Section 9.2 are codified as formal test specifications (`DOCUMENTED_TEST_SPECIFICATION`) for automated execution against the Firebase Emulator Suite in Phase 2 and Phase 4.
+  - Mock 45 incomplete published generations. Assert reconciler queries via cursor pagination strictly ordered by immutable `generationSequence` ASC (`limit(10)`, `startAfter(lastGenDoc)`), fetching 5 clean pages without memory exhaustion.
+  - *Status Mutation Invariance:* Assert status transitions during traversal (`pending` -> `in_progress` -> `completed`) do not shift document cursor positions or cause skipped generations.
+  - *Multi-Run Scheduled Sweeps:* Assert subsequent reconciler runs start from sequence 0 and recover remaining partial generations without skip hazards.
+- **18-Scenario Formal Verification Suite:**
+  - All 18 scenarios specified in `docs/SECURITY.md` Section 9.2 are codified as formal test specifications (`DOCUMENTED_TEST_SPECIFICATION`) for automated execution against the Firebase Emulator Suite in Phase 2 and Phase 4.
 
 ---
 

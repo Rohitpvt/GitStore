@@ -1,9 +1,9 @@
 # GitStore — System Design Document (SDD)
 
-**Document Version:** 1.12.0  
-**Phase:** Phase 0.1.12 — Fan-Out Work-Plan Integrity, Lease Ownership & Fail-Closed Recovery  
+**Document Version:** 1.13.0  
+**Phase:** Phase 0.1.13 — Work-Plan Concurrency, Lease Renewal & Reconciliation Correctness  
 **Status:** IN_REVIEW — Awaiting Explicit User Approval  
-**Data Schema Version:** 1.12.0  
+**Data Schema Version:** 1.13.0  
 
 ---
 
@@ -32,7 +32,7 @@ flowchart TD
         GHIssues["GitHub Issue Forms\n(.github/ISSUE_TEMPLATE)"]
         GHReleases["Public GitHub Releases\n(External User Repositories)"]
         GHREST["GitHub REST API v3\n(Canonical Repo Collaborator Check,\nUpstream Repo, Tag & Asset Validation,\nPages Deployment Status via Commit SHA: succeed)"]
-        GHWorker["GitHub Actions Batch Worker (Node 24)\n(Scheduled every 10 min + Manual Dispatch)\n- Actions: checkout@v7.0.1, setup-node@v7, upload@v5, deploy@v5\n- Single Authoritative Staging (stagedDigest check)\n- Explicit $GITHUB_OUTPUT Bridge\n- Work-Plan Digest & Transactional Lease Fan-Out"]
+        GHWorker["GitHub Actions Batch Worker (Node 24)\n(Scheduled every 10 min + Manual Dispatch)\n- Actions: checkout@v7.0.1, setup-node@v7, upload@v5, deploy@v5\n- Single Authoritative Staging (stagedDigest check)\n- Explicit $GITHUB_OUTPUT Bridge\n- Work-Plan Concurrency Lock, Lease Renewal & Reconciler Cursor Pagination"]
     end
 
     %% Client Interactions
@@ -97,7 +97,7 @@ flowchart TD
   1. **Split-Job Architecture & Output Bridge:** `build-and-commit` constructs `site/`, verifies `stagedDigest === catalogDigest`, commits to `main`, writes step outputs to `$GITHUB_OUTPUT`, and uploads Pages staging artifact. `deploy-to-pages` runs conditionally when `needs.build-and-commit.outputs.deploy_needed == 'true'`, executes the pre-deploy guard, and deploys via `actions/deploy-pages@v5.0.1`.
   2. **Startup Reconciler with Granular Error Classification:** Searches Git history via unshallow fetch and Commits API pagination loop. Distinguishes benign missing blobs (`CANDIDATE_NO_MANIFEST`, HTTP 404) from rate limits/timeouts (`INCOMPLETE_SEARCH`), 401 auth failures (`API_AUTH_ERROR`), and corrupt manifest blobs (`CANDIDATE_CORRUPT_MANIFEST`). Declares `EMPTY_SEARCH` only on complete, uninterrupted scans with zero errors.
   3. **Case B Clean Staging:** Extracts assets from the target commit directly into `site/`, recomputes and validates `stagedDigest`, and prohibits any post-staging workspace copies.
-  4. **2-Tier Finalization & Bounded Subcollections:** Reads `catalog_state`, `deployment_state`, and generation record before writes. Evaluates `evaluateGenerationOrdering` and revision monotonicity inside the transaction. Commits global state in 3 writes. Submission fan-out work is stored in bounded subcollections (`fanout_batches`, max 400 IDs each), and executed via conditional transactions that enforce status eligibility (`approved` only) and monotonic sequence advancement (`publishedGenerationSequence`), preventing stale fan-out overwrites across all concurrency interleavings.
+  4. **2-Tier Finalization, Concurrency-Safe Preparation & Heartbeat Lease Renewal:** Reads `catalog_state`, `deployment_state`, and generation record before writes. Evaluates `evaluateGenerationOrdering`, `fanoutPreparationStatus === 'prepared'`, valid canonical 64-char hex `workPlanDigest`, and revision monotonicity inside the transaction. Commits global state in 3 writes. Submission fan-out work is stored in bounded subcollections (`fanout_batches`, max 400 IDs each), prepared under an atomic 15-minute ownership lock (`acquirePreparationLock`), protected against active lease mutations (`ACTIVE_BATCH_MUTATION_CONFLICT`), and executed via conditional transactions with Option A heartbeat lease renewal (`renewBatchLease`), enforcing fail-closed product checks, status eligibility, and monotonic sequence advancement (`publishedGenerationSequence`). Atomic manual-review recovery logs to `/admin_logs` deterministically, and reconciler cursor pagination is ordered strictly by immutable `generationSequence` ASC.
 
 ---
 
@@ -254,7 +254,7 @@ GitStore/
 │       ├── pre-deploy-guard.js     # Pre-deployment shared generation ordering assertion
 │       ├── finalize-publishing.js  # 2-tier finalization transaction & stale abort
 │       └── catalog-compiler.js     # Static JSON generator, single staging & digest hasher
-├── docs/                           # Complete 13 Architectural Documents (v1.12.0)
+├── docs/                           # Complete 13 Architectural Documents (v1.13.0)
 ├── index.html                      # Homepage
 ├── explore.html                    # Product Discovery & Search
 ├── product.html                    # Dynamic Product Detail Viewer
